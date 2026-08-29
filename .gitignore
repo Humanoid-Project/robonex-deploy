@@ -6,3 +6,13 @@ __pycache__/
 build/
 results/
 policies/*/
+
+.vscode/
+
+.agents/
+.codex/
+.claude/
+.grok/
+AGENTS.md
+
+SNAPSHOT.md

@@ -5,8 +5,7 @@
 ```text
 robonex-deploy/
 ├── README.md
-├── SNAPSHOT.md
-├── check_sync.py
+├── SNAPSHOT.md                  provenance and hashes (gitignored)
 ├── requirements.txt
 ├── assets/
 │   ├── meshes/                  37 STL files
@@ -32,8 +31,6 @@ robonex-deploy/
         └── n100_cpp/
 ```
 
-No policy ships with this repo. Policies exported before 2026-08-29 are **incompatible** — the action mapping changed from a plain `scale` to `offset + scale` normalization, so an old policy silently produces joint targets offset by up to 27.5 deg.
-
 <br>
 
 ## Setup
@@ -44,20 +41,6 @@ cd ~/humanoid_project/robonex-deploy
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/pip install python-can
-```
-
-### `check_sync.py`
-
-`scripts/robonex_can.py` and `assets/mujoco/` are copies. This compares them against the originals in `Robstride-Motor-Test` and `robonex_description`.
-
-| Option | Required | Default | Description |
-| --- | :---: | --- | --- |
-| `--quiet` | No | Off | Print only drift, not matches |
-
-```bash
-# Example
-python3 check_sync.py
-python3 check_sync.py --quiet
 ```
 
 <br>
@@ -225,30 +208,4 @@ Runs an ONNX policy on the live observation and prints the resulting joint targe
 python3 scripts/policy_test/print_policy_action.py \
   --policy policies/<run>/policy.onnx \
   --imu-port /dev/ttyUSB0
-```
-
-<br>
-
-## Policy contract
-
-Observation (42), raw and unnormalized — the ONNX embeds its own normalization:
-
-```text
-joint_pos_rel(12) + joint_vel_rel(12) + imu_ang_vel(3) + projected_gravity(3) + last_action(12)
-```
-
-Action pipeline, which must mirror Isaac Lab term for term:
-
-```text
-clip(raw, ±3.0) -> × scale + offset -> clip(per-joint target limits)
-```
-
-`last_action` in the observation is the **runner-clipped** value, not the raw network output.
-
-Motor order (12), Isaac articulation DOF order — not CAN ID order:
-
-```text
-0:l_hip_yaw     1:r_hip_yaw     2:l_hip_pitch    3:r_hip_pitch
-4:l_hip_roll    5:r_hip_roll    6:l_knee_pitch   7:r_knee_pitch
-8:l_ankle_lower 9:l_ankle_upper 10:r_ankle_lower 11:r_ankle_upper
 ```
