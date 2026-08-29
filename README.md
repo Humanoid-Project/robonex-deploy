@@ -1,10 +1,8 @@
 # robonex-deploy
 
-RoboNex 정책과 자세를 Isaac, MuJoCo, 실물 사이에서 검증·배포하는 저장소입니다. 로봇 형상은 `robonex_description`, 공통 관절·모터·CAN 계약은 `robonex-common`, N100 SDK는 확정된 `IMU_N100_Test` checkout을 직접 사용합니다.
-
 ## Setup
-
 ```bash
+# Example
 cd ~/humanoid_project
 git clone https://github.com/Humanoid-Project/robonex-common.git
 git clone https://github.com/Humanoid-Project/robonex_description.git
@@ -12,64 +10,193 @@ git clone https://github.com/Humanoid-Project/IMU_N100_Test.git
 git clone https://github.com/Humanoid-Project/robonex-deploy.git
 cd robonex-deploy
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+source .venv/bin/activate
+pip install -e ../robonex-common
+pip install -r requirements.txt
 ```
 
-네 저장소를 같은 상위 폴더에 두는 구성을 권장합니다. 다른 배치에서는 다음 환경변수를 사용합니다.
+| Variable | Required | Default | Description |
+| --- | :---: | --- | --- |
+| `ROBONEX_DESCRIPTION_ROOT` | No | Sibling `robonex_description` | Description checkout |
+| `ROBONEX_COMMON_ROOT` | No | Sibling `robonex-common` | Common checkout |
+| `IMU_N100_TEST_ROOT` | No | Sibling `IMU_N100_Test` | N100 SDK checkout |
 
-```bash
-export ROBONEX_DESCRIPTION_ROOT=/absolute/path/to/robonex_description
-export ROBONEX_COMMON_ROOT=/absolute/path/to/robonex-common
-export IMU_N100_TEST_ROOT=/absolute/path/to/IMU_N100_Test
+<br>
+
+## Structure
+
+```text
+robonex-deploy/
+├── README.md
+├── policies/
+├── scripts/
+│   ├── robonex_can.py
+│   ├── robonex_paths.py
+│   ├── sim_to_sim/
+│   │   └── play_policy.py
+│   ├── sim_to_real/
+│   │   ├── mujoco_to_real.py
+│   │   └── real_to_mujoco.py
+│   └── policy_test/
+│       ├── CMakeLists.txt
+│       ├── n100_binding.cpp
+│       ├── print_policy_values.py
+│       └── print_policy_action.py
+└── requirements.txt
 ```
 
-## Policies
-
-`policies/<run>/`에는 최소한 ONNX 정책과 `policy_manifest.json`을 함께 둡니다. manifest는 `robonex_balancing/scripts/export_policy_manifest.py`로 생성하며 정책 SHA-256, action 순서·offset·scale·clip, 주기, 학습·모델·공통 저장소 커밋을 포함합니다.
+<br>
 
 ## sim-to-sim
 
+### `play_policy.py`
+
+| Option | Required | Default | Description |
+| --- | :---: | --- | --- |
+| `--manifest` | Yes | - | `policy_manifest.json` |
+| `--description-root` | No | Sibling checkout | `robonex_description` path |
+| `--model` | No | Manifest model | MJCF override |
+| `--spawn` | No | `mujoco` | `mujoco` or `isaac` |
+| `--duration` | No | - | Stop after this many seconds |
+| `--viewer` | No | Off | Open the MuJoCo viewer |
+| `--stop-on-fall` | No | Off | Stop when height drops below `--minimum-height` |
+| `--real-time` | No | Off | Pace the sim to wall clock |
+| `--check-only` | No | Off | Validate the manifest and exit |
+| `--output` | No | - | Write a log file |
+| `--minimum-height` | No | `0.6` | Fall height (m) |
+| `--max-raw-action` | No | `20.0` | Raw-action abort threshold |
+| `--max-constraint-error` | No | `0.05` | Closure-error abort threshold (m) |
+| `--max-joint-overrun` | No | `0.05` | Joint-limit overrun abort (rad) |
+| `--max-body-position` | No | `100.0` | Body-position abort (m) |
+
 ```bash
-.venv/bin/python scripts/sim_to_sim/play_policy.py \
+# Example
+cd ~/humanoid_project/robonex-deploy
+source .venv/bin/activate
+
+python3 scripts/sim_to_sim/play_policy.py \
   --manifest policies/<run>/policy_manifest.json \
   --check-only
 
-.venv/bin/python scripts/sim_to_sim/play_policy.py \
+python3 scripts/sim_to_sim/play_policy.py \
   --manifest policies/<run>/policy_manifest.json \
-  --viewer --spawn mujoco --stop-on-fall --duration 30
+  --viewer \
+  --spawn mujoco \
+  --stop-on-fall \
+  --duration 30
 ```
 
-기본 MuJoCo 모델과 정책 주기는 manifest에서 결정됩니다. `robonex_description` checkout의 현재 commit이 manifest와 다르면 실행을 거부합니다. 진단 목적으로 다른 모델을 확인할 때만 `--model`을 명시합니다.
+<br>
 
 ## sim-to-real
 
-기본 모델은 `robonex_description/mujoco`에서 직접 읽습니다.
+### `mujoco_to_real.py`
+
+| Option | Required | Default | Description |
+| --- | :---: | --- | --- |
+| `--hardware` | No | Off | Enable real CAN motor control |
+| `--motor-id` | No | `1`–`12` | Motor IDs to control |
+| `--model` | No | `robonex_description/mujoco/scene_fixed.xml` | Fixed-base MJCF |
+| `--interface` | No | `socketcan` | python-can interface |
+| `--host-id` | No | `0xFD` | Host CAN ID |
+| `--rate` | No | `100.0` | Command rate (Hz) |
+| `--max-speed` | No | `0.10` | Max target speed (rad/s) |
+| `--max-accel` | No | `0.25` | Max target acceleration (rad/s²) |
+| `--kp` | No | `40.0` | Position gain |
+| `--kd` | No | `2.0` | Velocity gain |
+| `--zero-tolerance-deg` | No | `3.0` | Zero-reach band (deg) |
+| `--limit-margin-deg` | No | `3.0` | Inner joint-limit margin (deg) |
+| `--feedback-timeout` | No | `0.30` | Type `0x02` freshness timeout (s) |
+| `--overspeed` | No | `2.0` | Measured-speed stop (rad/s) |
+| `--max-error-deg` | No | `25.0` | Tracking-error stop (deg) |
+| `--max-temp` | No | `70.0` | Temperature stop (°C) |
+| `--brake-time` | No | `0.20` | Damping time before shutdown (s) |
+| `--yes` | No | Off | Skip the hardware prompt |
+| `--headless` | No | Off | No viewer; requires `--duration` |
+| `--duration` | No | - | Stop after this many seconds |
 
 ```bash
-python3 scripts/sim_to_real/mujoco_to_real.py --headless --duration 5 --motor-id 4
+# Example
+python3 scripts/sim_to_real/mujoco_to_real.py \
+  --headless \
+  --duration 5 \
+  --motor-id 4
+
+python3 scripts/sim_to_real/mujoco_to_real.py \
+  --hardware \
+  --motor-id 4
+```
+
+<br>
+
+### `real_to_mujoco.py`
+
+| Option | Required | Default | Description |
+| --- | :---: | --- | --- |
+| `--hardware` | No | Off | Enable real CAN position reads |
+| `--motor-id` | No | `1`–`12` | Motor IDs to read |
+| `--model` | No | `robonex_description/mujoco/full_limit/scene_fixed_full_limit.xml` | Fixed-base MJCF |
+| `--interface` | No | `socketcan` | python-can interface |
+| `--host-id` | No | `0xFD` | Host CAN ID |
+| `--rate` | No | `30.0` | mechPos rate per motor (Hz) |
+| `--read-timeout` | No | `0.03` | One mechPos request timeout (s) |
+| `--startup-timeout` | No | `2.0` | Initial collection timeout (s) |
+| `--stale-timeout` | No | `0.5` | Stale-sample timeout (s) |
+| `--limit-tolerance-deg` | No | `1.0` | Encoder band outside model limits (deg) |
+| `--yes` | No | Off | Skip the start prompt |
+| `--headless` | No | Off | No viewer; requires `--duration` |
+| `--duration` | No | - | Stop after this many seconds |
+
+```bash
+# Example
 python3 scripts/sim_to_real/real_to_mujoco.py --hardware --motor-id 4
 ```
 
-`mujoco_to_real.py`는 `--hardware` 없이는 CAN 구동을 하지 않습니다. 실물 실행은 장착 상태와 비상정지 수단을 확인한 뒤 사용자가 직접 수행합니다.
+<br>
 
 ## policy-test
 
-Python N100 binding은 복사된 SDK가 아니라 `IMU_N100_Test/src/cpp_n100`을 빌드합니다.
-
 ```bash
-cd scripts/policy_test
+# Example
+cd ~/humanoid_project/robonex-deploy/scripts/policy_test
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-```bash
-python3 scripts/policy_test/print_policy_values.py \
-  --manifest policies/<run>/policy_manifest.json \
-  --imu-port /dev/ttyUSB0
+### `print_policy_values.py`
 
-python3 scripts/policy_test/print_policy_action.py \
+| Option | Required | Default | Description |
+| --- | :---: | --- | --- |
+| `--manifest` | Yes | - | `policy_manifest.json` |
+| `--imu-port` | No | `/dev/ttyUSB0` | N100 serial port |
+| `--channels` | No | `can0 can1` | CAN channels |
+| `--interface` | No | `socketcan` | python-can interface |
+| `--timeout` | No | `0.02` | One parameter-request timeout (s) |
+| `--rate` | No | `10.0` | Display rate (Hz) |
+
+```bash
+# Example
+python3 scripts/policy_test/print_policy_values.py \
   --manifest policies/<run>/policy_manifest.json \
   --imu-port /dev/ttyUSB0
 ```
 
-두 도구는 CAN 파라미터 읽기만 수행하며 정책 action을 모터로 전송하지 않습니다.
+<br>
+
+### `print_policy_action.py`
+
+| Option | Required | Default | Description |
+| --- | :---: | --- | --- |
+| `--manifest` | Yes | - | `policy_manifest.json` |
+| `--imu-port` | No | `/dev/ttyUSB0` | N100 serial port |
+| `--channels` | No | `can0 can1` | CAN channels |
+| `--interface` | No | `socketcan` | python-can interface |
+| `--timeout` | No | `0.02` | One parameter-request timeout (s) |
+| `--rate` | No | `10.0` | Display rate (Hz) |
+
+```bash
+# Example
+python3 scripts/policy_test/print_policy_action.py \
+  --manifest policies/<run>/policy_manifest.json \
+  --imu-port /dev/ttyUSB0
+```
