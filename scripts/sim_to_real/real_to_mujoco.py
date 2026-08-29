@@ -15,11 +15,12 @@ import numpy as np
 
 THIS_FILE = Path(__file__).resolve()
 REPO_ROOT = THIS_FILE.parents[2]
-DEFAULT_MODEL_PATH = (
-    REPO_ROOT / "assets" / "mujoco" / "full_limit"
-    / "scene_fixed_full_limit.xml"
-)
 sys.path.insert(0, str(THIS_FILE.parent))
+sys.path.insert(0, str(THIS_FILE.parents[1]))
+
+from robonex_paths import description_model
+
+DEFAULT_MODEL_PATH = description_model("mujoco/full_limit/scene_fixed_full_limit.xml")
 
 from mujoco_to_real import (
     DEFAULT_INTERFACE,
@@ -38,14 +39,14 @@ MAX_RATE = 100.0
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "손으로 움직인 RoboNex 모터의 mechPos를 fixed-base MuJoCo 모델에 반영. "
-            "선택 모터에는 시작과 종료 시 stop만 보내며 enable이나 구동 명령은 보내지 않음."
+            "Mirror hand-moved RoboNex mechPos values into fixed-base MuJoCo. "
+            "Only stop messages are sent at startup and shutdown."
         )
     )
     parser.add_argument(
         "--hardware",
         action="store_true",
-        help="실물 CAN 읽기 활성화. 안전상 명시적으로 지정해야 함",
+        help="Enable real CAN position reads",
     )
     parser.add_argument(
         "--motor-id",
@@ -54,65 +55,65 @@ def parse_args(argv=None):
         nargs="+",
         type=lambda value: int(value, 0),
         default=list(range(1, 13)),
-        help="반영할 모터 ID 한 개 이상. 기본: 1~12",
+        help="Motor IDs to read. Default: 1 through 12",
     )
     parser.add_argument(
         "--model",
         type=Path,
         default=DEFAULT_MODEL_PATH,
-        help=f"fixed-base MJCF scene, 기본: {DEFAULT_MODEL_PATH}",
+        help=f"Fixed-base MJCF scene. Default: {DEFAULT_MODEL_PATH}",
     )
     parser.add_argument(
         "--interface",
         default=DEFAULT_INTERFACE,
-        help="python-can 인터페이스, 기본: socketcan",
+        help="python-can interface. Default: socketcan",
     )
     parser.add_argument("--host-id", type=lambda value: int(value, 0), default=HOST_ID)
     parser.add_argument(
         "--rate",
         type=float,
         default=30.0,
-        help="모터별 mechPos 갱신 주기 Hz, 기본: 30",
+        help="mechPos update rate per motor in Hz. Default: 30",
     )
     parser.add_argument(
         "--read-timeout",
         type=float,
         default=0.03,
-        help="개별 mechPos 응답 대기시간 초, 기본: 0.03",
+        help="Timeout for one mechPos request in seconds. Default: 0.03",
     )
     parser.add_argument(
         "--startup-timeout",
         type=float,
         default=2.0,
-        help="최초 위치 수집 제한시간 초, 기본: 2.0",
+        help="Initial position collection timeout in seconds. Default: 2.0",
     )
     parser.add_argument(
         "--stale-timeout",
         type=float,
         default=0.5,
-        help="마지막 정상 위치 이후 중단시간 초, 기본: 0.5",
+        help="Stale position timeout in seconds. Default: 0.5",
     )
     parser.add_argument(
         "--limit-tolerance-deg",
         type=float,
         default=1.0,
-        help="모델 범위 밖 측정값에 허용할 엔코더 오차, 기본: 1deg",
+        help="Encoder tolerance outside model limits in degrees. Default: 1",
     )
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="시작 확인 입력 생략",
+        help="Skip the start confirmation prompt",
     )
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="뷰어 없이 실행. --duration 필요",
+        help="Run without a viewer; requires --duration",
     )
     parser.add_argument(
         "--duration",
         type=float,
         default=None,
-        help="지정 초 후 자동 종료",
+        help="Stop after this many seconds",
     )
     return parser.parse_args(argv)
 
@@ -122,9 +123,9 @@ def validate_args(args):
     motor_ids = sorted(set(args.motor_id))
     unknown = [motor_id for motor_id in motor_ids if motor_id not in MOTOR_MODELS]
     if unknown:
-        problems.append(f"지원하지 않는 motor-id: {unknown}")
+        problems.append(f"Unsupported motor ID: {unknown}")
     if not args.hardware:
-        problems.append("실물 위치 읽기를 승인하려면 --hardware를 지정해야 함")
+        problems.append("--hardware is required to read real motor positions")
     for name in (
         "rate",
         "read_timeout",
@@ -134,36 +135,36 @@ def validate_args(args):
     ):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0.0:
-            problems.append(f"--{name.replace('_', '-')}: 0보다 큰 유한값이어야 함")
+            problems.append(f"--{name.replace('_', '-')} must be finite and positive")
     if args.rate > MAX_RATE:
-        problems.append(f"--rate는 {MAX_RATE:g}Hz 이하여야 함")
+        problems.append(f"--rate must be at most {MAX_RATE:g} Hz")
     if args.read_timeout >= args.stale_timeout:
-        problems.append("--read-timeout은 --stale-timeout보다 작아야 함")
+        problems.append("--read-timeout must be smaller than --stale-timeout")
     if args.duration is not None and (
         not math.isfinite(args.duration) or args.duration <= 0.0
     ):
-        problems.append("--duration은 0보다 큰 유한값이어야 함")
+        problems.append("--duration must be finite and positive")
     if args.headless and args.duration is None:
-        problems.append("--headless에는 --duration이 필요함")
+        problems.append("--headless requires --duration")
     return motor_ids, problems
 
 
 def confirm_hardware(args, motor_ids, model_path):
-    print("\n실물 모터는 구동하지 않고 손으로 움직인 위치만 읽습니다.")
+    print("\nThis tool does not drive motors. It only reads hand-moved positions.")
     print(f"  model       : {model_path}")
     print(f"  motor IDs   : {motor_ids}")
     print(f"  update rate : {args.rate:g} Hz per motor")
-    print("  CAN write   : 시작·종료 시 stop만 전송")
-    print("  CAN read    : mechPos(0x7019) 버스별 병렬 조회")
-    print("  미전송       : enable, run-mode write, type-0x01 control")
-    print("  전제         : 로봇 고정, 관절 주변 비움, 손 끼임 주의")
+    print("  CAN write   : stop at startup and shutdown only")
+    print("  CAN read    : parallel mechPos (0x7019) reads per bus")
+    print("  Never sends : enable, run-mode writes, or type-0x01 control")
+    print("  Required    : fixed robot, clear joints, and safe hand placement")
     if args.yes:
         return
     if not sys.stdin.isatty():
-        raise RuntimeError("시작 확인 입력이 필요합니다. 대화형 터미널 또는 --yes를 사용하세요.")
-    answer = input("stop 후 수동 위치 반영을 시작하려면 Enter, 취소하려면 Ctrl-C: ")
+        raise RuntimeError("Start confirmation requires an interactive terminal or --yes")
+    answer = input("Press Enter to send stop and start mirroring, or Ctrl-C to cancel: ")
     if answer.strip():
-        raise RuntimeError("빈 Enter가 아니어서 사용자 취소")
+        raise RuntimeError("Cancelled because the input was not empty")
 
 
 def stop_motors(motors, required):
@@ -174,7 +175,7 @@ def stop_motors(motors, required):
         except (OSError, can.CanError) as error:
             failures.append(f"ID {motor_id}: {error}")
     if required and failures:
-        raise RuntimeError("stop 전송 실패: " + "; ".join(failures))
+        raise RuntimeError("Failed to send stop: " + "; ".join(failures))
 
 
 def motors_by_channel(motors):
@@ -224,7 +225,7 @@ def collect_initial_positions(motors, groups, executor, timeout, read_timeout):
         positions.update(read_all_positions(remaining, executor, read_timeout))
     missing = sorted(set(motors) - set(positions))
     if missing:
-        raise RuntimeError(f"최초 mechPos 응답 없음: {missing}")
+        raise RuntimeError(f"No initial mechPos response: {missing}")
     return positions
 
 
@@ -244,14 +245,14 @@ def validate_positions(positions, limits, tolerance_rad):
     clamped = set()
     for motor_id, value in positions.items():
         if not math.isfinite(value):
-            raise RuntimeError(f"ID {motor_id} mechPos가 NaN/inf")
+            raise RuntimeError(f"ID {motor_id} mechPos is NaN or infinite")
         wrapped = wrap_to_pi(value)
         lower, upper = limits[motor_id]
         if wrapped < lower - tolerance_rad or wrapped > upper + tolerance_rad:
             raise RuntimeError(
                 f"ID {motor_id} mechPos {math.degrees(value):+.2f}deg "
-                f"(wrap {math.degrees(wrapped):+.2f}deg)가 모델 범위 "
-                f"{math.degrees(lower):+.2f}..{math.degrees(upper):+.2f}deg 밖"
+                f"(wrapped {math.degrees(wrapped):+.2f} deg) is outside the model range "
+                f"{math.degrees(lower):+.2f}..{math.degrees(upper):+.2f} deg"
             )
         target = clamp(wrapped, lower, upper)
         if target != wrapped:
@@ -272,7 +273,7 @@ def poll_positions(motors, groups, executor, positions, last_seen, read_timeout,
         if now - last_seen[motor_id] > stale_timeout
     ]
     if stale:
-        raise RuntimeError("mechPos 피드백 끊김: " + ", ".join(stale))
+        raise RuntimeError("Stale mechPos feedback: " + ", ".join(stale))
 
 
 def initialize_simulation(model, data, actuator_ids, targets):
@@ -310,7 +311,7 @@ def print_status(data, qpos_addresses, positions, targets, clamped):
 def run(args):
     motor_ids, problems = validate_args(args)
     if problems:
-        raise RuntimeError("인자 오류:\n  " + "\n  ".join(problems))
+        raise RuntimeError("Argument error:\n  " + "\n  ".join(problems))
     model_path, model, actuator_ids = load_fixed_model(args.model, motor_ids)
     limits = model_limits_rad(model, actuator_ids)
     model.opt.gravity[:] = 0.0
@@ -341,7 +342,7 @@ def run(args):
                 model, data, actuator_ids, targets
             )
             if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
-                raise RuntimeError("초기 MuJoCo 상태에 NaN/inf")
+                raise RuntimeError("Initial MuJoCo state contains NaN or infinity")
 
             viewer_context = (
                 contextlib.nullcontext(None)
@@ -354,7 +355,7 @@ def run(args):
             next_tick = start_time
             last_print = 0.0
 
-            print("\n수동 위치 반영을 시작합니다. 종료하려면 viewer를 닫거나 Ctrl-C를 누르세요.")
+            print("\nPosition mirroring started. Close the viewer or press Ctrl-C to stop.")
             with viewer_context as viewer:
                 while viewer is None or viewer.is_running():
                     now = time.monotonic()
@@ -378,7 +379,7 @@ def run(args):
                             data.ctrl[actuator_ids[motor_id]] = target
                         mujoco.mj_step(model, data, nstep=sim_steps)
                         if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
-                            raise RuntimeError("MuJoCo 상태에 NaN/inf")
+                            raise RuntimeError("MuJoCo state contains NaN or infinity")
                     if viewer is not None:
                         viewer.sync()
                     if now - last_print >= 1.0:
@@ -398,7 +399,7 @@ def run(args):
                 bus.shutdown()
             except Exception:
                 pass
-    print("stop 상태 유지 및 CAN 종료를 완료했습니다.")
+    print("Stop state held and CAN shutdown completed.")
 
 
 def main(argv=None):
@@ -406,10 +407,10 @@ def main(argv=None):
     try:
         run(args)
     except KeyboardInterrupt:
-        print("\n종료 요청됨.")
+        print("\nStop requested.")
         return 0
     except (RuntimeError, ValueError, OSError, can.CanError) as error:
-        print(f"\n중단: {error}")
+        print(f"\nStopped: {error}")
         return 1
     return 0
 

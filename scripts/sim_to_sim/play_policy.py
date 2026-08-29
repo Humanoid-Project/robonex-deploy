@@ -1,7 +1,7 @@
 import argparse
-import hashlib
 import json
 import math
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -12,95 +12,16 @@ try:
     import numpy as np
     import onnxruntime as ort
 except ImportError as error:
-    raise SystemExit(f"필수 패키지를 불러오지 못했습니다: {error}")
+    raise SystemExit(f"Missing required package: {error}")
 
+from robonex_common.joints import PASSIVE_CLOSED_LOOP_JOINTS
+from robonex_common.policy import PolicyContract, sha256_file
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL = ROOT / "assets" / "mujoco" / "scene.xml"
-DEFAULT_POLICY = None
+sys.path.insert(0, str(ROOT / "scripts"))
+from robonex_paths import description_model, git_commit, resolve_repo
 
-POLICY_JOINTS = (
-    "l_hip_yaw_joint",
-    "r_hip_yaw_joint",
-    "l_hip_pitch_joint",
-    "r_hip_pitch_joint",
-    "l_hip_roll_joint",
-    "r_hip_roll_joint",
-    "l_knee_pitch_joint",
-    "r_knee_pitch_joint",
-    "l_ankle_lower_joint",
-    "l_ankle_upper_joint",
-    "r_ankle_lower_joint",
-    "r_ankle_upper_joint",
-)
-
-PASSIVE_JOINTS = (
-    "l_knee_joint",
-    "r_knee_joint",
-    "l_knee_coupler_joint_a",
-    "r_knee_coupler_joint_a",
-    "l_ankle_roll_joint",
-    "r_ankle_roll_joint",
-    "l_ankle_pitch_joint",
-    "r_ankle_pitch_joint",
-)
-
-ACTION_OFFSETS = (
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    -0.479966,
-    0.479966,
-    -0.3926995,
-    0.3926995,
-    0.0872665,
-    -0.0872665,
-    -0.0872665,
-    0.0872665,
-)
-
-ACTION_SCALES = (
-    0.688132,
-    0.688132,
-    0.862665,
-    0.862665,
-    0.557232,
-    0.557232,
-    0.4699655,
-    0.4699655,
-    0.5135985,
-    0.5135985,
-    0.5135985,
-    0.5135985,
-)
-
-# PPORunnerCfg.clip_actions
-RUNNER_ACTION_CLIP = 3.0
-
-# JointPositionActionCfg.clip, in POLICY_JOINTS order
-TARGET_CLIPS = (
-    (-0.688132, 0.688132),
-    (-0.688132, 0.688132),
-    (-0.862665, 0.862665),
-    (-0.862665, 0.862665),
-    (-1.037198, 0.077266),
-    (-0.077266, 1.037198),
-    (-0.862665, 0.077266),
-    (-0.077266, 0.862665),
-    (-0.426332, 0.600865),
-    (-0.600865, 0.426332),
-    (-0.600865, 0.426332),
-    (-0.426332, 0.600865),
-)
-
-
-def file_hash(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+file_hash = sha256_file
 
 
 def sibling_robot_hash(model_path):
@@ -111,7 +32,7 @@ def sibling_robot_hash(model_path):
 def required_id(model, object_type, name):
     object_id = mujoco.mj_name2id(model, object_type, name)
     if object_id < 0:
-        raise RuntimeError(f"MuJoCo 모델에 필요한 이름이 없습니다: {name}")
+        raise RuntimeError(f"Required MuJoCo name not found: {name}")
     return object_id
 
 
@@ -135,55 +56,57 @@ def quaternion_to_rpy(quaternion):
 
 
 class PolicyAdapter:
-    def __init__(self, model, policy_path):
+    def __init__(self, model, policy_path, contract):
         self.model = model
         self.policy_path = policy_path
+        self.contract = contract
+        self.joint_names = contract.joint_order
         self.session = ort.InferenceSession(str(policy_path), providers=["CPUExecutionProvider"])
         inputs = self.session.get_inputs()
         outputs = self.session.get_outputs()
-        if len(inputs) != 1 or tensor_last_dim(inputs[0]) != 42:
-            raise RuntimeError(f"정책 입력이 [1, 42]가 아닙니다: {[item.shape for item in inputs]}")
-        if len(outputs) != 1 or tensor_last_dim(outputs[0]) != 12:
-            raise RuntimeError(f"정책 출력이 [1, 12]가 아닙니다: {[item.shape for item in outputs]}")
+        if len(inputs) != 1 or tensor_last_dim(inputs[0]) != contract.observation_size:
+            raise RuntimeError(f"Policy input size does not match the manifest: {[item.shape for item in inputs]}")
+        if len(outputs) != 1 or tensor_last_dim(outputs[0]) != contract.action_size:
+            raise RuntimeError(f"Policy output size does not match the manifest: {[item.shape for item in outputs]}")
         self.input_name = inputs[0].name
         self.output_name = outputs[0].name
         self.joint_ids = np.array(
-            [required_id(model, mujoco.mjtObj.mjOBJ_JOINT, name) for name in POLICY_JOINTS],
+            [required_id(model, mujoco.mjtObj.mjOBJ_JOINT, name) for name in self.joint_names],
             dtype=np.int32,
         )
         self.qpos_addresses = model.jnt_qposadr[self.joint_ids].astype(np.int32)
         self.dof_addresses = model.jnt_dofadr[self.joint_ids].astype(np.int32)
         self.default_positions = model.qpos0[self.qpos_addresses].copy()
         actuator_ids = []
-        for name, joint_id in zip(POLICY_JOINTS, self.joint_ids):
+        for name, joint_id in zip(self.joint_names, self.joint_ids):
             matches = np.flatnonzero(model.actuator_trnid[:, 0] == joint_id)
             if matches.size != 1:
-                raise RuntimeError(f"{name}의 actuator 수가 1이 아닙니다: {matches.tolist()}")
+                raise RuntimeError(f"Expected one actuator for {name}: {matches.tolist()}")
             actuator_ids.append(int(matches[0]))
         self.actuator_ids = np.array(actuator_ids, dtype=np.int32)
         if model.nu != 12 or set(self.actuator_ids.tolist()) != set(range(model.nu)):
-            raise RuntimeError(f"12개 motor actuator가 정책 관절과 정확히 일치하지 않습니다: nu={model.nu}")
+            raise RuntimeError(f"The 12 motor actuators do not match the policy joints: nu={model.nu}")
         passive_actuators = []
-        for name in PASSIVE_JOINTS:
+        for name in PASSIVE_CLOSED_LOOP_JOINTS:
             joint_id = required_id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
             matches = np.flatnonzero(model.actuator_trnid[:, 0] == joint_id)
             if matches.size:
                 passive_actuators.append((name, matches.tolist()))
         if passive_actuators:
-            raise RuntimeError(f"passive closed-loop joint에 actuator가 연결되어 있습니다: {passive_actuators}")
+            raise RuntimeError(f"Passive closed-loop joints have actuators: {passive_actuators}")
         self.base_body_id = required_id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
         self.root_joint_id = required_id(model, mujoco.mjtObj.mjOBJ_JOINT, "root")
         if model.jnt_type[self.root_joint_id] != mujoco.mjtJoint.mjJNT_FREE:
-            raise RuntimeError("root joint가 free joint가 아닙니다")
+            raise RuntimeError("The root joint is not a free joint")
         self.root_qpos_address = int(model.jnt_qposadr[self.root_joint_id])
         self.floor_geom_id = required_id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
         self.left_foot_body_id = required_id(model, mujoco.mjtObj.mjOBJ_BODY, "l_foot")
         self.right_foot_body_id = required_id(model, mujoco.mjtObj.mjOBJ_BODY, "r_foot")
-        self.scales = np.asarray(ACTION_SCALES, dtype=np.float32)
-        self.offsets = np.asarray(ACTION_OFFSETS, dtype=np.float32)
-        self.runner_clip = float(RUNNER_ACTION_CLIP)
-        self.target_low = np.asarray([pair[0] for pair in TARGET_CLIPS], dtype=np.float32)
-        self.target_high = np.asarray([pair[1] for pair in TARGET_CLIPS], dtype=np.float32)
+        self.scales = np.asarray(contract.action_scales, dtype=np.float32)
+        self.offsets = np.asarray(contract.action_offsets, dtype=np.float32)
+        self.runner_clip = float(contract.runner_action_clip)
+        self.target_low = np.asarray([pair[0] for pair in contract.target_clips], dtype=np.float32)
+        self.target_high = np.asarray([pair[1] for pair in contract.target_clips], dtype=np.float32)
         self.runner_clip_count = 0
         self.target_clip_count = 0
         self.policy_call_count = 0
@@ -218,7 +141,7 @@ class PolicyAdapter:
             )
         ).astype(np.float32)
         if observation.shape != (42,) or not np.isfinite(observation).all():
-            raise RuntimeError("42차원 observation이 유한하지 않습니다")
+            raise RuntimeError("The 42-value observation contains a non-finite value")
         return observation
 
     def apply(self, data, max_raw_action):
@@ -226,10 +149,10 @@ class PolicyAdapter:
         output = self.session.run([self.output_name], {self.input_name: observation.reshape(1, 42)})[0]
         action = np.asarray(output, dtype=np.float32).reshape(-1)
         if action.shape != (12,) or not np.isfinite(action).all():
-            raise RuntimeError("12차원 policy action이 유한하지 않습니다")
+            raise RuntimeError("The 12-value policy action contains a non-finite value")
         raw_max = float(np.max(np.abs(action)))
         if raw_max > max_raw_action:
-            raise RuntimeError(f"raw action 한계를 초과했습니다: {raw_max:.6f} > {max_raw_action:.6f}")
+            raise RuntimeError(f"Raw action limit exceeded: {raw_max:.6f} > {max_raw_action:.6f}")
         clipped = np.clip(action, -self.runner_clip, self.runner_clip)
         scaled = clipped * self.scales + self.offsets
         targets = np.clip(scaled, self.target_low, self.target_high)
@@ -242,7 +165,7 @@ class PolicyAdapter:
 
     def mapping(self):
         rows = []
-        for policy_index, name in enumerate(POLICY_JOINTS):
+        for policy_index, name in enumerate(self.joint_names):
             actuator_id = int(self.actuator_ids[policy_index])
             actuator_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id)
             rows.append(
@@ -548,11 +471,10 @@ def check_result(model, data, adapter, args):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument("--policy", type=Path, default=DEFAULT_POLICY,
-                        required=DEFAULT_POLICY is None)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--description-root", type=Path)
+    parser.add_argument("--model", type=Path)
     parser.add_argument("--duration", type=float)
-    parser.add_argument("--policy-hz", type=float, default=50.0)
     parser.add_argument("--spawn", choices=("mujoco", "isaac"), default="mujoco")
     parser.add_argument("--viewer", action="store_true")
     parser.add_argument("--stop-on-fall", action="store_true")
@@ -565,20 +487,46 @@ def parse_args():
     parser.add_argument("--max-joint-overrun", type=float, default=0.05)
     parser.add_argument("--max-body-position", type=float, default=100.0)
     args = parser.parse_args()
-    args.model = args.model.resolve()
-    args.policy = args.policy.resolve()
+    args.manifest = args.manifest.expanduser().resolve()
+    if not args.manifest.is_file():
+        parser.error(f"Policy manifest not found: {args.manifest}")
+    try:
+        args.contract = PolicyContract.load(args.manifest)
+        args.policy = args.contract.verify_policy(args.manifest)
+        args.description_root = resolve_repo(
+            "robonex_description",
+            "ROBONEX_DESCRIPTION_ROOT",
+            args.description_root,
+        )
+        actual_description_commit = git_commit(args.description_root)
+        if actual_description_commit != args.contract.description_commit:
+            parser.error(
+                f"robonex_description commit mismatch: manifest={args.contract.description_commit}, "
+                f"checkout={actual_description_commit}"
+            )
+        common_root = resolve_repo("robonex-common", "ROBONEX_COMMON_ROOT")
+        actual_common_commit = git_commit(common_root)
+        if actual_common_commit != args.contract.common_commit:
+            parser.error(
+                f"robonex-common commit mismatch: manifest={args.contract.common_commit}, "
+                f"checkout={actual_common_commit}"
+            )
+        args.model = (
+            args.model.expanduser().resolve()
+            if args.model
+            else description_model(args.contract.description_model, args.description_root)
+        )
+    except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as error:
+        parser.error(str(error))
+    args.policy_hz = args.contract.policy_hz
     if not args.model.is_file():
-        parser.error(f"MuJoCo 모델 파일이 없습니다: {args.model}")
-    if not args.policy.is_file():
-        parser.error(f"정책 파일이 없습니다: {args.policy}")
+        parser.error(f"MuJoCo model not found: {args.model}")
     if args.duration is None:
         args.duration = math.inf if args.viewer else 15.0
     elif args.duration == 0.0:
         args.duration = math.inf
     elif args.duration < 0.0:
-        parser.error("--duration은 0 이상이어야 합니다")
-    if args.policy_hz <= 0.0:
-        parser.error("--policy-hz는 양수여야 합니다")
+        parser.error("--duration must be zero or greater")
     if args.output is not None:
         args.output = args.output.resolve()
     return args
@@ -588,7 +536,7 @@ def main():
     args = parse_args()
     model = mujoco.MjModel.from_xml_path(str(args.model))
     data = mujoco.MjData(model)
-    adapter = PolicyAdapter(model, args.policy)
+    adapter = PolicyAdapter(model, args.policy, args.contract)
     if args.check_only:
         result = check_result(model, data, adapter, args)
     elif args.viewer:
