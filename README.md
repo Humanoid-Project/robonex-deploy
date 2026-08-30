@@ -4,15 +4,12 @@
 ```bash
 cd ~/humanoid_project
 git clone https://github.com/Humanoid-Project/robonex-common.git
-git clone https://github.com/Humanoid-Project/robonex_description.git
-git clone https://github.com/Humanoid-Project/IMU_N100_Test.git
 git clone https://github.com/Humanoid-Project/robonex-deploy.git
 cd robonex-deploy
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ../robonex-common
-pip install -r requirements.txt
+source ../robonex-common/setup/setup.sh robonex_description IMU_N100_Test
 ```
+
+Shared across repos — see [`robonex-common/setup/SETUP.md`](https://github.com/Humanoid-Project/robonex-common/blob/main/setup/SETUP.md).
 
 | Variable | Required | Default | Description |
 | --- | :---: | --- | --- |
