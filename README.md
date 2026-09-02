@@ -32,6 +32,7 @@ robonex-deploy/
 │   │   └── play_policy.py
 │   ├── sim_to_real/
 │   │   ├── mujoco_to_real.py
+│   │   ├── process_mujoco_to_real.py
 │   │   └── real_to_mujoco.py
 │   └── policy_test/
 │       ├── CMakeLists.txt
@@ -119,6 +120,45 @@ python3 scripts/sim_to_real/mujoco_to_real.py \
 python3 scripts/sim_to_real/mujoco_to_real.py \
   --hardware \
   --motor-id 4
+```
+
+<br>
+
+### `process_mujoco_to_real.py`
+
+| Option | Required | Default | Description |
+| --- | :---: | --- | --- |
+| `--hardware` | No | Off | Enable real CAN motor control |
+| `--motor-id` | No | `1`–`12` | Motor IDs to control |
+| `--model` | No | `robonex-description/mujoco/scene_fixed.xml` | Fixed-base MJCF |
+| `--rate` | No | `100.0` | Command rate (Hz) |
+| `--max-speed` | No | `1.0` | Maximum timed-segment speed (rad/s) |
+| `--time-scale` | No | `1.0` | Sequence duration multiplier |
+| `--approach-speed` | No | `0.10` | Speed for zero and first-keyframe moves (rad/s) |
+| `--approach-accel` | No | `0.25` | Acceleration for approach moves (rad/s²) |
+| `--kp` | No | `40.0` | Position gain |
+| `--kd` | No | `2.0` | Velocity gain |
+| `--limit-margin-deg` | No | `2.0` | Inner joint-limit margin (deg) |
+| `--feedback-timeout` | No | `0.30` | Type `0x02` freshness timeout (s) |
+| `--overspeed` | No | `2.0` | Measured-speed stop (rad/s) |
+| `--max-error-deg` | No | `25.0` | Tracking-error stop (deg) |
+| `--max-temp` | No | `70.0` | Temperature stop (°C) |
+| `--brake-time` | No | `0.20` | Damping time before shutdown (s) |
+| `--yes` | No | Off | Skip the hardware prompt |
+| `--headless` | No | Off | Run without a viewer |
+| `--dry-run` | No | Off | Validate without opening CAN |
+
+```bash
+# Example
+python3 scripts/sim_to_real/process_mujoco_to_real.py --dry-run
+
+python3 scripts/sim_to_real/process_mujoco_to_real.py \
+  --headless \
+  --time-scale 2
+
+python3 scripts/sim_to_real/process_mujoco_to_real.py \
+  --hardware \
+  --time-scale 2
 ```
 
 <br>
