@@ -19,7 +19,7 @@ from robonex_common.policy import PolicyContract, sha256_file
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
-from robonex_paths import description_model, git_commit, resolve_repo
+from robonex_paths import DESCRIPTION_REPO_NAMES, description_model, git_commit, resolve_repo
 
 file_hash = sha256_file
 
@@ -494,14 +494,14 @@ def parse_args():
         args.contract = PolicyContract.load(args.manifest)
         args.policy = args.contract.verify_policy(args.manifest)
         args.description_root = resolve_repo(
-            "robonex_description",
+            DESCRIPTION_REPO_NAMES,
             "ROBONEX_DESCRIPTION_ROOT",
             args.description_root,
         )
         actual_description_commit = git_commit(args.description_root)
         if actual_description_commit != args.contract.description_commit:
             parser.error(
-                f"robonex_description commit mismatch: manifest={args.contract.description_commit}, "
+                f"robonex-description commit mismatch: manifest={args.contract.description_commit}, "
                 f"checkout={actual_description_commit}"
             )
         common_root = resolve_repo("robonex-common", "ROBONEX_COMMON_ROOT")

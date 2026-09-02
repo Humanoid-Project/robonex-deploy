@@ -6,14 +6,14 @@ cd ~/humanoid_project
 git clone https://github.com/Humanoid-Project/robonex-common.git
 git clone https://github.com/Humanoid-Project/robonex-deploy.git
 cd robonex-deploy
-source ../robonex-common/setup/setup.sh robonex_description IMU_N100_Test
+source ../robonex-common/setup/setup.sh robonex-description IMU_N100_Test
 ```
 
 Shared across repos — see [`robonex-common/setup/SETUP.md`](https://github.com/Humanoid-Project/robonex-common/blob/main/setup/SETUP.md).
 
 | Variable | Required | Default | Description |
 | --- | :---: | --- | --- |
-| `ROBONEX_DESCRIPTION_ROOT` | No | Sibling `robonex_description` | Description checkout |
+| `ROBONEX_DESCRIPTION_ROOT` | No | Sibling `robonex-description` | Description checkout |
 | `ROBONEX_COMMON_ROOT` | No | Sibling `robonex-common` | Common checkout |
 | `IMU_N100_TEST_ROOT` | No | Sibling `IMU_N100_Test` | N100 SDK checkout |
 
@@ -50,10 +50,10 @@ robonex-deploy/
 | Option | Required | Default | Description |
 | --- | :---: | --- | --- |
 | `--manifest` | Yes | - | `policy_manifest.json` |
-| `--description-root` | No | Sibling checkout | `robonex_description` path |
+| `--description-root` | No | Sibling checkout | `robonex-description` path |
 | `--model` | No | Manifest model | MJCF override |
 | `--spawn` | No | `mujoco` | `mujoco` or `isaac` |
-| `--duration` | No | - | Stop after this many seconds |
+| `--duration` | No | Viewer: unlimited; headless: `15` | Stop after this many simulation seconds |
 | `--viewer` | No | Off | Open the MuJoCo viewer |
 | `--stop-on-fall` | No | Off | Stop when height drops below `--minimum-height` |
 | `--real-time` | No | Off | Pace the sim to wall clock |
@@ -77,9 +77,7 @@ python3 scripts/sim_to_sim/play_policy.py \
 python3 scripts/sim_to_sim/play_policy.py \
   --manifest policies/<run>/policy_manifest.json \
   --viewer \
-  --spawn mujoco \
-  --stop-on-fall \
-  --duration 30
+  --spawn mujoco
 ```
 
 <br>
@@ -92,7 +90,7 @@ python3 scripts/sim_to_sim/play_policy.py \
 | --- | :---: | --- | --- |
 | `--hardware` | No | Off | Enable real CAN motor control |
 | `--motor-id` | No | `1`–`12` | Motor IDs to control |
-| `--model` | No | `robonex_description/mujoco/scene_fixed.xml` | Fixed-base MJCF |
+| `--model` | No | `robonex-description/mujoco/scene_fixed.xml` | Fixed-base MJCF |
 | `--interface` | No | `socketcan` | python-can interface |
 | `--host-id` | No | `0xFD` | Host CAN ID |
 | `--rate` | No | `100.0` | Command rate (Hz) |
@@ -131,7 +129,7 @@ python3 scripts/sim_to_real/mujoco_to_real.py \
 | --- | :---: | --- | --- |
 | `--hardware` | No | Off | Enable real CAN position reads |
 | `--motor-id` | No | `1`–`12` | Motor IDs to read |
-| `--model` | No | `robonex_description/mujoco/full_limit/scene_fixed_full_limit.xml` | Fixed-base MJCF |
+| `--model` | No | `robonex-description/mujoco/full_limit/scene_fixed_full_limit.xml` | Fixed-base MJCF |
 | `--interface` | No | `socketcan` | python-can interface |
 | `--host-id` | No | `0xFD` | Host CAN ID |
 | `--rate` | No | `30.0` | mechPos rate per motor (Hz) |

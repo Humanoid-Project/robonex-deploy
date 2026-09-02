@@ -200,7 +200,7 @@ def load_fixed_model(path, motor_ids):
     if not path.is_file():
         raise RuntimeError(
             f"Fixed-base model not found: {path}\n"
-            "Build it in robonex_description before running this tool."
+            "Build it in robonex-description before running this tool."
         )
     model = mujoco.MjModel.from_xml_path(str(path))
     if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "root") >= 0:

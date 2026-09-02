@@ -2,6 +2,8 @@ import os
 import subprocess
 from pathlib import Path
 
+DESCRIPTION_REPO_NAMES = ("robonex-description", "robonex_description")
+
 
 def resolve_repo(name, environment, explicit=None):
     configured = explicit or os.environ.get(environment)
@@ -10,16 +12,18 @@ def resolve_repo(name, environment, explicit=None):
         if not root.is_dir():
             raise FileNotFoundError(root)
         return root
+    names = (name,) if isinstance(name, str) else tuple(name)
     for anchor in (Path.cwd().resolve(), Path(__file__).resolve()):
         for parent in (anchor, *anchor.parents):
-            candidate = parent / name
-            if candidate.is_dir():
-                return candidate
-    raise FileNotFoundError(f"{name} checkout not found; set {environment}")
+            for candidate_name in names:
+                candidate = parent / candidate_name
+                if candidate.is_dir():
+                    return candidate
+    raise FileNotFoundError(f"{names[0]} checkout not found; set {environment}")
 
 
 def description_model(relative_path, root=None):
-    description_root = resolve_repo("robonex_description", "ROBONEX_DESCRIPTION_ROOT", root)
+    description_root = resolve_repo(DESCRIPTION_REPO_NAMES, "ROBONEX_DESCRIPTION_ROOT", root)
     model = description_root / relative_path
     if not model.is_file():
         raise FileNotFoundError(model)
