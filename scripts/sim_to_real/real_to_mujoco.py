@@ -18,9 +18,9 @@ REPO_ROOT = THIS_FILE.parents[2]
 sys.path.insert(0, str(THIS_FILE.parent))
 sys.path.insert(0, str(THIS_FILE.parents[1]))
 
-from robonex_paths import description_model
+from robonex_common.paths import description_model
 
-DEFAULT_MODEL_PATH = description_model("mujoco/full_limit/scene_fixed_full_limit.xml")
+DEFAULT_MODEL_PATH = description_model("mujoco/full_limit/scene_fixed_full_limit.xml", anchors=(__file__,))
 
 from mujoco_to_real import (
     DEFAULT_INTERFACE,

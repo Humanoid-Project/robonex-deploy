@@ -12,13 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import can
 import n100
 from robonex_common.can import Motor
+from robonex_common.imu import DEFAULT_IMU_PORT, MOUNT_ROLL_DEG
 from robonex_common.joints import CHANNEL_MOTOR_IDS, JOINT_BY_ID, JOINT_BY_MODEL_NAME
 from robonex_common.policy import PolicyContract
 from robonex_common.protocol import DEFAULT_INTERFACE, MECHANICAL_POSITION_INDEX, MECHANICAL_VELOCITY_INDEX
 
 DEG = math.pi / 180.0
 
-MOUNT_ROLL_DEG = 180.0
 
 PRINT_HZ = 10.0
 CAN_TIMEOUT = 0.02
@@ -76,7 +76,7 @@ def main():
         description="Print the live policy observation. Read-only.")
     parser.add_argument("--manifest", type=Path, required=True,
                         help="policy_manifest.json that defines observation order")
-    parser.add_argument("--imu-port", default="/dev/ttyUSB0", help="IMU serial port")
+    parser.add_argument("--imu-port", default=DEFAULT_IMU_PORT, help="IMU serial port")
     parser.add_argument("--channels", nargs="+", default=list(CHANNEL_MOTOR_IDS),
                         choices=list(CHANNEL_MOTOR_IDS), help="CAN channels to use")
     parser.add_argument("--interface", default=DEFAULT_INTERFACE, help="python-can interface")

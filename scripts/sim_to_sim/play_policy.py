@@ -16,10 +16,11 @@ except ImportError as error:
 
 from robonex_common.joints import PASSIVE_CLOSED_LOOP_JOINTS
 from robonex_common.policy import PolicyContract, sha256_file
+from robonex_common.runtime import ActionPipeline, assemble_observation
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
-from robonex_paths import DESCRIPTION_REPO_NAMES, description_model, git_commit, resolve_repo
+from robonex_common.paths import DESCRIPTION_REPO_NAMES, description_model, git_commit, resolve_repo
 
 file_hash = sha256_file
 
@@ -102,14 +103,7 @@ class PolicyAdapter:
         self.floor_geom_id = required_id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
         self.left_foot_body_id = required_id(model, mujoco.mjtObj.mjOBJ_BODY, "l_foot")
         self.right_foot_body_id = required_id(model, mujoco.mjtObj.mjOBJ_BODY, "r_foot")
-        self.scales = np.asarray(contract.action_scales, dtype=np.float32)
-        self.offsets = np.asarray(contract.action_offsets, dtype=np.float32)
-        self.runner_clip = float(contract.runner_action_clip)
-        self.target_low = np.asarray([pair[0] for pair in contract.target_clips], dtype=np.float32)
-        self.target_high = np.asarray([pair[1] for pair in contract.target_clips], dtype=np.float32)
-        self.runner_clip_count = 0
-        self.target_clip_count = 0
-        self.policy_call_count = 0
+        self.pipeline = ActionPipeline(contract)
         self.last_action = np.zeros(12, dtype=np.float32)
         self.object_velocity = np.zeros(6, dtype=np.float64)
         self.gravity_world = np.array((0.0, 0.0, -1.0), dtype=np.float64)
@@ -131,34 +125,24 @@ class PolicyAdapter:
         angular_velocity = self.object_velocity[:3]
         rotation_world_from_base = data.xmat[self.base_body_id].reshape(3, 3)
         projected_gravity = rotation_world_from_base.T @ self.gravity_world
-        observation = np.concatenate(
-            (
+        try:
+            return assemble_observation(
                 joint_positions,
                 joint_velocities,
                 angular_velocity,
                 projected_gravity,
                 self.last_action,
             )
-        ).astype(np.float32)
-        if observation.shape != (42,) or not np.isfinite(observation).all():
-            raise RuntimeError("The 42-value observation contains a non-finite value")
-        return observation
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
 
     def apply(self, data, max_raw_action):
         observation = self.observation(data)
         output = self.session.run([self.output_name], {self.input_name: observation.reshape(1, 42)})[0]
-        action = np.asarray(output, dtype=np.float32).reshape(-1)
-        if action.shape != (12,) or not np.isfinite(action).all():
-            raise RuntimeError("The 12-value policy action contains a non-finite value")
-        raw_max = float(np.max(np.abs(action)))
-        if raw_max > max_raw_action:
-            raise RuntimeError(f"Raw action limit exceeded: {raw_max:.6f} > {max_raw_action:.6f}")
-        clipped = np.clip(action, -self.runner_clip, self.runner_clip)
-        scaled = clipped * self.scales + self.offsets
-        targets = np.clip(scaled, self.target_low, self.target_high)
-        self.policy_call_count += 1
-        self.runner_clip_count += int(np.count_nonzero(clipped != action))
-        self.target_clip_count += int(np.count_nonzero(targets != scaled))
+        try:
+            clipped, targets = self.pipeline.apply(output, max_raw_action=max_raw_action)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
         data.ctrl[self.actuator_ids] = targets
         self.last_action[:] = clipped
         return observation, clipped.copy(), targets.copy()
@@ -176,11 +160,11 @@ class PolicyAdapter:
                     "dof_address": int(self.dof_addresses[policy_index]),
                     "actuator_index": actuator_id,
                     "actuator": actuator_name,
-                    "scale": float(self.scales[policy_index]),
-                    "offset": float(self.offsets[policy_index]),
+                    "scale": float(self.pipeline.scales[policy_index]),
+                    "offset": float(self.pipeline.offsets[policy_index]),
                     "target_clip_rad": [
-                        float(self.target_low[policy_index]),
-                        float(self.target_high[policy_index]),
+                        float(self.pipeline.target_low[policy_index]),
+                        float(self.pipeline.target_high[policy_index]),
                     ],
                 }
             )
@@ -348,11 +332,11 @@ class Diagnostics:
             "fall_time_s": self.fall_time_s,
             "last_raw_action": self.last_action.tolist(),
             "last_targets_rad_policy_order": self.last_targets.tolist(),
-            "runner_action_clip": self.adapter.runner_clip,
-            "runner_clip_fraction": self.adapter.runner_clip_count
-            / max(1, self.adapter.policy_call_count * 12),
-            "target_clip_fraction": self.adapter.target_clip_count
-            / max(1, self.adapter.policy_call_count * 12),
+            "runner_action_clip": self.adapter.pipeline.runner_clip,
+            "runner_clip_fraction": self.adapter.pipeline.runner_clip_count
+            / max(1, self.adapter.pipeline.policy_call_count * 12),
+            "target_clip_fraction": self.adapter.pipeline.target_clip_count
+            / max(1, self.adapter.pipeline.policy_call_count * 12),
             "policy_mapping": self.adapter.mapping(),
         }
 
@@ -458,7 +442,7 @@ def check_result(model, data, adapter, args):
         "total_mass_kg": float(mujoco.mj_getTotalmass(model)),
         "timestep_s": float(model.opt.timestep),
         "policy_hz": args.policy_hz,
-        "runner_action_clip": adapter.runner_clip,
+        "runner_action_clip": adapter.pipeline.runner_clip,
         "spawn": args.spawn,
         "observation_shape": list(observation.shape),
         "action_shape": list(action.shape),

@@ -12,8 +12,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import can
 import n100
 from robonex_common.can import Motor
+from robonex_common.imu import DEFAULT_IMU_PORT, MOUNT_ROLL_DEG
 from robonex_common.joints import CHANNEL_MOTOR_IDS, JOINT_BY_ID, JOINT_BY_MODEL_NAME
 from robonex_common.policy import PolicyContract
+from robonex_common.runtime import ActionPipeline, assemble_observation
 from robonex_common.protocol import DEFAULT_INTERFACE, MECHANICAL_POSITION_INDEX, MECHANICAL_VELOCITY_INDEX
 
 try:
@@ -28,7 +30,6 @@ except ImportError:
 
 DEG = math.pi / 180.0
 
-MOUNT_ROLL_DEG = 180.0
 
 PRINT_HZ = 10.0
 CAN_TIMEOUT = 0.02
@@ -90,13 +91,14 @@ def build_observation(snapshot, ang_vel, gravity, prev_action, joint_order):
         pos[i] = p if p is not None else 0.0
         vel[i] = v if v is not None else 0.0
 
-    obs = np.concatenate([
-        pos, vel,
-        [ang_vel.x, ang_vel.y, ang_vel.z],
-        [gravity.x, gravity.y, gravity.z],
+    observation = assemble_observation(
+        pos,
+        vel,
+        (ang_vel.x, ang_vel.y, ang_vel.z),
+        (gravity.x, gravity.y, gravity.z),
         prev_action,
-    ]).astype(np.float32)
-    return obs.reshape(1, -1)
+    )
+    return observation.reshape(1, -1)
 
 
 def main():
@@ -104,7 +106,7 @@ def main():
         description="Build a live observation, run the policy, and print targets. Read-only.")
     parser.add_argument("--manifest", type=Path, required=True,
                         help="policy_manifest.json created with policy.onnx")
-    parser.add_argument("--imu-port", default="/dev/ttyUSB0", help="IMU serial port")
+    parser.add_argument("--imu-port", default=DEFAULT_IMU_PORT, help="IMU serial port")
     parser.add_argument("--channels", nargs="+", default=list(CHANNEL_MOTOR_IDS),
                         choices=list(CHANNEL_MOTOR_IDS), help="CAN channels to use")
     parser.add_argument("--interface", default=DEFAULT_INTERFACE, help="python-can interface")
@@ -123,6 +125,7 @@ def main():
         print(f"Policy manifest error: {error}")
         return 1
 
+    pipeline = ActionPipeline(contract)
     session = ort.InferenceSession(str(policy), providers=["CPUExecutionProvider"])
     input_name = session.get_inputs()[0].name
     input_shape = session.get_inputs()[0].shape
@@ -204,12 +207,7 @@ def main():
             obs = build_observation(snapshot, ang_vel, gravity, prev_action, contract.joint_order)
             t0 = time.perf_counter()
             raw_action = session.run(None, {input_name: obs})[0][0]
-            action = np.clip(raw_action, -contract.runner_action_clip, contract.runner_action_clip)
-            targets = np.clip(
-                action * np.asarray(contract.action_scales) + np.asarray(contract.action_offsets),
-                np.asarray(contract.target_clips)[:, 0],
-                np.asarray(contract.target_clips)[:, 1],
-            )
+            action, targets = pipeline.apply(raw_action)
             infer_ms = (time.perf_counter() - t0) * 1000.0
 
             lines.append(f"\nRaw policy action ({infer_ms:.2f} ms) and clipped target")
