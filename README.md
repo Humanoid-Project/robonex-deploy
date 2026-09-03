@@ -3,19 +3,16 @@
 ## Setup
 ```bash
 cd ~/humanoid_project
-git clone https://github.com/Humanoid-Project/robonex-common.git
 git clone https://github.com/Humanoid-Project/robonex-deploy.git
+git clone https://github.com/Humanoid-Project/robonex-description.git
+git clone https://github.com/Humanoid-Project/imu-n100-test.git IMU_N100_Test
 cd robonex-deploy
-source ../robonex-common/setup/setup.sh robonex-description IMU_N100_Test
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-Shared across repos — see [`robonex-common/setup/SETUP.md`](https://github.com/Humanoid-Project/robonex-common/blob/main/setup/SETUP.md).
-
-| Variable | Required | Default | Description |
-| --- | :---: | --- | --- |
-| `ROBONEX_DESCRIPTION_ROOT` | No | Sibling `robonex-description` | Description checkout |
-| `ROBONEX_COMMON_ROOT` | No | Sibling `robonex-common` | Common checkout |
-| `IMU_N100_TEST_ROOT` | No | Sibling `IMU_N100_Test` | N100 SDK checkout |
+`robonex-common` is pinned in `requirements.txt` — see [`robonex-common/setup/SETUP.md`](https://github.com/Humanoid-Project/robonex-common/blob/main/setup/SETUP.md).
 
 <br>
 
