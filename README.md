@@ -2,6 +2,7 @@
 
 ## Setup
 ```bash
+# Example
 cd ~/humanoid_project
 git clone https://github.com/Humanoid-Project/robonex-deploy.git
 git clone https://github.com/Humanoid-Project/robonex-description.git
@@ -24,10 +25,10 @@ robonex-deploy/
 ├── policies/
 ├── scripts/
 │   ├── robonex_can.py
-│   ├── robonex_paths.py
 │   ├── sim_to_sim/
 │   │   └── play_policy.py
 │   ├── sim_to_real/
+│   │   ├── safety.py
 │   │   ├── mujoco_to_real.py
 │   │   ├── process_mujoco_to_real.py
 │   │   └── real_to_mujoco.py
@@ -87,8 +88,8 @@ python3 scripts/sim_to_sim/play_policy.py \
 | Option | Required | Default | Description |
 | --- | :---: | --- | --- |
 | `--hardware` | No | Off | Enable real CAN motor control |
-| `--motor-id` | No | `1`–`12` | Motor IDs to control |
-| `--model` | No | `robonex-description/mujoco/scene_fixed.xml` | Fixed-base MJCF |
+| `--motor-id`, `--motor-ids` | No | `1`–`12` | Motor IDs to control |
+| `--model` | No | `robonex-description/mujoco/basic/scene_fixed.xml` | Fixed-base MJCF |
 | `--interface` | No | `socketcan` | python-can interface |
 | `--host-id` | No | `0xFD` | Host CAN ID |
 | `--rate` | No | `100.0` | Command rate (Hz) |
@@ -126,8 +127,10 @@ python3 scripts/sim_to_real/mujoco_to_real.py \
 | Option | Required | Default | Description |
 | --- | :---: | --- | --- |
 | `--hardware` | No | Off | Enable real CAN motor control |
-| `--motor-id` | No | `1`–`12` | Motor IDs to control |
-| `--model` | No | `robonex-description/mujoco/scene_fixed.xml` | Fixed-base MJCF |
+| `--motor-id`, `--motor-ids` | No | `1`–`12` | Motor IDs to control |
+| `--interface` | No | `socketcan` | python-can interface |
+| `--host-id` | No | `0xFD` | Host CAN ID |
+| `--model` | No | `robonex-description/mujoco/basic/scene_fixed.xml` | Fixed-base MJCF |
 | `--rate` | No | `100.0` | Command rate (Hz) |
 | `--max-speed` | No | `1.0` | Maximum timed-segment speed (rad/s) |
 | `--time-scale` | No | `1.0` | Sequence duration multiplier |
@@ -135,6 +138,7 @@ python3 scripts/sim_to_real/mujoco_to_real.py \
 | `--approach-accel` | No | `0.25` | Acceleration for approach moves (rad/s²) |
 | `--kp` | No | `40.0` | Position gain |
 | `--kd` | No | `2.0` | Velocity gain |
+| `--zero-tolerance-deg` | No | `3.0` | Zero-reach band (deg) |
 | `--limit-margin-deg` | No | `2.0` | Inner joint-limit margin (deg) |
 | `--feedback-timeout` | No | `0.30` | Type `0x02` freshness timeout (s) |
 | `--overspeed` | No | `2.0` | Measured-speed stop (rad/s) |
@@ -165,8 +169,8 @@ python3 scripts/sim_to_real/process_mujoco_to_real.py \
 | Option | Required | Default | Description |
 | --- | :---: | --- | --- |
 | `--hardware` | No | Off | Enable real CAN position reads |
-| `--motor-id` | No | `1`–`12` | Motor IDs to read |
-| `--model` | No | `robonex-description/mujoco/full_limit/scene_fixed_full_limit.xml` | Fixed-base MJCF |
+| `--motor-id`, `--motor-ids` | No | `1`–`12` | Motor IDs to read |
+| `--model` | No | `robonex-description/mujoco/full_limit/scene_fixed.xml` | Fixed-base MJCF |
 | `--interface` | No | `socketcan` | python-can interface |
 | `--host-id` | No | `0xFD` | Host CAN ID |
 | `--rate` | No | `30.0` | mechPos rate per motor (Hz) |
@@ -231,3 +235,52 @@ python3 scripts/policy_test/print_policy_action.py \
   --manifest policies/<run>/policy_manifest.json \
   --imu-port /dev/ttyUSB0
 ```
+
+## Parameter inventory
+
+All CLI tables above also support `-h` / `--help`. Values below are source settings or manifest/environment inputs, not additional CLI flags.
+
+### Source limits and timing
+
+| Script | Setting | Current value / meaning |
+| --- | --- | --- |
+| `mujoco_to_real.py` | `MAX_CONFIG_SPEED` | `0.5` rad/s cap for `--max-speed` |
+| `mujoco_to_real.py` | `MAX_CONFIG_ACCEL`, `MAX_CONFIG_RATE` | `2.0` rad/s², `200.0` Hz |
+| `mujoco_to_real.py` | `ZERO_SETTLE_TIMEOUT` | `5.0` s zero-settling allowance |
+| `process_mujoco_to_real.py` | `MAX_CONFIG_SPEED` | `2.0` rad/s cap for `--max-speed` |
+| `process_mujoco_to_real.py` | `MAX_CONFIG_ACCEL`, `MAX_CONFIG_RATE` | `2.0` rad/s², `200.0` Hz |
+| `process_mujoco_to_real.py` | `ZERO_SETTLE_TIMEOUT` | `5.0` s zero-settling allowance |
+| `process_mujoco_to_real.py` | `MIN_SEGMENT_TIME` | `0.05` s minimum scaled keyframe duration |
+| `real_to_mujoco.py` | `MAX_RATE` | `100.0` Hz maximum accepted read rate |
+| Both policy-test scripts | `MOUNT_ROLL_DEG` | `180.0` deg IMU correction imported from common |
+
+The two motor-driving scripts require `--overspeed > --max-speed`; the timed player also requires `--approach-speed <= --max-speed`. Gains must fit every selected motor's common encoding range. A margin that empties any joint's allowed interval is rejected. `--duration 0` means unlimited only in `play_policy.py`; the sim-to-real duration options require a finite positive value.
+
+### Policy and path inputs
+
+| Input | Source / current behavior |
+| --- | --- |
+| Action offsets, scales, target clips | `policy_manifest.json`; 12 values/pairs in `joint_order` |
+| `runner_action_clip`, `policy_hz` | Manifest; current exporters write `3.0`, `50.0` Hz |
+| `observation_size`, `action_size` | Manifest; current exporters write `42`, `12` |
+| `ROBONEX_DESCRIPTION_ROOT` | Description checkout override; `--description-root` takes precedence in `play_policy.py` |
+| `ROBONEX_COMMON_ROOT` | Common checkout override still required by `play_policy.py`'s Git-SHA validation, despite tag-based package installation |
+| `IMU_N100_TEST_ROOT` | IMU SDK root used by the policy-test CMake build |
+
+### `process_mujoco_to_real.py` source sequence
+
+`SEQUENCE` is a list of `(duration_s, {motor_id: target_rad})` keyframes. Targets below are motor-space radians. `--time-scale` multiplies durations; movement from zero to keyframe 0 uses the approach speed/acceleration instead of its stored duration. Keyframes 1–10 are timed linear interpolation segments. Editing the sequence currently requires editing source.
+
+| Keyframe | Stored seconds | ID1 | ID2 | ID3 | ID4 | ID5 | ID6 | ID7 | ID8 | ID9 | ID10 | ID11 | ID12 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 0.35 | 0 | 0 | 0 | -0.12 | 0.05 | -0.05 | 0 | 0 | 0 | 0.12 | -0.05 | 0.05 |
+| 1 | 0.35 | 0 | 0.1646 | 0 | -0.4433 | 0.1088 | -0.1088 | 0 | 0 | 0 | 0.12 | -0.05 | 0.05 |
+| 2 | 0.35 | 0 | 0.2663 | 0 | -0.6431 | 0.1451 | -0.1451 | 0 | 0 | 0 | 0.12 | -0.05 | 0.05 |
+| 3 | 0.35 | 0 | 0.2663 | 0 | -0.6431 | 0.1451 | -0.1451 | 0 | 0 | 0 | 0.12 | -0.05 | 0.05 |
+| 4 | 0.35 | 0 | 0.1646 | 0 | -0.4433 | 0.1088 | -0.1088 | 0 | 0 | 0 | 0.12 | -0.05 | 0.05 |
+| 5 | 0.35 | 0 | 0 | 0 | -0.12 | 0.05 | -0.05 | 0 | 0 | 0 | 0.12 | -0.05 | 0.05 |
+| 6 | 0.35 | 0 | 0 | 0 | -0.12 | 0.05 | -0.05 | 0 | -0.1646 | 0 | 0.4433 | -0.1088 | 0.1088 |
+| 7 | 0.35 | 0 | 0 | 0 | -0.12 | 0.05 | -0.05 | 0 | -0.2663 | 0 | 0.6431 | -0.1451 | 0.1451 |
+| 8 | 0.35 | 0 | 0 | 0 | -0.12 | 0.05 | -0.05 | 0 | -0.2663 | 0 | 0.6431 | -0.1451 | 0.1451 |
+| 9 | 0.35 | 0 | 0 | 0 | -0.12 | 0.05 | -0.05 | 0 | -0.1646 | 0 | 0.4433 | -0.1088 | 0.1088 |
+| 10 | 0.35 | 0 | 0 | 0 | -0.12 | 0.05 | -0.05 | 0 | 0 | 0 | 0.12 | -0.05 | 0.05 |

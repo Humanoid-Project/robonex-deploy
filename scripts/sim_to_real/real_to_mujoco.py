@@ -20,18 +20,17 @@ sys.path.insert(0, str(THIS_FILE.parents[1]))
 
 from robonex_common.paths import description_model
 
-DEFAULT_MODEL_PATH = description_model("mujoco/full_limit/scene_fixed_full_limit.xml", anchors=(__file__,))
+DEFAULT_MODEL_PATH = description_model("mujoco/full_limit/scene_fixed.xml", anchors=(__file__,))
 
-from mujoco_to_real import (
+from robonex_can import (
     DEFAULT_INTERFACE,
     HOST_ID,
     JOINT_MAP,
     MOTOR_MODELS,
     channel_for_id,
     clamp,
-    load_fixed_model,
-    open_hardware,
 )
+from safety import load_fixed_model, open_hardware
 
 MAX_RATE = 100.0
 

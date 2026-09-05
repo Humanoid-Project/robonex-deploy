@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-from dataclasses import dataclass
 import math
 from pathlib import Path
 import sys
@@ -12,7 +11,6 @@ import time
 import can
 import mujoco
 import mujoco.viewer
-import numpy as np
 
 THIS_FILE = Path(__file__).resolve()
 SCRIPTS_DIR = THIS_FILE.parents[1]
@@ -24,16 +22,13 @@ from robonex_common.paths import description_model
 from robonex_can import (
     JOINT_LIMITS_RAD,
     DEFAULT_INTERFACE,
-    FeedbackHub,
     HOST_ID,
     JOINT_MAP,
-    Motor,
     SPECS,
-    channel_for_id,
     clamp,
 )
 
-from robonex_can import MOTOR_ACTUATORS, MOTOR_MODELS
+from robonex_can import MOTOR_MODELS
 from safety import (
     AxisLimiter,
     align_angle,
@@ -48,7 +43,7 @@ from safety import (
     wrap_to_pi,
 )
 
-DEFAULT_MODEL_PATH = description_model("mujoco/scene_fixed.xml", anchors=(__file__,))
+DEFAULT_MODEL_PATH = description_model("mujoco/basic/scene_fixed.xml", anchors=(__file__,))
 
 MAX_CONFIG_SPEED = 2.0
 MAX_CONFIG_ACCEL = 2.0

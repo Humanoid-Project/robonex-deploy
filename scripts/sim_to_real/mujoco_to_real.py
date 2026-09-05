@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-from dataclasses import dataclass
 import math
 from pathlib import Path
 import sys
@@ -25,18 +24,13 @@ from robonex_common.paths import description_model
 from robonex_can import (
     JOINT_LIMITS_RAD,
     DEFAULT_INTERFACE,
-    FeedbackHub,
     HOST_ID,
     JOINT_MAP,
-    Motor,
     SPECS,
-    build_arb,
-    channel_for_id,
     clamp,
-    parse_arb,
 )
 
-from robonex_can import MOTOR_ACTUATORS, MOTOR_MODELS
+from robonex_can import MOTOR_MODELS
 from safety import (
     AxisLimiter,
     align_angle,
@@ -51,7 +45,7 @@ from safety import (
     wrap_to_pi,
 )
 
-DEFAULT_MODEL_PATH = description_model("mujoco/scene_fixed.xml", anchors=(__file__,))
+DEFAULT_MODEL_PATH = description_model("mujoco/basic/scene_fixed.xml", anchors=(__file__,))
 
 MAX_CONFIG_SPEED = 0.5
 MAX_CONFIG_ACCEL = 2.0
