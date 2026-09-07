@@ -117,7 +117,7 @@ class PolicyAdapter:
         mujoco.mj_objectVelocity(
             self.model,
             data,
-            mujoco.mjtObj.mjOBJ_BODY,
+            mujoco.mjtObj.mjOBJ_XBODY,
             self.base_body_id,
             self.object_velocity,
             1,
@@ -257,7 +257,7 @@ class Diagnostics:
         mujoco.mj_objectVelocity(
             self.model,
             data,
-            mujoco.mjtObj.mjOBJ_BODY,
+            mujoco.mjtObj.mjOBJ_XBODY,
             self.adapter.base_body_id,
             self.adapter.object_velocity,
             1,
@@ -287,7 +287,7 @@ class Diagnostics:
         self.contact_normal_force_max = max(self.contact_normal_force_max, normal_force_max)
         return root_z, constraint_error, overrun
 
-    def result(self, data, status, reason, wall_seconds, model_path, policy_path, spawn):
+    def result(self, data, status, reason, wall_seconds, model_path, policy_path):
         denominator = max(1, self.physics_steps)
         force_denominator = max(1, self.force_sample_count)
         roll, pitch, yaw = quaternion_to_rpy(data.xquat[self.adapter.base_body_id])
@@ -298,7 +298,7 @@ class Diagnostics:
             "wall_time_s": wall_seconds,
             "physics_steps": self.physics_steps,
             "policy_steps": self.policy_steps,
-            "spawn": spawn,
+            "spawn": "isaac",
             "model": str(model_path),
             "model_sha256": file_hash(model_path),
             "included_robot_sha256": sibling_robot_hash(model_path),
@@ -341,10 +341,17 @@ class Diagnostics:
         }
 
 
-def reset_simulation(model, data, adapter, spawn):
+class HeadlessViewer:
+    def is_running(self):
+        return True
+
+    def sync(self):
+        return None
+
+
+def reset_simulation(model, data, adapter):
     mujoco.mj_resetData(model, data)
-    if spawn == "isaac":
-        data.qpos[adapter.root_qpos_address + 2] = 1.0789
+    data.qpos[adapter.root_qpos_address + 2] = 1.0789
     adapter.reset()
     mujoco.mj_forward(model, data)
 
@@ -356,8 +363,8 @@ def state_is_finite(data):
     )
 
 
-def simulate(model, data, adapter, args, viewer_handle=None):
-    reset_simulation(model, data, adapter, args.spawn)
+def simulate(model, data, adapter, args, viewer_handle):
+    reset_simulation(model, data, adapter)
     diagnostics = Diagnostics(model, adapter)
     policy_period = 1.0 / args.policy_hz
     next_policy_time = 0.0
@@ -365,10 +372,12 @@ def simulate(model, data, adapter, args, viewer_handle=None):
     wall_start = time.perf_counter()
     status = "timeout"
     reason = "duration_reached"
-    while data.time < args.duration:
-        if viewer_handle is not None and not viewer_handle.is_running():
+    while True:
+        if not viewer_handle.is_running():
             status = "viewer_closed"
             reason = "viewer_closed"
+            break
+        if args.duration is not None and data.time >= args.duration:
             break
         if data.time + 1.0e-12 >= next_policy_time:
             try:
@@ -388,10 +397,6 @@ def simulate(model, data, adapter, args, viewer_handle=None):
         if root_z < args.minimum_height:
             if diagnostics.fall_time_s is None:
                 diagnostics.fall_time_s = float(data.time)
-            if viewer_handle is None or args.stop_on_fall:
-                status = "fall"
-                reason = f"root_z_below_{args.minimum_height}"
-                break
         if constraint_error > args.max_constraint_error:
             status = "constraint_divergence"
             reason = f"constraint_error_above_{args.max_constraint_error}"
@@ -404,10 +409,10 @@ def simulate(model, data, adapter, args, viewer_handle=None):
             status = "position_divergence"
             reason = f"body_position_above_{args.max_body_position}"
             break
-        if viewer_handle is not None and data.time + 1.0e-12 >= next_viewer_sync:
+        if data.time + 1.0e-12 >= next_viewer_sync:
             viewer_handle.sync()
             next_viewer_sync += policy_period
-        if args.real_time or viewer_handle is not None:
+        if not args.headless:
             sleep_seconds = wall_start + data.time - time.perf_counter()
             if sleep_seconds > 0.0:
                 time.sleep(sleep_seconds)
@@ -419,70 +424,40 @@ def simulate(model, data, adapter, args, viewer_handle=None):
         wall_seconds,
         args.model,
         args.policy,
-        args.spawn,
     )
-
-
-def check_result(model, data, adapter, args):
-    reset_simulation(model, data, adapter, args.spawn)
-    observation, action, targets = adapter.apply(data, args.max_raw_action)
-    return {
-        "status": "check_ok",
-        "model": str(args.model),
-        "model_sha256": file_hash(args.model),
-        "included_robot_sha256": sibling_robot_hash(args.model),
-        "policy": str(args.policy),
-        "policy_sha256": file_hash(args.policy),
-        "mujoco_version": mujoco.__version__,
-        "onnxruntime_version": ort.__version__,
-        "nq": model.nq,
-        "nv": model.nv,
-        "nu": model.nu,
-        "neq": model.neq,
-        "total_mass_kg": float(mujoco.mj_getTotalmass(model)),
-        "timestep_s": float(model.opt.timestep),
-        "policy_hz": args.policy_hz,
-        "runner_action_clip": adapter.pipeline.runner_clip,
-        "spawn": args.spawn,
-        "observation_shape": list(observation.shape),
-        "action_shape": list(action.shape),
-        "initial_raw_action": action.tolist(),
-        "initial_targets_rad_policy_order": targets.tolist(),
-        "policy_mapping": adapter.mapping(),
-        "passive_joint_actuators": [],
-    }
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--description-root", type=Path)
-    parser.add_argument("--model", type=Path)
-    parser.add_argument("--duration", type=float)
-    parser.add_argument("--spawn", choices=("mujoco", "isaac"), default="mujoco")
-    parser.add_argument("--viewer", action="store_true")
-    parser.add_argument("--stop-on-fall", action="store_true")
-    parser.add_argument("--real-time", action="store_true")
-    parser.add_argument("--check-only", action="store_true")
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--minimum-height", type=float, default=0.6)
-    parser.add_argument("--max-raw-action", type=float, default=20.0)
-    parser.add_argument("--max-constraint-error", type=float, default=0.05)
-    parser.add_argument("--max-joint-overrun", type=float, default=0.05)
-    parser.add_argument("--max-body-position", type=float, default=100.0)
+    parser.add_argument("--policy", type=Path, required=True)
+    parser.add_argument("--output", type=Path, help="Optional JSON output path")
+    parser.add_argument("--duration", type=float, help="Stop after this many simulated seconds")
+    parser.add_argument("--headless", action="store_true", help="Run without opening the viewer")
     args = parser.parse_args()
-    args.manifest = args.manifest.expanduser().resolve()
-    if not args.manifest.is_file():
-        parser.error(f"Policy manifest not found: {args.manifest}")
+    if args.headless and args.duration is None:
+        parser.error("--headless requires --duration")
+    args.minimum_height = 0.6
+    args.max_raw_action = 20.0
+    args.max_constraint_error = 0.05
+    args.max_joint_overrun = 0.05
+    args.max_body_position = 100.0
+    args.policy = args.policy.expanduser().resolve()
+    if not args.policy.is_file():
+        parser.error(f"Policy not found: {args.policy}")
+    args.manifest = args.policy.with_name("policy_manifest.json")
     try:
         args.contract = PolicyContract.load(args.manifest)
-        args.policy = args.contract.verify_policy(args.manifest)
-        args.description_root = resolve_repo(
+        manifest_policy = args.contract.verify_policy(args.manifest)
+        if manifest_policy.resolve() != args.policy:
+            parser.error(
+                f"policy_manifest.json selects {manifest_policy.name}, not {args.policy.name}"
+            )
+        description_root = resolve_repo(
             DESCRIPTION_REPO_NAMES,
             "ROBONEX_DESCRIPTION_ROOT",
-            args.description_root,
+            None,
         )
-        actual_description_commit = git_commit(args.description_root)
+        actual_description_commit = git_commit(description_root)
         if actual_description_commit != args.contract.description_commit:
             parser.error(
                 f"robonex-description commit mismatch: manifest={args.contract.description_commit}, "
@@ -495,22 +470,12 @@ def parse_args():
                 f"robonex-common commit mismatch: manifest={args.contract.common_commit}, "
                 f"checkout={actual_common_commit}"
             )
-        args.model = (
-            args.model.expanduser().resolve()
-            if args.model
-            else description_model(args.contract.description_model, args.description_root)
-        )
+        args.model = description_model(args.contract.description_model, description_root)
     except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as error:
         parser.error(str(error))
     args.policy_hz = args.contract.policy_hz
     if not args.model.is_file():
         parser.error(f"MuJoCo model not found: {args.model}")
-    if args.duration is None:
-        args.duration = math.inf if args.viewer else 15.0
-    elif args.duration == 0.0:
-        args.duration = math.inf
-    elif args.duration < 0.0:
-        parser.error("--duration must be zero or greater")
     if args.output is not None:
         args.output = args.output.resolve()
     return args
@@ -521,19 +486,17 @@ def main():
     model = mujoco.MjModel.from_xml_path(str(args.model))
     data = mujoco.MjData(model)
     adapter = PolicyAdapter(model, args.policy, args.contract)
-    if args.check_only:
-        result = check_result(model, data, adapter, args)
-    elif args.viewer:
+    if args.headless:
+        result = simulate(model, data, adapter, args, HeadlessViewer())
+    else:
         with mujoco.viewer.launch_passive(model, data) as viewer_handle:
             result = simulate(model, data, adapter, args, viewer_handle)
-    else:
-        result = simulate(model, data, adapter, args)
     text = json.dumps(result, ensure_ascii=False, indent=2)
     print(text)
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(text + "\n", encoding="utf-8")
-    return 0 if result["status"] in {"check_ok", "timeout", "viewer_closed"} else 1
+    return 0 if result["status"] in ("viewer_closed", "timeout") else 1
 
 
 if __name__ == "__main__":

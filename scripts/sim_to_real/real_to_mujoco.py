@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-import contextlib
 import math
 from pathlib import Path
 import sys
@@ -32,9 +31,6 @@ from robonex_can import (
 )
 from safety import load_fixed_model, open_hardware
 
-MAX_RATE = 100.0
-
-
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
@@ -43,78 +39,23 @@ def parse_args(argv=None):
         )
     )
     parser.add_argument(
-        "--hardware",
-        action="store_true",
-        help="Enable real CAN position reads",
-    )
-    parser.add_argument(
         "--motor-id",
-        "--motor-ids",
         dest="motor_id",
         nargs="+",
         type=lambda value: int(value, 0),
         default=list(range(1, 13)),
         help="Motor IDs to read. Default: 1 through 12",
     )
-    parser.add_argument(
-        "--model",
-        type=Path,
-        default=DEFAULT_MODEL_PATH,
-        help=f"Fixed-base MJCF scene. Default: {DEFAULT_MODEL_PATH}",
-    )
-    parser.add_argument(
-        "--interface",
-        default=DEFAULT_INTERFACE,
-        help="python-can interface. Default: socketcan",
-    )
-    parser.add_argument("--host-id", type=lambda value: int(value, 0), default=HOST_ID)
-    parser.add_argument(
-        "--rate",
-        type=float,
-        default=30.0,
-        help="mechPos update rate per motor in Hz. Default: 30",
-    )
-    parser.add_argument(
-        "--read-timeout",
-        type=float,
-        default=0.03,
-        help="Timeout for one mechPos request in seconds. Default: 0.03",
-    )
-    parser.add_argument(
-        "--startup-timeout",
-        type=float,
-        default=2.0,
-        help="Initial position collection timeout in seconds. Default: 2.0",
-    )
-    parser.add_argument(
-        "--stale-timeout",
-        type=float,
-        default=0.5,
-        help="Stale position timeout in seconds. Default: 0.5",
-    )
-    parser.add_argument(
-        "--limit-tolerance-deg",
-        type=float,
-        default=1.0,
-        help="Encoder tolerance outside model limits in degrees. Default: 1",
-    )
-    parser.add_argument(
-        "--yes",
-        action="store_true",
-        help="Skip the start confirmation prompt",
-    )
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run without a viewer; requires --duration",
-    )
-    parser.add_argument(
-        "--duration",
-        type=float,
-        default=None,
-        help="Stop after this many seconds",
-    )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.model = DEFAULT_MODEL_PATH
+    args.interface = DEFAULT_INTERFACE
+    args.host_id = HOST_ID
+    args.rate = 30.0
+    args.read_timeout = 0.03
+    args.startup_timeout = 2.0
+    args.stale_timeout = 0.5
+    args.limit_tolerance_deg = 1.0
+    return args
 
 
 def validate_args(args):
@@ -123,28 +64,6 @@ def validate_args(args):
     unknown = [motor_id for motor_id in motor_ids if motor_id not in MOTOR_MODELS]
     if unknown:
         problems.append(f"Unsupported motor ID: {unknown}")
-    if not args.hardware:
-        problems.append("--hardware is required to read real motor positions")
-    for name in (
-        "rate",
-        "read_timeout",
-        "startup_timeout",
-        "stale_timeout",
-        "limit_tolerance_deg",
-    ):
-        value = getattr(args, name)
-        if not math.isfinite(value) or value <= 0.0:
-            problems.append(f"--{name.replace('_', '-')} must be finite and positive")
-    if args.rate > MAX_RATE:
-        problems.append(f"--rate must be at most {MAX_RATE:g} Hz")
-    if args.read_timeout >= args.stale_timeout:
-        problems.append("--read-timeout must be smaller than --stale-timeout")
-    if args.duration is not None and (
-        not math.isfinite(args.duration) or args.duration <= 0.0
-    ):
-        problems.append("--duration must be finite and positive")
-    if args.headless and args.duration is None:
-        problems.append("--headless requires --duration")
     return motor_ids, problems
 
 
@@ -152,15 +71,10 @@ def confirm_hardware(args, motor_ids, model_path):
     print("\nThis tool does not drive motors. It only reads hand-moved positions.")
     print(f"  model       : {model_path}")
     print(f"  motor IDs   : {motor_ids}")
-    print(f"  update rate : {args.rate:g} Hz per motor")
-    print("  CAN write   : stop at startup and shutdown only")
-    print("  CAN read    : parallel mechPos (0x7019) reads per bus")
-    print("  Never sends : enable, run-mode writes, or type-0x01 control")
-    print("  Required    : fixed robot, clear joints, and safe hand placement")
-    if args.yes:
-        return
+    print("  Motors remain disabled; only stop and position-read messages are sent.")
+    print("  Keep the robot fixed and joints clear.")
     if not sys.stdin.isatty():
-        raise RuntimeError("Start confirmation requires an interactive terminal or --yes")
+        raise RuntimeError("Start confirmation requires an interactive terminal")
     answer = input("Press Enter to send stop and start mirroring, or Ctrl-C to cancel: ")
     if answer.strip():
         raise RuntimeError("Cancelled because the input was not empty")
@@ -343,11 +257,6 @@ def run(args):
             if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
                 raise RuntimeError("Initial MuJoCo state contains NaN or infinity")
 
-            viewer_context = (
-                contextlib.nullcontext(None)
-                if args.headless
-                else mujoco.viewer.launch_passive(model, data)
-            )
             period = 1.0 / args.rate
             sim_steps = max(1, int(round(period / model.opt.timestep)))
             start_time = time.monotonic()
@@ -355,11 +264,9 @@ def run(args):
             last_print = 0.0
 
             print("\nPosition mirroring started. Close the viewer or press Ctrl-C to stop.")
-            with viewer_context as viewer:
-                while viewer is None or viewer.is_running():
+            with mujoco.viewer.launch_passive(model, data) as viewer:
+                while viewer.is_running():
                     now = time.monotonic()
-                    if args.duration is not None and now - start_time >= args.duration:
-                        break
                     poll_positions(
                         motors,
                         groups,
@@ -372,15 +279,13 @@ def run(args):
                     targets, clamped = validate_positions(
                         positions, limits, math.radians(args.limit_tolerance_deg)
                     )
-                    lock = viewer.lock() if viewer is not None else contextlib.nullcontext()
-                    with lock:
+                    with viewer.lock():
                         for motor_id, target in targets.items():
                             data.ctrl[actuator_ids[motor_id]] = target
                         mujoco.mj_step(model, data, nstep=sim_steps)
                         if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
                             raise RuntimeError("MuJoCo state contains NaN or infinity")
-                    if viewer is not None:
-                        viewer.sync()
+                    viewer.sync()
                     if now - last_print >= 1.0:
                         last_print = now
                         print_status(data, qpos_addresses, positions, targets, clamped)

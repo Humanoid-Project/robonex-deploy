@@ -104,25 +104,21 @@ def build_observation(snapshot, ang_vel, gravity, prev_action, joint_order):
 def main():
     parser = argparse.ArgumentParser(
         description="Build a live observation, run the policy, and print targets. Read-only.")
-    parser.add_argument("--manifest", type=Path, required=True,
-                        help="policy_manifest.json created with policy.onnx")
-    parser.add_argument("--imu-port", default=DEFAULT_IMU_PORT, help="IMU serial port")
-    parser.add_argument("--channels", nargs="+", default=list(CHANNEL_MOTOR_IDS),
-                        choices=list(CHANNEL_MOTOR_IDS), help="CAN channels to use")
-    parser.add_argument("--interface", default=DEFAULT_INTERFACE, help="python-can interface")
-    parser.add_argument("--timeout", type=float, default=CAN_TIMEOUT,
-                        help="Timeout for one motor parameter request in seconds")
-    parser.add_argument("--rate", type=float, default=PRINT_HZ, help="Display update rate in Hz")
+    parser.add_argument("--policy", type=Path, required=True, help="ONNX policy path")
     args = parser.parse_args()
-
-    if args.rate <= 0:
-        print("--rate must be positive.")
-        return 1
+    policy = args.policy.expanduser().resolve()
+    manifest = policy.with_name("policy_manifest.json")
     try:
-        contract = PolicyContract.load(args.manifest)
-        policy = contract.verify_policy(args.manifest)
+        if not policy.is_file():
+            raise FileNotFoundError(policy)
+        contract = PolicyContract.load(manifest)
+        manifest_policy = contract.verify_policy(manifest)
+        if manifest_policy.resolve() != policy:
+            raise ValueError(
+                f"policy_manifest.json selects {manifest_policy.name}, not {policy.name}"
+            )
     except (FileNotFoundError, ValueError) as error:
-        print(f"Policy manifest error: {error}")
+        print(f"Policy error: {error}")
         return 1
 
     pipeline = ActionPipeline(contract)
@@ -136,22 +132,32 @@ def main():
     if output_shape[-1] not in (None, "None", contract.action_size):
         print(f"Policy output size does not match the manifest: {output_shape}")
         return 1
-    print(f"Policy: {policy}")
-    print(f"  Input {input_shape}  Output {output_shape}")
-    print("  Contract: 12 active motor joints; passive closed-loop joints are never targeted.\n")
+    print(f"Policy loaded: {policy}")
+
+    if not sys.stdin.isatty():
+        print("Start confirmation requires an interactive terminal")
+        return 1
+    try:
+        answer = input("Press Enter to start reading CAN and IMU, or Ctrl-C to cancel: ")
+    except KeyboardInterrupt:
+        print("\nStop requested.")
+        return 0
+    if answer.strip():
+        print("Cancelled because the input was not empty")
+        return 1
 
     notes = []
     state = {mid: (None, None) for mid in JOINT_BY_ID}
     lock = threading.Lock()
 
-    readers = [CanReader(channel, CHANNEL_MOTOR_IDS[channel], args.interface, args.timeout,
+    readers = [CanReader(channel, motor_ids, DEFAULT_INTERFACE, CAN_TIMEOUT,
                          state, lock, notes)
-              for channel in args.channels]
+              for channel, motor_ids in CHANNEL_MOTOR_IDS.items()]
     for reader in readers:
         reader.start()
 
     driver = n100.ImuDriver(n100.DriverConfig(
-        port=args.imu_port,
+        port=DEFAULT_IMU_PORT,
         mount_rotation=n100.Quat.from_axis_angle_x(MOUNT_ROLL_DEG * DEG),
     ))
     imu_status = "Starting..."
@@ -166,13 +172,12 @@ def main():
         imu_status = "Start failed"
         notes.append(f"[IMU] {error}")
         notes.append(f"      ls /dev/ttyUSB* /dev/ttyACM*  "
-                     f"(permissions: sudo chmod 666 {args.imu_port})")
+                     f"(permissions: sudo chmod 666 {DEFAULT_IMU_PORT})")
 
     time.sleep(0.3)
 
     prev_action = np.zeros(12, dtype=np.float32)
 
-    print("Press Ctrl-C to stop.\n")
     try:
         while True:
             with lock:
@@ -226,7 +231,7 @@ def main():
             sys.stdout.flush()
 
             prev_action = action.astype(np.float32)
-            time.sleep(1.0 / args.rate)
+            time.sleep(1.0 / PRINT_HZ)
     except KeyboardInterrupt:
         pass
     finally:
