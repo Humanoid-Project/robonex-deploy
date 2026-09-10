@@ -82,7 +82,7 @@ class PolicyAdapter:
         )
         self.qpos_addresses = model.jnt_qposadr[self.joint_ids].astype(np.int32)
         self.dof_addresses = model.jnt_dofadr[self.joint_ids].astype(np.int32)
-        self.default_positions = model.qpos0[self.qpos_addresses].copy()
+        self.default_positions = np.asarray(contract.action_offsets, dtype=np.float64)
         actuator_ids = []
         for name, joint_id in zip(self.joint_names, self.joint_ids):
             matches = np.flatnonzero(model.actuator_trnid[:, 0] == joint_id)
@@ -105,6 +105,10 @@ class PolicyAdapter:
         if model.jnt_type[self.root_joint_id] != mujoco.mjtJoint.mjJNT_FREE:
             raise RuntimeError("The root joint is not a free joint")
         self.root_qpos_address = int(model.jnt_qposadr[self.root_joint_id])
+        self.home_keyframe_id = required_id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+        home_positions = model.key_qpos[self.home_keyframe_id, self.qpos_addresses]
+        if not np.allclose(home_positions, self.default_positions, rtol=0.0, atol=1.0e-8):
+            raise RuntimeError("MuJoCo home keyframe does not match the policy action offsets")
         self.floor_geom_id = required_id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
         self.left_foot_body_id = required_id(model, mujoco.mjtObj.mjOBJ_BODY, "l_foot")
         self.right_foot_body_id = required_id(model, mujoco.mjtObj.mjOBJ_BODY, "r_foot")
@@ -355,8 +359,7 @@ class HeadlessViewer:
 
 
 def reset_simulation(model, data, adapter):
-    mujoco.mj_resetData(model, data)
-    data.qpos[adapter.root_qpos_address + 2] = 1.0789
+    mujoco.mj_resetDataKeyframe(model, data, adapter.home_keyframe_id)
     adapter.reset()
     mujoco.mj_forward(model, data)
 
