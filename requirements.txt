@@ -1,4 +1,4 @@
-robonex-common[can,policy] @ git+https://github.com/Humanoid-Project/robonex-common.git@v0.2.0
+robonex-common[can,policy] @ git+https://github.com/Humanoid-Project/robonex-common.git@v0.3.0
 mujoco==3.11.0
 numpy==2.2.6
 onnxruntime==1.23.2

@@ -19,7 +19,7 @@ sys.path.insert(0, str(THIS_FILE.parents[1]))
 
 from robonex_common.paths import description_model
 
-DEFAULT_MODEL_PATH = description_model("mujoco/full_limit/scene_fixed.xml", anchors=(__file__,))
+DEFAULT_MODEL_PATH = description_model("mujoco/robot/scene_fixed.xml", anchors=(__file__,))
 
 from robonex_can import (
     DEFAULT_INTERFACE,

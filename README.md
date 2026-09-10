@@ -48,7 +48,7 @@ robonex-deploy/
 
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
-| - | `--policy` | - | ONNX policy path |
+| - | `--policy` | `Required` | ONNX policy path |
 | - | `--output` | Terminal only | Optional JSON output path |
 | - | `--duration` | Until the viewer closes | Stop after this many simulated seconds |
 | - | `--headless` | Viewer on | Run without a viewer; requires `--duration` |
@@ -68,6 +68,9 @@ python3 scripts/sim_to_sim/isaac_to_mujoco.py \
   --duration 15 \
   --output /tmp/sim_to_sim.json
 ```
+
+The required schema-2 manifest verifies the policy file, MuJoCo XML/mesh bundle, action
+contract, and `robonex-common` runtime source before simulation starts.
 
 <br>
 
@@ -131,7 +134,7 @@ cmake --build build -j
 
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
-| - | `--manifest` | - | Policy manifest path |
+| - | `--manifest` | `Required` | Policy manifest path |
 
 ```bash
 # Example
@@ -145,7 +148,7 @@ python3 scripts/policy_test/print_policy_values.py \
 
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
-| - | `--policy` | - | ONNX policy path |
+| - | `--policy` | `Required` | ONNX policy path |
 
 ```bash
 # Example

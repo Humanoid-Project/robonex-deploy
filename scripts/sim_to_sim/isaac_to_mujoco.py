@@ -15,7 +15,12 @@ except ImportError as error:
     raise SystemExit(f"Missing required package: {error}")
 
 from robonex_common.joints import PASSIVE_CLOSED_LOOP_JOINTS
-from robonex_common.policy import PolicyContract, sha256_file
+from robonex_common.policy import (
+    PolicyContract,
+    mujoco_bundle_sha256,
+    python_source_sha256,
+    sha256_file,
+)
 from robonex_common.runtime import ActionPipeline, assemble_observation
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -463,12 +468,26 @@ def parse_args():
                 f"robonex-description commit mismatch: manifest={args.contract.description_commit}, "
                 f"checkout={actual_description_commit}"
             )
+        actual_description_sha256 = mujoco_bundle_sha256(
+            description_root, args.contract.description_model
+        )
+        if actual_description_sha256 != args.contract.description_sha256:
+            parser.error(
+                f"robonex-description model bundle mismatch: manifest={args.contract.description_sha256}, "
+                f"checkout={actual_description_sha256}"
+            )
         common_root = resolve_repo("robonex-common", "ROBONEX_COMMON_ROOT")
         actual_common_commit = git_commit(common_root)
         if actual_common_commit != args.contract.common_commit:
             parser.error(
                 f"robonex-common commit mismatch: manifest={args.contract.common_commit}, "
                 f"checkout={actual_common_commit}"
+            )
+        actual_common_sha256 = python_source_sha256(common_root, ("src/robonex_common",))
+        if actual_common_sha256 != args.contract.common_sha256:
+            parser.error(
+                f"robonex-common source mismatch: manifest={args.contract.common_sha256}, "
+                f"checkout={actual_common_sha256}"
             )
         args.model = description_model(args.contract.description_model, description_root)
     except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as error:
