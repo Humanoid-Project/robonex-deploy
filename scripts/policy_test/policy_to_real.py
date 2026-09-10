@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import subprocess
 import sys
 import threading
@@ -67,6 +68,28 @@ DEG = math.pi / 180.0
 CLEAR_SCREEN = "\033[2J\033[3J\033[H"
 
 
+class TeeStream:
+    def __init__(self, terminal, log, lock):
+        self.terminal = terminal
+        self.log = log
+        self.lock = lock
+
+    def write(self, value):
+        with self.lock:
+            written = self.terminal.write(value)
+            self.log.write(value.replace(CLEAR_SCREEN, ""))
+            self.log.flush()
+        return written
+
+    def flush(self):
+        with self.lock:
+            self.terminal.flush()
+            self.log.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.terminal, name)
+
+
 @dataclass(frozen=True)
 class Settings:
     interface: str = DEFAULT_INTERFACE
@@ -87,7 +110,7 @@ class Settings:
 
     approach_max_speed: float = 0.30
     approach_max_accel: float = 0.60
-    approach_tolerance_deg: float = 3.0
+    approach_tolerance_deg: float = 6.0
     approach_settle_timeout: float = 5.0
 
     policy_max_speed: float = 6.0
@@ -783,17 +806,28 @@ def parse_args(argv=None):
         help="Read-only preview: print observation, action and targets without commanding any motor",
     )
     parser.add_argument("--duration", type=float, help="Stop after this many seconds")
+    parser.add_argument(
+        "--log",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help="Save terminal output; omit PATH for an automatic file under results/policy_to_real",
+    )
     args = parser.parse_args(argv)
     args.policy = args.policy.expanduser().resolve()
     if not args.policy.is_file():
         parser.error(f"Policy not found: {args.policy}")
     if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0.0):
         parser.error("--duration must be finite and positive")
+    if args.log == "":
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        args.log = THIS_FILE.parents[2] / "results" / "policy_to_real" / f"{timestamp}_{os.getpid()}.log"
+    elif args.log is not None:
+        args.log = Path(args.log).expanduser().resolve()
     return args
 
 
-def main(argv=None):
-    args = parse_args(argv)
+def run(args):
     try:
         contract = resolve_contract(args.policy)
     except (FileNotFoundError, ValueError) as error:
@@ -808,6 +842,29 @@ def main(argv=None):
         return 0
     except (RuntimeError, ValueError, OSError, can.CanError, subprocess.CalledProcessError) as error:
         print(f"\nStopped: {error}")
+        return 1
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.log is None:
+        return run(args)
+    try:
+        args.log.parent.mkdir(parents=True, exist_ok=True)
+        with args.log.open("x", encoding="utf-8", buffering=1) as log:
+            original_stdout = sys.stdout
+            original_stderr = sys.stderr
+            lock = threading.Lock()
+            sys.stdout = TeeStream(original_stdout, log, lock)
+            sys.stderr = TeeStream(original_stderr, log, lock)
+            try:
+                print(f"Log file    : {args.log}")
+                return run(args)
+            finally:
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
+    except OSError as error:
+        print(f"Log error: {error}")
         return 1
 
 
