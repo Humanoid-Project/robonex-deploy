@@ -10,8 +10,16 @@ if(NOT IMU_N100_TEST_ROOT AND DEFINED ENV{IMU_N100_TEST_ROOT})
   set(IMU_N100_TEST_ROOT "$ENV{IMU_N100_TEST_ROOT}")
 endif()
 if(NOT IMU_N100_TEST_ROOT)
-  get_filename_component(IMU_N100_TEST_ROOT
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../IMU_N100_Test" ABSOLUTE)
+  # Same spellings as robonex_common.paths.IMU_REPO_NAMES: the GitHub name
+  # first, then the legacy renamed checkout.
+  foreach(candidate imu-n100-test IMU_N100_Test)
+    get_filename_component(candidate_root
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../../${candidate}" ABSOLUTE)
+    if(EXISTS "${candidate_root}/src/cpp_n100/CMakeLists.txt")
+      set(IMU_N100_TEST_ROOT "${candidate_root}")
+      break()
+    endif()
+  endforeach()
 endif()
 set(N100_CPP_DIR "${IMU_N100_TEST_ROOT}/src/cpp_n100")
 if(NOT EXISTS "${N100_CPP_DIR}/CMakeLists.txt")

@@ -6,7 +6,7 @@
 cd ~/humanoid_project
 git clone https://github.com/Humanoid-Project/robonex-deploy.git
 git clone https://github.com/Humanoid-Project/robonex-description.git
-git clone https://github.com/Humanoid-Project/imu-n100-test.git IMU_N100_Test
+git clone https://github.com/Humanoid-Project/imu-n100-test.git
 cd robonex-deploy
 python3 -m venv .venv
 source .venv/bin/activate
