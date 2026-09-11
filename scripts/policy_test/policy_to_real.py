@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
-import subprocess
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from importlib import metadata
 from pathlib import Path
 
 THIS_FILE = Path(__file__).resolve()
@@ -46,10 +49,10 @@ from robonex_can import (
     SPECS,
     clamp,
 )
+import robonex_common
 from robonex_common.imu import DEFAULT_IMU_BAUDRATE, DEFAULT_IMU_PORT, MOUNT_ROLL_DEG
 from robonex_common.joints import CHANNEL_MOTOR_IDS, JOINT_BY_MODEL_NAME
 from robonex_common.motors import MOTOR_CONTROL_KD, MOTOR_CONTROL_KP
-from robonex_common.paths import COMMON_REPO_NAMES, git_commit, resolve_repo
 from robonex_common.policy import PolicyContract, python_source_sha256
 from robonex_common.protocol import MECHANICAL_VELOCITY_INDEX
 from robonex_common.runtime import ActionPipeline, assemble_observation
@@ -450,24 +453,30 @@ def resolve_contract(policy_path):
     return contract
 
 
-def verify_common_source(contract, notes):
+def installed_common_commit():
     try:
-        common_root = resolve_repo(COMMON_REPO_NAMES, "ROBONEX_COMMON_ROOT")
-    except FileNotFoundError:
-        notes.append(
-            "[env] robonex-common checkout not found; the manifest's source fingerprint was not verified"
-        )
-        return
-    actual_commit = git_commit(common_root)
-    if actual_commit != contract.common_commit:
-        raise RuntimeError(
-            f"robonex-common commit mismatch: manifest={contract.common_commit}, checkout={actual_commit}"
-        )
-    actual_sha256 = python_source_sha256(common_root, ("src/robonex_common",))
+        text = metadata.distribution("robonex-common").read_text("direct_url.json")
+    except metadata.PackageNotFoundError:
+        return None
+    return json.loads(text).get("vcs_info", {}).get("commit_id") if text else None
+
+
+def verify_common_source(contract):
+    # Verify the robonex_common that is actually imported (the .venv install), not a sibling checkout.
+    package = Path(robonex_common.__file__).parent
+    with tempfile.TemporaryDirectory() as tmp:
+        # The manifest hashed the files as src/robonex_common/*.py; pip installs them without src/.
+        shutil.copytree(package, Path(tmp, "src", "robonex_common"), ignore=shutil.ignore_patterns("__pycache__"))
+        actual_sha256 = python_source_sha256(tmp, ("src/robonex_common",))
     if actual_sha256 != contract.common_sha256:
         raise RuntimeError(
-            f"robonex-common source mismatch: manifest={contract.common_sha256}, checkout={actual_sha256}"
+            f"installed robonex-common differs from the policy's training source: "
+            f"manifest={contract.common_sha256}, installed={actual_sha256} ({package})"
         )
+    print(
+        f"Common      : source matches the manifest  "
+        f"(installed commit {installed_common_commit() or 'unknown'}, manifest commit {contract.common_commit})"
+    )
 
 
 def format_joint_table(contract, positions, velocities, raw_action, targets, commands):
@@ -718,7 +727,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
 
 def run_deploy(policy_path, contract, args):
     notes = []
-    verify_common_source(contract, notes)
+    verify_common_source(contract)
     runner = PolicyRunner(policy_path, contract)
     imu = ImuSource(SETTINGS, notes)
 
@@ -840,7 +849,7 @@ def run(args):
     except KeyboardInterrupt:
         print("\nStop requested.")
         return 0
-    except (RuntimeError, ValueError, OSError, can.CanError, subprocess.CalledProcessError) as error:
+    except (RuntimeError, ValueError, OSError, can.CanError) as error:
         print(f"\nStopped: {error}")
         return 1
 
