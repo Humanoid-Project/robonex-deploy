@@ -113,7 +113,7 @@ class Settings:
 
     approach_max_speed: float = 0.30
     approach_max_accel: float = 0.60
-    approach_tolerance_deg: float = 6.0
+    approach_tolerance_deg: float = 1.0
     approach_settle_timeout: float = 5.0
 
     policy_max_speed: float = 6.0
@@ -384,6 +384,17 @@ class PolicyRunner:
             self.last_action[:] = action
         return np.asarray(raw_action, dtype=np.float32), action, targets
 
+    def commit_commanded_targets(self, targets):
+        targets = np.asarray(targets, dtype=np.float32).reshape(-1)
+        if targets.shape != (self.contract.action_size,):
+            raise ValueError(
+                f"commanded targets must have {self.contract.action_size} values, got {targets.shape[0]}"
+            )
+        action = (targets - self.offsets) / self.pipeline.scales
+        if not np.isfinite(action).all():
+            raise ValueError("commanded targets produce a non-finite last action")
+        self.last_action[:] = np.clip(action, -self.pipeline.runner_clip, self.pipeline.runner_clip)
+
 
 class TargetCommander:
     def __init__(self, motors, start_positions, settings):
@@ -396,25 +407,42 @@ class TargetCommander:
         self.velocities = {motor_id: 0.0 for motor_id in motors}
         self.slew_limited_count = 0
         self.command_count = 0
+        self.slew_limited_by_motor = {motor_id: 0 for motor_id in motors}
+        self.command_count_by_motor = {motor_id: 0 for motor_id in motors}
 
-    def send(self, motor_ids_targets, dt, max_speed, max_accel):
+    def reset_stats(self):
+        self.slew_limited_count = 0
+        self.command_count = 0
+        self.slew_limited_by_motor = {motor_id: 0 for motor_id in self.motors}
+        self.command_count_by_motor = {motor_id: 0 for motor_id in self.motors}
+
+    def send(self, motor_ids_targets, dt, max_speed, max_accel, use_velocity_target):
         for motor_id, target in motor_ids_targets.items():
             limiter = self.limiters[motor_id]
             aligned = align_angle(limiter.position, target)
             position, velocity = limiter.step(aligned, dt, max_speed, max_accel)
             if abs(position - aligned) > 1.0e-9:
                 self.slew_limited_count += 1
+                self.slew_limited_by_motor[motor_id] += 1
             self.command_count += 1
+            self.command_count_by_motor[motor_id] += 1
             self.commands[motor_id] = position
             self.velocities[motor_id] = velocity
         for motor_id, motor in self.motors.items():
             motor.control(
                 pos=self.commands[motor_id],
-                vel=self.velocities[motor_id],
+                vel=self.velocities[motor_id] if use_velocity_target else 0.0,
                 kp=self.settings.kp,
                 kd=self.settings.kd,
                 torque=0.0,
             )
+
+    def slew_rate_by_motor(self):
+        return {
+            motor_id: self.slew_limited_by_motor[motor_id]
+            / max(1, self.command_count_by_motor[motor_id])
+            for motor_id in self.motors
+        }
 
     def at_rest(self, targets, tolerance):
         return all(
@@ -602,7 +630,13 @@ def approach_pose(commander, joints, targets, motors, limits, settings, label):
 
         dt = clamp(now - last_tick, period * 0.25, period * 2.0)
         last_tick = now
-        commander.send(targets, dt, settings.approach_max_speed, settings.approach_max_accel)
+        commander.send(
+            targets,
+            dt,
+            settings.approach_max_speed,
+            settings.approach_max_accel,
+            use_velocity_target=True,
+        )
 
         if now - last_print >= 1.0:
             last_print = now
@@ -653,6 +687,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
     ramp_started = next_tick
     home = {motor_id: commander.commands[motor_id] for motor_id in motors}
     deadline = None if args.duration is None else next_tick + args.duration
+    commander.reset_stats()
 
     print(
         f"\nPolicy control is active at {contract.policy_hz:.0f} Hz "
@@ -675,7 +710,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
 
         try:
             observation = runner.observation(positions, velocities, angular_velocity, gravity)
-            raw_action, action, targets = runner.step(observation, commit=True)
+            raw_action, _, targets = runner.step(observation, commit=False)
         except ValueError as error:
             raise RuntimeError(f"Safety stop: {error}") from error
 
@@ -687,7 +722,17 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
 
         dt = clamp(now - last_tick, period * 0.25, period * 2.0)
         last_tick = now
-        commander.send(commanded, dt, SETTINGS.policy_max_speed, SETTINGS.policy_max_accel)
+        commander.send(
+            commanded,
+            dt,
+            SETTINGS.policy_max_speed,
+            SETTINGS.policy_max_accel,
+            use_velocity_target=False,
+        )
+        commanded_targets = [
+            commander.commands[motor_id] for _, motor_id in joint_row_order(contract)
+        ]
+        runner.commit_commanded_targets(commanded_targets)
         stats.record(dt, runner.inference_ms)
 
         if now - last_status >= 1.0 / SETTINGS.status_hz:
@@ -710,6 +755,11 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                 f"slew-limited {commander.slew_limited_count / max(1, commander.command_count) * 100:5.2f}%   "
                 f"worst period {stats.period_max * 1000.0:6.2f} ms   "
                 f"worst inference {stats.inference_ms_max:5.2f} ms"
+            )
+            rates = commander.slew_rate_by_motor()
+            lines.append(
+                "slew by motor "
+                + "  ".join(f"ID {motor_id} {rates[motor_id] * 100:5.1f}%" for motor_id in sorted(rates))
             )
             if notes:
                 lines.append("")
