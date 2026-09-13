@@ -21,7 +21,12 @@ from robonex_common.policy import (
     python_source_sha256,
     sha256_file,
 )
-from robonex_common.runtime import ActionPipeline, assemble_observation
+from robonex_common.runtime import (
+    ActionPipeline,
+    ObservationHistory,
+    assemble_observation,
+    gait_phase_at,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -114,11 +119,16 @@ class PolicyAdapter:
         self.right_foot_body_id = required_id(model, mujoco.mjtObj.mjOBJ_BODY, "r_foot")
         self.pipeline = ActionPipeline(contract)
         self.last_action = np.zeros(12, dtype=np.float32)
+        self.velocity_command = np.zeros(3, dtype=np.float32)
+        self.history = ObservationHistory()
+        self.gait_step = 0
         self.object_velocity = np.zeros(6, dtype=np.float64)
         self.gravity_world = np.array((0.0, 0.0, -1.0), dtype=np.float64)
 
     def reset(self):
         self.last_action.fill(0.0)
+        self.history.reset()
+        self.gait_step = 0
 
     def observation(self, data):
         joint_positions = data.qpos[self.qpos_addresses] - self.default_positions
@@ -140,20 +150,24 @@ class PolicyAdapter:
                 joint_velocities,
                 angular_velocity,
                 projected_gravity,
+                self.velocity_command,
+                gait_phase_at(self.gait_step),
                 self.last_action,
+                history=self.history,
             )
         except ValueError as error:
             raise RuntimeError(str(error)) from error
 
     def apply(self, data, max_raw_action):
         observation = self.observation(data)
-        output = self.session.run([self.output_name], {self.input_name: observation.reshape(1, 42)})[0]
+        output = self.session.run([self.output_name], {self.input_name: observation.reshape(1, -1)})[0]
         try:
             clipped, targets = self.pipeline.apply(output, max_raw_action=max_raw_action)
         except ValueError as error:
             raise RuntimeError(str(error)) from error
         data.ctrl[self.actuator_ids] = targets
         self.last_action[:] = clipped
+        self.gait_step += 1
         return observation, clipped.copy(), targets.copy()
 
     def mapping(self):
@@ -371,6 +385,42 @@ def state_is_finite(data):
     )
 
 
+COMMAND_KEYS = {
+    # key: (d_vx, d_vy, d_wz) -- the policy was trained on vx 0.0-0.3 only
+    ord("W"): (0.05, 0.0, 0.0),
+    ord("S"): (-0.05, 0.0, 0.0),
+    ord("A"): (0.0, 0.0, 0.1),
+    ord("D"): (0.0, 0.0, -0.1),
+    ord("Q"): (0.0, 0.05, 0.0),
+    ord("E"): (0.0, -0.05, 0.0),
+}
+COMMAND_LIMITS = ((-0.5, 0.5), (-0.3, 0.3), (-1.0, 1.0))
+
+
+def make_key_callback(adapter):
+    """Drive the velocity command from the viewer keyboard.
+
+    GLFW reports uppercase codes for letter keys, so match on those.
+    """
+
+    def on_key(keycode):
+        if keycode == ord(" "):
+            adapter.velocity_command[:] = 0.0
+        elif keycode in COMMAND_KEYS:
+            delta = COMMAND_KEYS[keycode]
+            for index, step in enumerate(delta):
+                low, high = COMMAND_LIMITS[index]
+                adapter.velocity_command[index] = float(
+                    min(high, max(low, adapter.velocity_command[index] + step))
+                )
+        else:
+            return
+        vx, vy, wz = adapter.velocity_command
+        print(f"command  vx={vx:+.2f} m/s  vy={vy:+.2f} m/s  wz={wz:+.2f} rad/s", flush=True)
+
+    return on_key
+
+
 def simulate(model, data, adapter, args, viewer_handle):
     reset_simulation(model, data, adapter)
     diagnostics = Diagnostics(model, adapter)
@@ -441,6 +491,10 @@ def parse_args():
     parser.add_argument("--output", type=Path, help="Optional JSON output path")
     parser.add_argument("--duration", type=float, help="Stop after this many simulated seconds")
     parser.add_argument("--headless", action="store_true", help="Run without opening the viewer")
+    parser.add_argument("--vx", type=float, default=0.3,
+                        help="Forward velocity command in m/s (the policy was trained on 0.0-0.3)")
+    parser.add_argument("--vy", type=float, default=0.0, help="Lateral velocity command in m/s")
+    parser.add_argument("--wz", type=float, default=0.0, help="Yaw rate command in rad/s")
     args = parser.parse_args()
     if args.headless and args.duration is None:
         parser.error("--headless requires --duration")
@@ -508,10 +562,16 @@ def main():
     model = mujoco.MjModel.from_xml_path(str(args.model))
     data = mujoco.MjData(model)
     adapter = PolicyAdapter(model, args.policy, args.contract)
+    adapter.velocity_command[:] = (args.vx, args.vy, args.wz)
     if args.headless:
         result = simulate(model, data, adapter, args, HeadlessViewer())
     else:
-        with mujoco.viewer.launch_passive(model, data) as viewer_handle:
+        print("keys: W/S forward  A/D turn  Q/E strafe  SPACE stop", flush=True)
+        vx0, vy0, wz0 = adapter.velocity_command
+        print(f"command  vx={vx0:+.2f} m/s  vy={vy0:+.2f} m/s  wz={wz0:+.2f} rad/s", flush=True)
+        with mujoco.viewer.launch_passive(
+            model, data, key_callback=make_key_callback(adapter)
+        ) as viewer_handle:
             result = simulate(model, data, adapter, args, viewer_handle)
     text = json.dumps(result, ensure_ascii=False, indent=2)
     print(text)

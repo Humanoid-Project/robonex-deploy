@@ -55,7 +55,12 @@ from robonex_common.joints import CHANNEL_MOTOR_IDS, JOINT_BY_MODEL_NAME
 from robonex_common.motors import MOTOR_CONTROL_KD, MOTOR_CONTROL_KP
 from robonex_common.policy import PolicyContract, python_source_sha256
 from robonex_common.protocol import MECHANICAL_VELOCITY_INDEX
-from robonex_common.runtime import ActionPipeline, assemble_observation
+from robonex_common.runtime import (
+    ActionPipeline,
+    ObservationHistory,
+    assemble_observation,
+    gait_phase_at,
+)
 from safety import (
     AxisLimiter,
     align_angle,
@@ -344,6 +349,9 @@ class PolicyRunner:
         self.motor_ids = [JOINT_BY_MODEL_NAME[name].motor_id for name in contract.joint_order]
         self.offsets = np.asarray(contract.action_offsets, dtype=np.float32)
         self.last_action = np.zeros(contract.action_size, dtype=np.float32)
+        self.velocity_command = np.zeros(3, dtype=np.float32)
+        self.history = ObservationHistory.from_contract(contract)
+        self.gait_step = 0
         self.inference_ms = 0.0
 
     def reset(self):
@@ -369,8 +377,10 @@ class PolicyRunner:
             velocities,
             angular_velocity,
             gravity,
+            self.velocity_command,
+            gait_phase_at(self.gait_step),
             self.last_action,
-            expected_size=self.contract.observation_size,
+            history=self.history,
         )
 
     def step(self, observation, commit):
@@ -394,6 +404,7 @@ class PolicyRunner:
         if not np.isfinite(action).all():
             raise ValueError("commanded targets produce a non-finite last action")
         self.last_action[:] = np.clip(action, -self.pipeline.runner_clip, self.pipeline.runner_clip)
+        self.gait_step += 1
 
 
 class TargetCommander:
@@ -561,6 +572,7 @@ def confirm(prompt):
 def run_read(policy_path, contract, args):
     notes = []
     runner = PolicyRunner(policy_path, contract)
+    runner.velocity_command[:] = (args.vx, args.vy, args.wz)
     joints = ReadOnlyJointSource(SETTINGS, notes)
     imu = ImuSource(SETTINGS, notes)
 
@@ -779,6 +791,7 @@ def run_deploy(policy_path, contract, args):
     notes = []
     verify_common_source(contract)
     runner = PolicyRunner(policy_path, contract)
+    runner.velocity_command[:] = (args.vx, args.vy, args.wz)
     imu = ImuSource(SETTINGS, notes)
 
     motor_ids = [JOINT_BY_MODEL_NAME[name].motor_id for name in contract.joint_order]
@@ -854,6 +867,11 @@ def run_deploy(policy_path, contract, args):
     return 0
 
 
+# The policy is only trained inside this envelope; a command outside it is out of
+# distribution and the response is undefined, so refuse it rather than clamp silently.
+COMMAND_LIMITS = ((0.0, 0.3), (0.0, 0.0), (0.0, 0.0))
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Run a trained RoboNex policy on the real motors, or preview its values read-only."
@@ -865,6 +883,15 @@ def parse_args(argv=None):
         help="Read-only preview: print observation, action and targets without commanding any motor",
     )
     parser.add_argument("--duration", type=float, help="Stop after this many seconds")
+    parser.add_argument(
+        "--vx", type=float, default=0.0, help="Forward velocity command (m/s)"
+    )
+    parser.add_argument(
+        "--vy", type=float, default=0.0, help="Lateral velocity command (m/s)"
+    )
+    parser.add_argument(
+        "--wz", type=float, default=0.0, help="Yaw rate command (rad/s)"
+    )
     parser.add_argument(
         "--log",
         nargs="?",
@@ -878,6 +905,18 @@ def parse_args(argv=None):
         parser.error(f"Policy not found: {args.policy}")
     if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0.0):
         parser.error("--duration must be finite and positive")
+    for name, value, limit in (
+        ("--vx", args.vx, COMMAND_LIMITS[0]),
+        ("--vy", args.vy, COMMAND_LIMITS[1]),
+        ("--wz", args.wz, COMMAND_LIMITS[2]),
+    ):
+        if not math.isfinite(value):
+            parser.error(f"{name} must be finite")
+        if not limit[0] <= value <= limit[1]:
+            parser.error(
+                f"{name}={value} is outside the trained envelope {limit}; the policy has never "
+                "seen that command and its response is undefined"
+            )
     if args.log == "":
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         args.log = THIS_FILE.parents[2] / "results" / "policy_to_real" / f"{timestamp}_{os.getpid()}.log"
