@@ -56,6 +56,7 @@ from robonex_common.motors import MOTOR_CONTROL_KD, MOTOR_CONTROL_KP
 from robonex_common.policy import PolicyContract, python_source_sha256
 from robonex_common.protocol import MECHANICAL_VELOCITY_INDEX
 from robonex_common.runtime import (
+    OBSERVATION_TERM_SIZES,
     ActionPipeline,
     ObservationHistory,
     assemble_observation,
@@ -489,6 +490,17 @@ def resolve_contract(policy_path):
     manifest_policy = contract.verify_policy(manifest_path)
     if manifest_policy.resolve() != policy_path:
         raise ValueError(f"policy_manifest.json selects {manifest_policy.name}, not {policy_path.name}")
+    # PolicyRunner always assembles OBSERVATION_TERM_SIZES in order; the size check alone
+    # accepts a manifest whose terms are reordered, so compare names and sizes before any CAN I/O.
+    layout = ObservationHistory.from_contract(contract)
+    if layout.term_sizes != OBSERVATION_TERM_SIZES:
+        raise ValueError(
+            f"observation_terms {list(contract.observation_terms)} do not match the deploy "
+            f"layout {[f'{name}:{size}' for name, size in OBSERVATION_TERM_SIZES]}"
+        )
+    # gait_phase_at() advances the clock by 1/50 s per policy step.
+    if contract.policy_hz != 50.0:
+        raise ValueError(f"policy_hz={contract.policy_hz:g} but the gait clock assumes 50 Hz")
     return contract
 
 
