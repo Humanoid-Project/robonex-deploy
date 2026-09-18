@@ -15,6 +15,8 @@ from dataclasses import dataclass, field, replace
 from importlib import metadata
 from pathlib import Path
 
+PROGRAM_STARTED = time.monotonic()
+
 THIS_FILE = Path(__file__).resolve()
 SCRIPTS_DIR = THIS_FILE.parents[1]
 
@@ -58,6 +60,7 @@ from robonex_common.motors import MOTOR_CONTROL_KD, MOTOR_CONTROL_KP
 from robonex_common.policy import PolicyContract, python_source_sha256
 from robonex_common.protocol import MECHANICAL_VELOCITY_INDEX
 from robonex_common.runtime import (
+    OBSERVATION_TERM_SIZES,
     ActionPipeline,
     ObservationHistory,
     assemble_observation,
@@ -519,6 +522,60 @@ class TargetCommander:
         )
 
 
+# Type-0x02 feedback fault flags (Motor.last_fault bit n = 29-bit ID bit 16+n),
+# from the RobStride RS02/RS03 manuals, "Communication Type 2: motor feedback data".
+FAULT_FLAG_NAMES = (
+    "undervoltage",
+    "overcurrent",
+    "overtemperature",
+    "magnetic encoder fault",
+    "stall overload",
+    "uncalibrated",
+)
+
+
+def fault_flag_names(flags):
+    return [name for bit, name in enumerate(FAULT_FLAG_NAMES) if flags & (1 << bit)]
+
+
+class FaultMonitor:
+    """Display-only record of reported motor faults; it never stops the robot."""
+
+    def __init__(self):
+        self.previous = {}
+        self.history = {}  # (motor_id, bit) -> [first seconds since start, phase, onset count]
+
+    def update(self, motors, now, phase):
+        for motor_id, motor in motors.items():
+            flags = motor.last_fault
+            rising = flags & ~self.previous.get(motor_id, 0)
+            self.previous[motor_id] = flags
+            for bit in range(len(FAULT_FLAG_NAMES)):
+                if rising & (1 << bit):
+                    record = self.history.setdefault(
+                        (motor_id, bit), [now - PROGRAM_STARTED, phase, 0]
+                    )
+                    record[2] += 1
+
+    def current_line(self, motors):
+        active = [
+            f"ID {motor_id} {', '.join(fault_flag_names(motors[motor_id].last_fault))} "
+            f"(0x{motors[motor_id].last_fault:02X})"
+            for motor_id in sorted(motors)
+            if motors[motor_id].last_fault
+        ]
+        return "motor faults : " + ("   ".join(active) if active else "none")
+
+    def history_line(self):
+        by_motor = {}
+        for (motor_id, bit), (seconds, phase, count) in sorted(self.history.items()):
+            by_motor.setdefault(motor_id, []).append(
+                f"{FAULT_FLAG_NAMES[bit]} @ {seconds:.2f} s ({phase}) x{count}"
+            )
+        entries = [f"ID {motor_id} " + ", ".join(items) for motor_id, items in by_motor.items()]
+        return "fault history: " + ("   ".join(entries) if entries else "none")
+
+
 @dataclass
 class LoopStats:
     steps: int = 0
@@ -541,6 +598,17 @@ def resolve_contract(policy_path):
     manifest_policy = contract.verify_policy(manifest_path)
     if manifest_policy.resolve() != policy_path:
         raise ValueError(f"policy_manifest.json selects {manifest_policy.name}, not {policy_path.name}")
+    # PolicyRunner always assembles OBSERVATION_TERM_SIZES in order; the size check alone
+    # accepts a manifest whose terms are reordered, so compare names and sizes before any CAN I/O.
+    layout = ObservationHistory.from_contract(contract)
+    if layout.term_sizes != OBSERVATION_TERM_SIZES:
+        raise ValueError(
+            f"observation_terms {list(contract.observation_terms)} do not match the deploy "
+            f"layout {[f'{name}:{size}' for name, size in OBSERVATION_TERM_SIZES]}"
+        )
+    # gait_phase_at() advances the clock by 1/50 s per policy step.
+    if contract.policy_hz != 50.0:
+        raise ValueError(f"policy_hz={contract.policy_hz:g} but the gait clock assumes 50 Hz")
     return contract
 
 
@@ -693,7 +761,7 @@ def run_read(policy_path, contract, args):
     return 0
 
 
-def approach_pose(commander, joints, targets, motors, limits, settings, label):
+def approach_pose(commander, joints, targets, motors, limits, settings, label, faults):
     print(f"\nSpeed-limited move to the {label} pose ({settings.approach_max_speed:.2f} rad/s cap).")
     tolerance = settings.approach_tolerance_deg * DEG
     period = 1.0 / 100.0
@@ -704,6 +772,7 @@ def approach_pose(commander, joints, targets, motors, limits, settings, label):
     while True:
         now = time.monotonic()
         joints.poll()
+        faults.update(motors, now, "approach")
         reason = runtime_safety_reason(motors, commander.commands, limits, now, settings)
         if reason:
             raise RuntimeError(f"{label} move stopped for safety: {reason}")
@@ -728,6 +797,9 @@ def approach_pose(commander, joints, targets, motors, limits, settings, label):
                 default=0.0,
             )
             print(f"  [{time.strftime('%H:%M:%S')}] worst error {math.degrees(worst):+6.2f} deg")
+            if faults.history:
+                print("    " + faults.current_line(motors))
+                print("    " + faults.history_line())
 
         if commander.at_rest(targets, tolerance):
             print(f"{label.capitalize()} pose reached (within {settings.approach_tolerance_deg:g} deg).")
@@ -920,7 +992,7 @@ def _round(value, digits=5):
         return ""
 
 
-def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, notes, stats):
+def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, notes, stats, faults):
     period = 1.0 / contract.policy_hz
     stats.started = time.monotonic()
     next_tick = time.monotonic()
@@ -946,6 +1018,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
         while deadline is None or time.monotonic() < deadline:
             now = time.monotonic()
             joints.poll()
+            faults.update(motors, now, "policy")
             reason = runtime_safety_reason(motors, commander.commands, limits, now, SETTINGS)
             if reason:
                 raise RuntimeError("Safety stop: " + reason)
@@ -1018,6 +1091,9 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     "slew by motor "
                     + "  ".join(f"ID {motor_id} {rates[motor_id] * 100:5.1f}%" for motor_id in sorted(rates))
                 )
+                lines.append("")
+                lines.append(faults.current_line(motors))
+                lines.append(faults.history_line())
                 if notes:
                     lines.append("")
                     lines.extend(notes)
@@ -1061,6 +1137,7 @@ def run_deploy(policy_path, contract, args):
     stop_ids = []
     stats = LoopStats()
     commander = None
+    faults = FaultMonitor()
     try:
         buses, motors, hubs = open_hardware(motor_ids, SETTINGS.interface, SETTINGS.host_id)
         _, blocking = inspect_zero_positions(motors, SETTINGS.approach_tolerance_deg * DEG, hard_limits)
@@ -1097,10 +1174,10 @@ def run_deploy(policy_path, contract, args):
 
         joints = RuntimeJointSource(motors, hubs)
         commander = TargetCommander(motors, starts, SETTINGS)
-        approach_pose(commander, joints, home_targets, motors, hard_limits, SETTINGS, "default")
+        approach_pose(commander, joints, home_targets, motors, hard_limits, SETTINGS, "default", faults)
         runner.reset()
         policy_loop(
-            runner, commander, joints, imu, motors, hard_limits, contract, args, notes, stats
+            runner, commander, joints, imu, motors, hard_limits, contract, args, notes, stats, faults
         )
     except KeyboardInterrupt:
         print("\nStop requested.")
@@ -1109,6 +1186,7 @@ def run_deploy(policy_path, contract, args):
         imu.stop()
         if stop_ids:
             print("Active damping and stop/disable shutdown completed.")
+            print(faults.history_line())
         else:
             print("CAN buses closed. No motor control command was sent.")
         if commander is not None and stats.steps:
