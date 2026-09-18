@@ -140,6 +140,13 @@ def open_hardware(motor_ids, interface, host_id):
     }
     return buses, motors, hubs
 
+def gain_for(gains, motor_id):
+    """Accept either a scalar gain or a per-motor {id: value} mapping."""
+    if isinstance(gains, dict):
+        return gains[motor_id]
+    return gains
+
+
 def enable_with_runtime_feedback(motors, hubs, kp, kd, limits):
     starts = {}
     enabled_ids = []
@@ -176,7 +183,10 @@ def enable_with_runtime_feedback(motors, hubs, kp, kd, limits):
             error.enabled_ids = enabled_ids
             raise error
         starts[mid] = start
-        motor.control(pos=start, vel=0.0, kp=kp, kd=kd, torque=0.0)
+        motor.control(
+            pos=start, vel=0.0,
+            kp=gain_for(kp, mid), kd=gain_for(kd, mid), torque=0.0,
+        )
     return starts, enabled_ids
 
 def inspect_zero_positions(motors, tolerance_rad, limits):
@@ -256,7 +266,7 @@ def brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd):
                     motor = motors[mid]
                     motor.control(
                         pos=0.0, vel=0.0, kp=0.0,
-                        kd=min(kd, motor.spec.kd_max), torque=0.0,
+                        kd=min(gain_for(kd, mid), motor.spec.kd_max), torque=0.0,
                     )
                 except (OSError, can.CanError):
                     pass

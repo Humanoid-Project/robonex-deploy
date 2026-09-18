@@ -15,3 +15,6 @@ policies/
 .claude/
 .grok/
 AGENTS.md
+
+# Local hardware-check procedure, kept out of the repo like the other working notes.
+READ_CHECK.md

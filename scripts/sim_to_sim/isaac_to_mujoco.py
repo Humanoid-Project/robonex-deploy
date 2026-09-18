@@ -35,6 +35,9 @@ from robonex_common.paths import DESCRIPTION_REPO_NAMES, description_model, git_
 file_hash = sha256_file
 
 
+GAIT_COMMAND_DEADBAND = 0.05
+
+
 def sibling_robot_hash(model_path):
     robot_path = model_path.parent / "robonex.xml"
     return file_hash(robot_path) if robot_path.is_file() else None
@@ -129,6 +132,22 @@ class PolicyAdapter:
         self.last_action.fill(0.0)
         self.history.reset()
         self.gait_step = 0
+        self.mask_gait_on_standing = True
+
+    def gait_phase_observation(self):
+        """The clock the policy sees, zeroed on a standing command.
+
+        Training masks this pair to (0, 0) whenever the command norm is inside the
+        standing deadband, so feeding a turning clock at a standstill puts the policy
+        outside its training distribution. The manifest cannot catch the mismatch: the
+        term is still ``gait_phase:2x5`` either way, only the values differ.
+        """
+        phase = gait_phase_at(self.gait_step, step_dt=1.0 / self.contract.policy_hz)
+        if not self.mask_gait_on_standing:
+            return phase
+        if float(np.linalg.norm(self.velocity_command)) <= GAIT_COMMAND_DEADBAND:
+            return np.zeros_like(phase)
+        return phase
 
     def observation(self, data):
         joint_positions = data.qpos[self.qpos_addresses] - self.default_positions
@@ -151,7 +170,7 @@ class PolicyAdapter:
                 angular_velocity,
                 projected_gravity,
                 self.velocity_command,
-                gait_phase_at(self.gait_step),
+                self.gait_phase_observation(),
                 self.last_action,
                 history=self.history,
             )
@@ -491,6 +510,11 @@ def parse_args():
     parser.add_argument("--output", type=Path, help="Optional JSON output path")
     parser.add_argument("--duration", type=float, help="Stop after this many simulated seconds")
     parser.add_argument("--headless", action="store_true", help="Run without opening the viewer")
+    parser.add_argument(
+        "--no-gait-mask",
+        action="store_true",
+        help="Feed the raw gait clock even on a standing command, for policies trained before the mask",
+    )
     parser.add_argument("--vx", type=float, default=0.3,
                         help="Forward velocity command in m/s (the policy was trained on 0.0-0.3)")
     parser.add_argument("--vy", type=float, default=0.0, help="Lateral velocity command in m/s")
@@ -562,6 +586,7 @@ def main():
     model = mujoco.MjModel.from_xml_path(str(args.model))
     data = mujoco.MjData(model)
     adapter = PolicyAdapter(model, args.policy, args.contract)
+    adapter.mask_gait_on_standing = not args.no_gait_mask
     adapter.velocity_command[:] = (args.vx, args.vy, args.wz)
     if args.headless:
         result = simulate(model, data, adapter, args, HeadlessViewer())
