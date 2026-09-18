@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -10,7 +11,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import metadata
 from pathlib import Path
 
@@ -52,6 +53,7 @@ from robonex_can import (
 import robonex_common
 from robonex_common.imu import DEFAULT_IMU_BAUDRATE, DEFAULT_IMU_PORT, MOUNT_ROLL_DEG
 from robonex_common.joints import CHANNEL_MOTOR_IDS, JOINT_BY_MODEL_NAME
+from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
 from robonex_common.motors import MOTOR_CONTROL_KD, MOTOR_CONTROL_KP
 from robonex_common.policy import PolicyContract, python_source_sha256
 from robonex_common.protocol import MECHANICAL_VELOCITY_INDEX
@@ -98,12 +100,33 @@ class TeeStream:
         return getattr(self.terminal, name)
 
 
+def resolve_gains(scale):
+    """Per-motor (kp, kd) from the shared per-joint table, scaled.
+
+    The policy is trained against CONTROL_GAINS_BY_JOINT (hip 100/2, knee 150/4,
+    ankle 40/2); commanding one scalar 40/2 drives the knee at 27% of the stiffness
+    the policy assumes, so the joint does not reach the target the policy chose.
+    """
+    kp_by_motor = {}
+    kd_by_motor = {}
+    for name, spec in JOINT_BY_MODEL_NAME.items():
+        kp, kd = CONTROL_GAINS_BY_JOINT.get(name, (MOTOR_CONTROL_KP, MOTOR_CONTROL_KD))
+        kp_by_motor[spec.motor_id] = kp * scale
+        kd_by_motor[spec.motor_id] = kd * scale
+    return kp_by_motor, kd_by_motor
+
+
 @dataclass(frozen=True)
 class Settings:
     interface: str = DEFAULT_INTERFACE
     host_id: int = HOST_ID
     kp: float = MOTOR_CONTROL_KP
     kd: float = MOTOR_CONTROL_KD
+    # Fraction of the per-joint gains in CONTROL_GAINS_BY_JOINT actually commanded.
+    # The trained policy assumes those gains; the measured-hardware scalars above are
+    # only the fallback for a joint the table does not cover. Ramp this up from a low
+    # value on the stand before running at 1.0.
+    gain_scale: float = 1.0
 
     read_poll_timeout: float = 0.02
     read_print_hz: float = 10.0
@@ -130,6 +153,9 @@ class Settings:
 
 
 SETTINGS = Settings()
+
+GAIT_COMMAND_DEADBAND = 0.05
+ENABLE_KP, ENABLE_KD = resolve_gains(SETTINGS.gain_scale)
 
 
 def joint_row_order(contract):
@@ -352,6 +378,7 @@ class PolicyRunner:
         self.velocity_command = np.zeros(3, dtype=np.float32)
         self.history = ObservationHistory.from_contract(contract)
         self.gait_step = 0
+        self.mask_gait_on_standing = True
         self.inference_ms = 0.0
 
     def reset(self):
@@ -371,6 +398,14 @@ class PolicyRunner:
             velocities[index] = velocity if velocity is not None and math.isfinite(velocity) else 0.0
         return positions, velocities, missing
 
+    def gait_phase_observation(self):
+        phase = gait_phase_at(self.gait_step, step_dt=1.0 / self.contract.policy_hz)
+        if not self.mask_gait_on_standing:
+            return phase
+        if float(np.linalg.norm(self.velocity_command)) <= GAIT_COMMAND_DEADBAND:
+            return np.zeros_like(phase)
+        return phase
+
     def observation(self, positions, velocities, angular_velocity, gravity):
         return assemble_observation(
             positions - self.offsets,
@@ -378,7 +413,7 @@ class PolicyRunner:
             angular_velocity,
             gravity,
             self.velocity_command,
-            gait_phase_at(self.gait_step),
+            self.gait_phase_observation(),
             self.last_action,
             history=self.history,
         )
@@ -394,16 +429,32 @@ class PolicyRunner:
             self.last_action[:] = action
         return np.asarray(raw_action, dtype=np.float32), action, targets
 
-    def commit_commanded_targets(self, targets):
-        targets = np.asarray(targets, dtype=np.float32).reshape(-1)
-        if targets.shape != (self.contract.action_size,):
+    def commit_policy_action(self, action, commanded_targets):
+        """Feed back the policy's own runner-clipped action, as training defines it.
+
+        Training observes `action_manager.action`, the runner-clipped value *before* the
+        target fence, and both the MuJoCo harness and this script's read mode already feed
+        that back. Reconstructing it from the commanded motor position instead made the live
+        path the only one of the three that disagreed: ramp blending, the slew limiter and
+        the target fence all change the commanded position, and the fence is many-to-one so
+        the original request cannot be recovered from it. The commanded vector is still
+        validated here because a non-finite command must stop the run.
+        """
+        commanded = np.asarray(commanded_targets, dtype=np.float32).reshape(-1)
+        if commanded.shape != (self.contract.action_size,):
             raise ValueError(
-                f"commanded targets must have {self.contract.action_size} values, got {targets.shape[0]}"
+                f"commanded targets must have {self.contract.action_size} values, got {commanded.shape[0]}"
             )
-        action = (targets - self.offsets) / self.pipeline.scales
+        if not np.isfinite(commanded).all():
+            raise ValueError("commanded targets are not finite")
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if action.shape != (self.contract.action_size,):
+            raise ValueError(
+                f"policy action must have {self.contract.action_size} values, got {action.shape[0]}"
+            )
         if not np.isfinite(action).all():
-            raise ValueError("commanded targets produce a non-finite last action")
-        self.last_action[:] = np.clip(action, -self.pipeline.runner_clip, self.pipeline.runner_clip)
+            raise ValueError("policy action is not finite")
+        self.last_action[:] = action
         self.gait_step += 1
 
 
@@ -416,6 +467,7 @@ class TargetCommander:
         }
         self.commands = dict(start_positions)
         self.velocities = {motor_id: 0.0 for motor_id in motors}
+        self.kp_by_motor, self.kd_by_motor = resolve_gains(settings.gain_scale)
         self.slew_limited_count = 0
         self.command_count = 0
         self.slew_limited_by_motor = {motor_id: 0 for motor_id in motors}
@@ -443,8 +495,8 @@ class TargetCommander:
             motor.control(
                 pos=self.commands[motor_id],
                 vel=self.velocities[motor_id] if use_velocity_target else 0.0,
-                kp=self.settings.kp,
-                kd=self.settings.kd,
+                kp=self.kp_by_motor[motor_id],
+                kd=self.kd_by_motor[motor_id],
                 torque=0.0,
             )
 
@@ -573,6 +625,7 @@ def run_read(policy_path, contract, args):
     notes = []
     runner = PolicyRunner(policy_path, contract)
     runner.velocity_command[:] = (args.vx, args.vy, args.wz)
+    runner.mask_gait_on_standing = not args.no_gait_mask
     joints = ReadOnlyJointSource(SETTINGS, notes)
     imu = ImuSource(SETTINGS, notes)
 
@@ -584,11 +637,21 @@ def run_read(policy_path, contract, args):
 
     joints.start()
     imu.start(calibrate=True)
+    read_log = None
+    if args.telemetry:
+        read_log = ReadRecorder(args.telemetry, contract)
+        print(f"Recording   : {read_log.path}")
     period = 1.0 / SETTINGS.read_print_hz
     deadline = None if args.duration is None else time.monotonic() + args.duration
+    # The preview prints at read_print_hz, not the policy rate, and nothing here commits a
+    # command, so the gait clock has no step counter to ride on. Derive it from elapsed time
+    # instead: otherwise the preview shows a frozen phase and the policy it displays is not
+    # the one the robot would run.
+    started_at = time.monotonic()
     try:
         while deadline is None or time.monotonic() < deadline:
             now = time.monotonic()
+            runner.gait_step = int((now - started_at) * contract.policy_hz)
             snapshot = joints.snapshot()
             positions, velocities, missing = runner.joint_state(snapshot)
             angular_velocity, gravity, age = imu.read(now)
@@ -612,6 +675,8 @@ def run_read(policy_path, contract, args):
                 lines.extend(notes)
             sys.stdout.write("\n".join(lines) + "\n")
             sys.stdout.flush()
+            if read_log is not None:
+                read_log.record(now, observation, gravity, angular_velocity, age, positions, missing)
 
             sleep = period - (time.monotonic() - now)
             if sleep > 0.0:
@@ -621,6 +686,9 @@ def run_read(policy_path, contract, args):
     finally:
         joints.stop()
         imu.stop()
+        if read_log is not None:
+            read_log.close()
+            print(f"Recorded to {read_log.path}")
         print("Stopped. No motor was enabled or commanded.")
     return 0
 
@@ -690,6 +758,168 @@ def approach_pose(commander, joints, targets, motors, limits, settings, label):
             next_tick = time.monotonic()
 
 
+class ReadRecorder:
+    """Per-frame record of the read-only preview.
+
+    Read mode has no torque, temperature or type 0x02 feedback age — it polls `mechPos` — so
+    this is deliberately not the live `TelemetryRecorder`. It captures what the read check
+    actually needs to be verified off the screen: the gait-phase pair across the whole run,
+    the IMU vectors, and which motors went silent.
+    """
+
+    def __init__(self, path, contract):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            raise SystemExit(
+                f"{self.path} already exists. Recordings of a real robot are not reproducible, "
+                "so this refuses to overwrite one. Pass --telemetry with no path for an "
+                "automatic timestamped file, or name a new one."
+            )
+        self.handle = self.path.open("w", newline="")
+        self.writer = csv.writer(self.handle)
+        header = ["t_s", "gravity_x", "gravity_y", "gravity_z",
+                  "gyro_x", "gyro_y", "gyro_z", "imu_age_ms", "missing_ids"]
+        header += [f"gait_{i}" for i in range(10)]
+        header += [f"{n.replace('_joint','')}.pos" for n in contract.joint_order]
+        self.writer.writerow(header)
+        self.handle.flush()
+        self.started = None
+
+    def record(self, now, observation, gravity, gyro, age, positions, missing):
+        if self.started is None:
+            self.started = now
+        row = [round(now - self.started, 3)]
+        row += [round(float(v), 5) for v in gravity]
+        row += [round(float(v), 5) for v in gyro]
+        row += ["" if age is None else round(age * 1000.0, 2)]
+        row += ["|".join(str(m) for m in sorted(missing)) if missing else ""]
+        row += [round(float(v), 5) for v in observation[165:175]]
+        row += [round(float(v), 5) for v in positions]
+        self.writer.writerow(row)
+        self.handle.flush()
+
+    def close(self):
+        try:
+            self.handle.close()
+        except OSError:
+            pass
+
+
+class TelemetryRecorder:
+    """Per-policy-step record of everything needed to diagnose a hardware stop.
+
+    The loop has ~20 ms of budget and the previous hardware run already measured a
+    20.43 ms worst period, so nothing here touches the filesystem inside the step: rows
+    accumulate in memory and are written in batches between steps, and whatever is left
+    is flushed by the caller's finally.
+    """
+
+    SLACK_S = 0.005
+    MAX_ROWS = 500
+
+    def __init__(self, path, contract, motors):
+        self.path = Path(path)
+        self.rows = []
+        self.order = joint_row_order(contract)
+        self.motors = motors
+        self.dropped = 0
+        header = ["t_s", "step", "dt_ms", "inference_ms", "ramp",
+                  "cmd_vx", "cmd_vy", "cmd_wz",
+                  "gravity_x", "gravity_y", "gravity_z",
+                  "gyro_x", "gyro_y", "gyro_z", "imu_age_ms"]
+        for name, motor_id in self.order:
+            short = name.replace("_joint", "")
+            header += [
+                f"{short}.age_ms", f"{short}.pos", f"{short}.vel", f"{short}.torque",
+                f"{short}.temp", f"{short}.fault", f"{short}.raw_action",
+                f"{short}.target", f"{short}.commanded",
+            ]
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            raise SystemExit(
+                f"{self.path} already exists. Recordings of a real robot are not reproducible, "
+                "so this refuses to overwrite one. Pass --telemetry with no path for an "
+                "automatic timestamped file, or name a new one."
+            )
+        self.handle = self.path.open("w", newline="")
+        self.writer = csv.writer(self.handle)
+        self.writer.writerow(header)
+        self.handle.flush()
+        self.step = 0
+
+    def record(self, now, started, dt, inference_ms, ramp, raw_action, targets, commands,
+               gravity=None, gyro=None, imu_age=None, velocity_command=None):
+        row = [
+            round(now - started, 4), self.step, round(dt * 1000.0, 3),
+            round(inference_ms, 3), round(ramp, 4),
+        ]
+        row += [_round(v) for v in (velocity_command if velocity_command is not None else (None,) * 3)]
+        row += [_round(v) for v in (gravity if gravity is not None else (None,) * 3)]
+        row += [_round(v) for v in (gyro if gyro is not None else (None,) * 3)]
+        row.append(round(imu_age * 1000.0, 3) if imu_age is not None else "")
+        # Age is measured against a fresh clock read, not the `now` the caller captured at the
+        # top of its loop: that timestamp predates `joints.poll()`, so the feedback it is being
+        # compared against is stamped later and every age came out negative.
+        sampled_at = time.monotonic()
+        for index, (_, motor_id) in enumerate(self.order):
+            motor = self.motors.get(motor_id)
+            stamp = getattr(motor, "last_feedback_time", None)
+            age = (sampled_at - stamp) * 1000.0 if stamp else float("nan")
+            row += [
+                round(age, 3),
+                _round(getattr(motor, "last_position", None)),
+                _round(getattr(motor, "last_velocity", None)),
+                _round(getattr(motor, "last_torque", None)),
+                _round(getattr(motor, "last_temp", None)),
+                getattr(motor, "last_fault", ""),
+                round(float(raw_action[index]), 5),
+                round(float(targets[index]), 5),
+                _round(commands.get(motor_id)),
+            ]
+        self.rows.append(row)
+        self.step += 1
+        if len(self.rows) >= self.MAX_ROWS:
+            self.flush()
+
+    def flush_if_idle(self, slack_s):
+        """Write only while the loop is waiting for its next tick.
+
+        A batched write of 100 rows measured 1.7 ms, and the previous hardware run's worst
+        period was already 20.43 ms against a 20 ms budget, so the write must not land
+        inside the step.
+        """
+        if self.rows and slack_s > self.SLACK_S:
+            self.flush()
+
+    def flush(self):
+        if not self.rows:
+            return
+        try:
+            self.writer.writerows(self.rows)
+            self.handle.flush()
+        except OSError:
+            self.dropped += len(self.rows)
+        finally:
+            self.rows = []
+
+    def close(self):
+        self.flush()
+        try:
+            self.handle.close()
+        except OSError:
+            pass
+
+
+def _round(value, digits=5):
+    if value is None:
+        return ""
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return ""
+
+
 def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, notes, stats):
     period = 1.0 / contract.policy_hz
     stats.started = time.monotonic()
@@ -700,91 +930,113 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
     home = {motor_id: commander.commands[motor_id] for motor_id in motors}
     deadline = None if args.duration is None else next_tick + args.duration
     commander.reset_stats()
+    telemetry = (
+        TelemetryRecorder(args.telemetry, contract, motors)
+        if getattr(args, "telemetry", None)
+        else None
+    )
+    if telemetry is not None:
+        print(f"Telemetry   : {telemetry.path}  ({contract.policy_hz:.0f} Hz per-motor record)")
 
     print(
         f"\nPolicy control is active at {contract.policy_hz:.0f} Hz "
         f"(ramp-in {SETTINGS.ramp_seconds:.1f} s). Ctrl-C stops and brakes."
     )
-    while deadline is None or time.monotonic() < deadline:
-        now = time.monotonic()
-        joints.poll()
-        reason = runtime_safety_reason(motors, commander.commands, limits, now, SETTINGS)
-        if reason:
-            raise RuntimeError("Safety stop: " + reason)
+    try:
+        while deadline is None or time.monotonic() < deadline:
+            now = time.monotonic()
+            joints.poll()
+            reason = runtime_safety_reason(motors, commander.commands, limits, now, SETTINGS)
+            if reason:
+                raise RuntimeError("Safety stop: " + reason)
 
-        positions, velocities, missing = runner.joint_state(joints.snapshot())
-        if missing:
-            raise RuntimeError(f"Safety stop: no feedback for motor IDs {sorted(missing)}")
-        angular_velocity, gravity, age = imu.read(now)
-        imu_reason = imu.failure_reason(age)
-        if imu_reason:
-            raise RuntimeError("Safety stop: " + imu_reason)
+            positions, velocities, missing = runner.joint_state(joints.snapshot())
+            if missing:
+                raise RuntimeError(f"Safety stop: no feedback for motor IDs {sorted(missing)}")
+            angular_velocity, gravity, age = imu.read(now)
+            imu_reason = imu.failure_reason(age)
+            if imu_reason:
+                raise RuntimeError("Safety stop: " + imu_reason)
 
-        try:
-            observation = runner.observation(positions, velocities, angular_velocity, gravity)
-            raw_action, _, targets = runner.step(observation, commit=False)
-        except ValueError as error:
-            raise RuntimeError(f"Safety stop: {error}") from error
+            try:
+                observation = runner.observation(positions, velocities, angular_velocity, gravity)
+                raw_action, policy_action, targets = runner.step(observation, commit=False)
+            except ValueError as error:
+                raise RuntimeError(f"Safety stop: {error}") from error
 
-        blend = clamp((now - ramp_started) / SETTINGS.ramp_seconds, 0.0, 1.0)
-        commanded = {}
-        for index, (_, motor_id) in enumerate(joint_row_order(contract)):
-            target = float(targets[index])
-            commanded[motor_id] = home[motor_id] + blend * (target - home[motor_id])
+            blend = clamp((now - ramp_started) / SETTINGS.ramp_seconds, 0.0, 1.0)
+            commanded = {}
+            for index, (_, motor_id) in enumerate(joint_row_order(contract)):
+                target = float(targets[index])
+                commanded[motor_id] = home[motor_id] + blend * (target - home[motor_id])
 
-        dt = clamp(now - last_tick, period * 0.25, period * 2.0)
-        last_tick = now
-        commander.send(
-            commanded,
-            dt,
-            SETTINGS.policy_max_speed,
-            SETTINGS.policy_max_accel,
-            use_velocity_target=False,
-        )
-        commanded_targets = [
-            commander.commands[motor_id] for _, motor_id in joint_row_order(contract)
-        ]
-        runner.commit_commanded_targets(commanded_targets)
-        stats.record(dt, runner.inference_ms)
-
-        if now - last_status >= 1.0 / SETTINGS.status_hz:
-            last_status = now
-            lines = [CLEAR_SCREEN]
-            lines.append(
-                f"Policy control   {joints.rate_text()}   ramp {blend * 100:5.1f}%   "
-                f"elapsed {stats.elapsed():6.2f} s   (Ctrl-C to stop)\n"
+            dt = clamp(now - last_tick, period * 0.25, period * 2.0)
+            last_tick = now
+            commander.send(
+                commanded,
+                dt,
+                SETTINGS.policy_max_speed,
+                SETTINGS.policy_max_accel,
+                use_velocity_target=False,
             )
-            lines.extend(
-                format_joint_table(
-                    contract, positions, velocities, raw_action, targets, commander.commands
+            commanded_targets = [
+                commander.commands[motor_id] for _, motor_id in joint_row_order(contract)
+            ]
+            runner.commit_policy_action(policy_action, commanded_targets)
+            stats.record(dt, runner.inference_ms)
+            if telemetry is not None:
+                telemetry.record(
+                    now, stats.started, dt, runner.inference_ms, blend,
+                    raw_action, targets, commander.commands,
+                    gravity=gravity, gyro=angular_velocity, imu_age=age,
+                    velocity_command=tuple(float(v) for v in runner.velocity_command),
                 )
-            )
-            lines.append("")
-            lines.extend(format_imu(imu, angular_velocity, gravity, age))
-            lines.append("")
-            lines.append(format_pipeline(runner))
-            lines.append(
-                f"slew-limited {commander.slew_limited_count / max(1, commander.command_count) * 100:5.2f}%   "
-                f"worst period {stats.period_max * 1000.0:6.2f} ms   "
-                f"worst inference {stats.inference_ms_max:5.2f} ms"
-            )
-            rates = commander.slew_rate_by_motor()
-            lines.append(
-                "slew by motor "
-                + "  ".join(f"ID {motor_id} {rates[motor_id] * 100:5.1f}%" for motor_id in sorted(rates))
-            )
-            if notes:
-                lines.append("")
-                lines.extend(notes)
-            sys.stdout.write("\n".join(lines) + "\n")
-            sys.stdout.flush()
 
-        next_tick += period
-        sleep = next_tick - time.monotonic()
-        if sleep > 0.0:
-            time.sleep(sleep)
-        elif time.monotonic() - next_tick > period:
-            next_tick = time.monotonic()
+            if now - last_status >= 1.0 / SETTINGS.status_hz:
+                last_status = now
+                lines = [CLEAR_SCREEN]
+                lines.append(
+                    f"Policy control   {joints.rate_text()}   ramp {blend * 100:5.1f}%   "
+                    f"elapsed {stats.elapsed():6.2f} s   (Ctrl-C to stop)\n"
+                )
+                lines.extend(
+                    format_joint_table(
+                        contract, positions, velocities, raw_action, targets, commander.commands
+                    )
+                )
+                lines.append("")
+                lines.extend(format_imu(imu, angular_velocity, gravity, age))
+                lines.append("")
+                lines.append(format_pipeline(runner))
+                lines.append(
+                    f"slew-limited {commander.slew_limited_count / max(1, commander.command_count) * 100:5.2f}%   "
+                    f"worst period {stats.period_max * 1000.0:6.2f} ms   "
+                    f"worst inference {stats.inference_ms_max:5.2f} ms"
+                )
+                rates = commander.slew_rate_by_motor()
+                lines.append(
+                    "slew by motor "
+                    + "  ".join(f"ID {motor_id} {rates[motor_id] * 100:5.1f}%" for motor_id in sorted(rates))
+                )
+                if notes:
+                    lines.append("")
+                    lines.extend(notes)
+                sys.stdout.write("\n".join(lines) + "\n")
+                sys.stdout.flush()
+
+            next_tick += period
+            sleep = next_tick - time.monotonic()
+            if telemetry is not None:
+                telemetry.flush_if_idle(sleep)
+                sleep = next_tick - time.monotonic()
+            if sleep > 0.0:
+                time.sleep(sleep)
+            elif time.monotonic() - next_tick > period:
+                next_tick = time.monotonic()
+
+    finally:
+        if telemetry is not None:
+            telemetry.close()
 
 
 def run_deploy(policy_path, contract, args):
@@ -792,6 +1044,7 @@ def run_deploy(policy_path, contract, args):
     verify_common_source(contract)
     runner = PolicyRunner(policy_path, contract)
     runner.velocity_command[:] = (args.vx, args.vy, args.wz)
+    runner.mask_gait_on_standing = not args.no_gait_mask
     imu = ImuSource(SETTINGS, notes)
 
     motor_ids = [JOINT_BY_MODEL_NAME[name].motor_id for name in contract.joint_order]
@@ -821,7 +1074,12 @@ def run_deploy(policy_path, contract, args):
         print("\nThe real motors will move under policy control.")
         print(f"  policy      : {policy_path}")
         print(f"  task        : {contract.task}")
-        print(f"  rate        : {contract.policy_hz:.0f} Hz   kp {SETTINGS.kp:g}  kd {SETTINGS.kd:g}")
+        print(f"  rate        : {contract.policy_hz:.0f} Hz")
+        print(f"  gain scale  : {SETTINGS.gain_scale:g}  (1.0 = the gains the policy was trained at)")
+        for name, spec in JOINT_BY_MODEL_NAME.items():
+            print(
+                f"      {name:22s} kp {ENABLE_KP[spec.motor_id]:6.1f}  kd {ENABLE_KD[spec.motor_id]:5.2f}"
+            )
         print(f"  motor IDs   : {sorted(motor_ids)}")
         print(f"  duration    : {'until Ctrl-C' if args.duration is None else f'{args.duration:.1f} s'}")
         print("  The robot must hang on the stand or be held; this tool cannot catch a fall.")
@@ -831,7 +1089,7 @@ def run_deploy(policy_path, contract, args):
         stop_ids = list(motor_ids)
         try:
             starts, enabled_ids = enable_with_runtime_feedback(
-                motors, hubs, SETTINGS.kp, SETTINGS.kd, hard_limits
+                motors, hubs, ENABLE_KP, ENABLE_KD, hard_limits
             )
         except RuntimeError as error:
             enabled_ids = getattr(error, "enabled_ids", enabled_ids)
@@ -847,7 +1105,7 @@ def run_deploy(policy_path, contract, args):
     except KeyboardInterrupt:
         print("\nStop requested.")
     finally:
-        brake_and_stop(motors, buses, enabled_ids, stop_ids, SETTINGS.brake_time, SETTINGS.kd)
+        brake_and_stop(motors, buses, enabled_ids, stop_ids, SETTINGS.brake_time, ENABLE_KD)
         imu.stop()
         if stop_ids:
             print("Active damping and stop/disable shutdown completed.")
@@ -884,6 +1142,31 @@ def parse_args(argv=None):
     )
     parser.add_argument("--duration", type=float, help="Stop after this many seconds")
     parser.add_argument(
+        "--approach-tolerance-deg",
+        type=float,
+        default=None,
+        help="How close to the default pose counts as reached before policy control starts. "
+             "The 1.0 deg default suits a suspended robot; standing on the ground the legs "
+             "carry body weight and PD control leaves a steady-state error of roughly "
+             "(holding torque / kp), which is 3-5 deg at the ankles. Raise it deliberately, "
+             "and only when you know why the robot cannot close the gap",
+    )
+    parser.add_argument(
+        "--telemetry",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help="Write a per-policy-step CSV: per-motor feedback age, position, velocity, torque, "
+             "temperature and fault, plus raw action, clipped target and commanded position. "
+             "Omit PATH for an automatic timestamped file under results/policy_to_real. "
+             "An existing file is never overwritten",
+    )
+    parser.add_argument(
+        "--no-gait-mask",
+        action="store_true",
+        help="Feed the raw gait clock even on a standing command, for policies trained before the mask",
+    )
+    parser.add_argument(
         "--vx", type=float, default=0.0, help="Forward velocity command (m/s)"
     )
     parser.add_argument(
@@ -891,6 +1174,16 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--wz", type=float, default=0.0, help="Yaw rate command (rad/s)"
+    )
+    parser.add_argument(
+        "--gain-scale",
+        type=float,
+        default=Settings.gain_scale,
+        metavar="F",
+        help=(
+            "Fraction of the per-joint gains to command (default 1.0 = the gains the "
+            "policy was trained at). Ramp up from a low value on the stand."
+        ),
     )
     parser.add_argument(
         "--log",
@@ -905,6 +1198,8 @@ def parse_args(argv=None):
         parser.error(f"Policy not found: {args.policy}")
     if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0.0):
         parser.error("--duration must be finite and positive")
+    if not math.isfinite(args.gain_scale) or not 0.0 < args.gain_scale <= 1.0:
+        parser.error("--gain-scale must be in (0, 1]")
     for name, value, limit in (
         ("--vx", args.vx, COMMAND_LIMITS[0]),
         ("--vy", args.vy, COMMAND_LIMITS[1]),
@@ -917,6 +1212,14 @@ def parse_args(argv=None):
                 f"{name}={value} is outside the trained envelope {limit}; the policy has never "
                 "seen that command and its response is undefined"
             )
+    if args.telemetry == "":
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        kind = "read" if args.read else "live"
+        args.telemetry = (
+            THIS_FILE.parents[2] / "results" / "policy_to_real" / f"{stamp}_{kind}_telemetry.csv"
+        )
+    elif args.telemetry is not None:
+        args.telemetry = Path(args.telemetry).expanduser().resolve()
     if args.log == "":
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         args.log = THIS_FILE.parents[2] / "results" / "policy_to_real" / f"{timestamp}_{os.getpid()}.log"
@@ -945,6 +1248,17 @@ def run(args):
 
 def main(argv=None):
     args = parse_args(argv)
+    global SETTINGS, ENABLE_KP, ENABLE_KD
+    SETTINGS = replace(SETTINGS, gain_scale=args.gain_scale)
+    if args.approach_tolerance_deg is not None:
+        if not 0.0 < args.approach_tolerance_deg <= 10.0:
+            raise SystemExit("--approach-tolerance-deg must be between 0 and 10 degrees")
+        SETTINGS = replace(SETTINGS, approach_tolerance_deg=args.approach_tolerance_deg)
+        print(
+            f"Approach tolerance widened to {args.approach_tolerance_deg:g} deg "
+            f"(default {Settings().approach_tolerance_deg:g})"
+        )
+    ENABLE_KP, ENABLE_KD = resolve_gains(SETTINGS.gain_scale)
     if args.log is None:
         return run(args)
     try:
