@@ -239,7 +239,7 @@ def runtime_safety_reason(motors, commands, limits, now, args):
             return f"ID {mid} feedback contains NaN or infinity"
         if abs(motor.last_velocity) > args.overspeed:
             return f"ID {mid} overspeed ({motor.last_velocity:+.3f} rad/s)"
-        if motor.last_temp > args.max_temp:
+        if motor.last_temp >= args.max_temp:
             return f"ID {mid} overtemperature ({motor.last_temp:.1f} degC)"
         lower, upper = limits[mid]
         wrapped = wrap_to_pi(motor.last_position)
@@ -257,6 +257,9 @@ def runtime_safety_reason(motors, commands, limits, now, args):
     return None
 
 def brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd):
+    damping_errors = {}
+    stop_errors = {}
+    stop_sent = []
     enabled = [mid for mid in sorted(set(enabled_ids)) if mid in motors]
     if enabled and duration > 0.0:
         deadline = time.monotonic() + duration
@@ -268,8 +271,9 @@ def brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd):
                         pos=0.0, vel=0.0, kp=0.0,
                         kd=min(gain_for(kd, mid), motor.spec.kd_max), torque=0.0,
                     )
-                except (OSError, can.CanError):
-                    pass
+                except (OSError, can.CanError) as error:
+                    damping_errors[mid] = error
+
             time.sleep(0.01)
 
     for mid in sorted(set(stop_ids)):
@@ -278,10 +282,43 @@ def brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd):
             continue
         try:
             motor.stop()
-        except (OSError, can.CanError):
-            pass
+        except (OSError, can.CanError) as error:
+            stop_errors[mid] = error
+        else:
+            stop_sent.append(mid)
     for bus in buses.values():
         try:
             bus.shutdown()
         except Exception:
             pass
+    return {
+        "damped": enabled,
+        "damping_errors": damping_errors,
+        "stop_sent": stop_sent,
+        "stop_errors": stop_errors,
+    }
+
+
+def shutdown_report_lines(report):
+    """Describe a `brake_and_stop` result without claiming more than was verified."""
+    lines = []
+    stop_errors = report["stop_errors"]
+    if stop_errors:
+        failed = ", ".join(str(mid) for mid in sorted(stop_errors))
+        lines.append(
+            f"WARNING: the stop frame failed for ID {failed}. Those motors may still be "
+            "enabled. Cut power at the supply before approaching the robot."
+        )
+        for mid in sorted(stop_errors):
+            lines.append(f"  ID {mid} stop: {stop_errors[mid]}")
+    damping_errors = report["damping_errors"]
+    if damping_errors:
+        failed = ", ".join(str(mid) for mid in sorted(damping_errors))
+        lines.append(f"WARNING: active damping failed for ID {failed}.")
+    if report["stop_sent"]:
+        sent = ", ".join(str(mid) for mid in report["stop_sent"])
+        lines.append(
+            f"Stop frame sent to ID {sent}. The motors do not acknowledge it, so delivery "
+            "is unconfirmed."
+        )
+    return lines

@@ -74,6 +74,7 @@ from safety import (
     inspect_zero_positions,
     open_hardware,
     runtime_safety_reason,
+    shutdown_report_lines,
     wrap_to_pi,
 )
 
@@ -475,25 +476,40 @@ class TargetCommander:
         self.command_count = 0
         self.slew_limited_by_motor = {motor_id: 0 for motor_id in motors}
         self.command_count_by_motor = {motor_id: 0 for motor_id in motors}
+        self.slew_lag_step_max = 0.0
+        self.slew_lag_run_max = 0.0
+        self.slew_lag_max_by_motor = {motor_id: 0.0 for motor_id in motors}
 
     def reset_stats(self):
         self.slew_limited_count = 0
         self.command_count = 0
         self.slew_limited_by_motor = {motor_id: 0 for motor_id in self.motors}
         self.command_count_by_motor = {motor_id: 0 for motor_id in self.motors}
+        self.slew_lag_step_max = 0.0
+        self.slew_lag_run_max = 0.0
+        self.slew_lag_max_by_motor = {motor_id: 0.0 for motor_id in self.motors}
 
     def send(self, motor_ids_targets, dt, max_speed, max_accel, use_velocity_target):
+        step_lag_max = 0.0
         for motor_id, target in motor_ids_targets.items():
             limiter = self.limiters[motor_id]
             aligned = align_angle(limiter.position, target)
             position, velocity = limiter.step(aligned, dt, max_speed, max_accel)
-            if abs(position - aligned) > 1.0e-9:
+            lag = abs(position - aligned)
+            if lag > 1.0e-9:
                 self.slew_limited_count += 1
                 self.slew_limited_by_motor[motor_id] += 1
+            if lag > step_lag_max:
+                step_lag_max = lag
+            if lag > self.slew_lag_max_by_motor[motor_id]:
+                self.slew_lag_max_by_motor[motor_id] = lag
             self.command_count += 1
             self.command_count_by_motor[motor_id] += 1
             self.commands[motor_id] = position
             self.velocities[motor_id] = velocity
+        self.slew_lag_step_max = step_lag_max
+        if step_lag_max > self.slew_lag_run_max:
+            self.slew_lag_run_max = step_lag_max
         for motor_id, motor in self.motors.items():
             motor.control(
                 pos=self.commands[motor_id],
@@ -509,6 +525,11 @@ class TargetCommander:
             / max(1, self.command_count_by_motor[motor_id])
             for motor_id in self.motors
         }
+
+    def worst_slew_lag_motor(self):
+        if not self.slew_lag_max_by_motor:
+            return None
+        return max(self.slew_lag_max_by_motor, key=self.slew_lag_max_by_motor.get)
 
     def at_rest(self, targets, tolerance):
         return all(
@@ -915,9 +936,13 @@ class TelemetryRecorder:
                 "automatic timestamped file, or name a new one."
             )
         self.handle = self.path.open("w", newline="")
-        self.writer = csv.writer(self.handle)
-        self.writer.writerow(header)
-        self.handle.flush()
+        try:
+            self.writer = csv.writer(self.handle)
+            self.writer.writerow(header)
+            self.handle.flush()
+        except BaseException:
+            self.handle.close()
+            raise
         self.step = 0
 
     def record(self, now, started, dt, inference_ms, ramp, raw_action, targets, commands,
@@ -976,11 +1001,13 @@ class TelemetryRecorder:
             self.rows = []
 
     def close(self):
-        self.flush()
         try:
-            self.handle.close()
-        except OSError:
-            pass
+            self.flush()
+        finally:
+            try:
+                self.handle.close()
+            except OSError:
+                pass
 
 
 def _round(value, digits=5):
@@ -1081,15 +1108,19 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                 lines.extend(format_imu(imu, angular_velocity, gravity, age))
                 lines.append("")
                 lines.append(format_pipeline(runner))
+                worst_lag_id = commander.worst_slew_lag_motor()
                 lines.append(
-                    f"slew-limited {commander.slew_limited_count / max(1, commander.command_count) * 100:5.2f}%   "
-                    f"worst period {stats.period_max * 1000.0:6.2f} ms   "
+                    f"slew lag now {math.degrees(commander.slew_lag_step_max):6.2f} deg   "
+                    f"run max {math.degrees(commander.slew_lag_run_max):6.2f} deg"
+                    + (f" (ID {worst_lag_id})" if worst_lag_id is not None else "")
+                    + f"   worst period {stats.period_max * 1000.0:6.2f} ms   "
                     f"worst inference {stats.inference_ms_max:5.2f} ms"
                 )
-                rates = commander.slew_rate_by_motor()
+                lags = commander.slew_lag_max_by_motor
                 lines.append(
-                    "slew by motor "
-                    + "  ".join(f"ID {motor_id} {rates[motor_id] * 100:5.1f}%" for motor_id in sorted(rates))
+                    "slew lag max by motor "
+                    + "  ".join(f"ID {motor_id} {math.degrees(lags[motor_id]):5.2f}" for motor_id in sorted(lags))
+                    + " deg"
                 )
                 lines.append("")
                 lines.append(faults.current_line(motors))
@@ -1182,10 +1213,13 @@ def run_deploy(policy_path, contract, args):
     except KeyboardInterrupt:
         print("\nStop requested.")
     finally:
-        brake_and_stop(motors, buses, enabled_ids, stop_ids, SETTINGS.brake_time, ENABLE_KD)
+        shutdown_report = brake_and_stop(
+            motors, buses, enabled_ids, stop_ids, SETTINGS.brake_time, ENABLE_KD
+        )
         imu.stop()
         if stop_ids:
-            print("Active damping and stop/disable shutdown completed.")
+            for line in shutdown_report_lines(shutdown_report):
+                print(line)
             print(faults.history_line())
         else:
             print("CAN buses closed. No motor control command was sent.")
@@ -1196,7 +1230,7 @@ def run_deploy(policy_path, contract, args):
                 f"Ran {stats.steps} policy steps in {stats.elapsed():.2f} s; "
                 f"worst period {stats.period_max * 1000.0:.2f} ms, "
                 f"worst inference {stats.inference_ms_max:.2f} ms, "
-                f"slew-limited {commander.slew_limited_count / max(1, commander.command_count) * 100:.2f}%, "
+                f"slew lag max {math.degrees(commander.slew_lag_run_max):.2f} deg, "
                 f"runner clip {pipeline.runner_clip_count / calls * 100:.2f}%, "
                 f"target clip {pipeline.target_clip_count / calls * 100:.2f}%."
             )
