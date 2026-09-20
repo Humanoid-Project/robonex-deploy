@@ -561,11 +561,23 @@ def fault_flag_names(flags):
 
 
 class FaultMonitor:
-    """Display-only record of reported motor faults; it never stops the robot."""
+    """Record reported motor faults, and stop once one of them persists.
+
+    All six bits mean the motor firmware has decided something is wrong, and every one of
+    them makes the next position command either useless or harmful -- a magnetic encoder
+    fault means the position being fed back is not trustworthy, and `uncalibrated` appearing
+    mid-run means the motor rebooted. So none of them is display-only. What they are not is
+    instantaneous: a single frame could be a glitch on a bus that has dropped frames before,
+    and dropping a 20 kg robot has its own cost. A bit therefore has to hold for
+    BLOCKING_FRAMES consecutive feedback frames before it stops anything.
+    """
+
+    BLOCKING_FRAMES = 3
 
     def __init__(self):
         self.previous = {}
         self.history = {}  # (motor_id, bit) -> [first seconds since start, phase, onset count]
+        self.streak = {}   # (motor_id, bit) -> consecutive frames the bit has been set
 
     def update(self, motors, now, phase):
         for motor_id, motor in motors.items():
@@ -573,11 +585,22 @@ class FaultMonitor:
             rising = flags & ~self.previous.get(motor_id, 0)
             self.previous[motor_id] = flags
             for bit in range(len(FAULT_FLAG_NAMES)):
+                if flags & (1 << bit):
+                    self.streak[(motor_id, bit)] = self.streak.get((motor_id, bit), 0) + 1
+                else:
+                    self.streak.pop((motor_id, bit), None)
                 if rising & (1 << bit):
                     record = self.history.setdefault(
                         (motor_id, bit), [now - PROGRAM_STARTED, phase, 0]
                     )
                     record[2] += 1
+
+    def blocking_reason(self):
+        for (motor_id, bit), frames in sorted(self.streak.items()):
+            if frames >= self.BLOCKING_FRAMES:
+                return (f"ID {motor_id} reports {FAULT_FLAG_NAMES[bit]} "
+                        f"on {frames} consecutive feedback frames")
+        return None
 
     def current_line(self, motors):
         active = [
@@ -795,6 +818,9 @@ def approach_pose(commander, joints, targets, motors, limits, settings, label, f
         now = time.monotonic()
         joints.poll()
         faults.update(motors, now, "approach")
+        fault_reason = faults.blocking_reason()
+        if fault_reason:
+            raise RuntimeError("Safety stop: " + fault_reason)
         reason = runtime_safety_reason(motors, commander.commands, limits, now, settings)
         if reason:
             raise RuntimeError(f"{label} move stopped for safety: {reason}")
@@ -1049,6 +1075,9 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
             joints.poll()
             faults.update(motors, now, "policy")
             thermal.update(motors, now - last_tick)
+            fault_reason = faults.blocking_reason()
+            if fault_reason:
+                raise RuntimeError("Safety stop: " + fault_reason)
             reason = runtime_safety_reason(motors, commander.commands, limits, now, SETTINGS)
             if reason:
                 raise RuntimeError("Safety stop: " + reason)
