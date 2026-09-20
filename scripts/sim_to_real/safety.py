@@ -304,6 +304,32 @@ def runtime_safety_reason(motors, commands, limits, now, args):
                 return f"ID {mid} tracking error is too large ({math.degrees(error):+.2f} deg)"
     return None
 
+def tilt_reason(gravity, max_tilt_deg):
+    """Stop once the trunk is further from vertical than a walking robot ever gets.
+
+    Nothing else in `runtime_safety_reason` looks at attitude: the IMU is read for the
+    policy and checked for staleness, but its value is never a stop condition. On the
+    stand that did not matter because the ropes caught a fall. Untethered it does -- a
+    robot lying on the floor keeps being commanded to its policy targets, which is high
+    torque at zero speed, the worst case for motor heating.
+
+    The threshold is on the angle between measured gravity and straight down. The three
+    recorded hardware runs reach 6.88 deg while walking and 26.12 deg standing under a
+    push, so 30 deg clears normal operation and still fires long before the robot is flat.
+    """
+    if gravity is None or len(gravity) < 3:
+        return "IMU returned no gravity vector"
+    if not all(math.isfinite(v) for v in gravity[:3]):
+        return "IMU gravity contains NaN or infinity"
+    norm = math.sqrt(sum(v * v for v in gravity[:3]))
+    if norm < 0.5:
+        return f"IMU gravity vector is degenerate (norm {norm:.3f})"
+    tilt = math.degrees(math.acos(max(-1.0, min(1.0, -gravity[2] / norm))))
+    if tilt > max_tilt_deg:
+        return f"the robot is {tilt:.1f} deg from vertical (limit {max_tilt_deg:.0f} deg)"
+    return None
+
+
 def brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd):
     damping_errors = {}
     stop_errors = {}

@@ -76,6 +76,7 @@ from safety import (
     open_hardware,
     runtime_safety_reason,
     shutdown_report_lines,
+    tilt_reason,
     wrap_to_pi,
 )
 
@@ -142,6 +143,7 @@ class Settings:
     overspeed: float = 10.0
     max_temp: float = 70.0
     max_error_deg: float = 25.0
+    max_tilt_deg: float = 40.0
     max_raw_action: float = 20.0
 
     approach_max_speed: float = 0.30
@@ -1089,6 +1091,9 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
             imu_reason = imu.failure_reason(age)
             if imu_reason:
                 raise RuntimeError("Safety stop: " + imu_reason)
+            tilt = tilt_reason(gravity, SETTINGS.max_tilt_deg)
+            if tilt:
+                raise RuntimeError("Safety stop: " + tilt)
 
             try:
                 observation = runner.observation(positions, velocities, angular_velocity, gravity)
@@ -1226,6 +1231,7 @@ def run_deploy(policy_path, contract, args):
             )
         print(f"  motor IDs   : {sorted(motor_ids)}")
         print(f"  duration    : {'until Ctrl-C' if args.duration is None else f'{args.duration:.1f} s'}")
+        print(f"  tilt stop   : {SETTINGS.max_tilt_deg:g} deg from vertical")
         print("  The robot must hang on the stand or be held; this tool cannot catch a fall.")
         print("  Keep the emergency stop within reach.")
         confirm("Press Enter to enable the motors and start, or Ctrl-C to cancel: ")
@@ -1264,6 +1270,7 @@ def run_deploy(policy_path, contract, args):
                 f"worst period {stats.period_max * 1000.0:.2f} ms, "
                 f"worst inference {stats.inference_ms_max:.2f} ms, "
                 f"slew lag max {math.degrees(commander.slew_lag_run_max):.2f} deg, "
+                f"{thermal.worst_line()}, "
                 f"runner clip {pipeline.runner_clip_count / calls * 100:.2f}%, "
                 f"target clip {pipeline.target_clip_count / calls * 100:.2f}%."
             )
@@ -1286,6 +1293,16 @@ def parse_args(argv=None):
         help="Read-only preview: print observation, action and targets without commanding any motor",
     )
     parser.add_argument("--duration", type=float, help="Stop after this many seconds")
+    parser.add_argument(
+        "--max-tilt-deg",
+        type=float,
+        default=None,
+        help="Stop if the trunk goes further than this from vertical. The recorded runs "
+             "reach 6.9 deg walking and 26.1 deg standing under a push that the robot then "
+             "recovered from, so the 40 deg default leaves recovery alone while still firing "
+             "long before the robot is flat. Lower it to catch a fall sooner, at the risk of "
+             "cutting a recovery short.",
+    )
     parser.add_argument(
         "--approach-tolerance-deg",
         type=float,
@@ -1395,6 +1412,14 @@ def main(argv=None):
     args = parse_args(argv)
     global SETTINGS, ENABLE_KP, ENABLE_KD
     SETTINGS = replace(SETTINGS, gain_scale=args.gain_scale)
+    if args.max_tilt_deg is not None:
+        if not 5.0 <= args.max_tilt_deg <= 90.0:
+            raise SystemExit("--max-tilt-deg must be between 5 and 90 degrees")
+        SETTINGS = replace(SETTINGS, max_tilt_deg=args.max_tilt_deg)
+        print(
+            f"Tilt stop set to {args.max_tilt_deg:g} deg "
+            f"(default {Settings().max_tilt_deg:g})"
+        )
     if args.approach_tolerance_deg is not None:
         if not 0.0 < args.approach_tolerance_deg <= 10.0:
             raise SystemExit("--approach-tolerance-deg must be between 0 and 10 degrees")
