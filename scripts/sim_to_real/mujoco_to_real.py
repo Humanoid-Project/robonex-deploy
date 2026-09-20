@@ -38,6 +38,7 @@ from safety import (
     load_fixed_model,
     open_hardware,
     runtime_safety_reason,
+    shutdown_report_lines,
     safe_limits,
     verify_model_limits,
     wrap_to_pi,
@@ -328,11 +329,12 @@ def run(args):
                 elif time.monotonic() - next_tick > period:
                     next_tick = time.monotonic()
     finally:
-        brake_and_stop(
+        shutdown_report = brake_and_stop(
             motors, buses, enabled_ids, stop_ids, args.brake_time, args.kd
         )
         if stop_ids:
-            print("Active damping and stop/disable shutdown completed.")
+            for line in shutdown_report_lines(shutdown_report):
+                print(line)
         else:
             print("CAN buses closed. No motor control command was sent during the preflight check.")
 

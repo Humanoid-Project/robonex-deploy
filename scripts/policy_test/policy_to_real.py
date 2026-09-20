@@ -54,9 +54,9 @@ from robonex_can import (
 )
 import robonex_common
 from robonex_common.imu import DEFAULT_IMU_BAUDRATE, DEFAULT_IMU_PORT, MOUNT_ROLL_DEG
-from robonex_common.joints import CHANNEL_MOTOR_IDS, JOINT_BY_MODEL_NAME
+from robonex_common.joints import CHANNEL_MOTOR_IDS, JOINT_BY_MODEL_NAME, JOINT_BY_ID
 from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
-from robonex_common.motors import MOTOR_CONTROL_KD, MOTOR_CONTROL_KP
+from robonex_common.motors import MOTOR_CONTROL_KD, MOTOR_CONTROL_KP, RATED_TORQUE
 from robonex_common.policy import PolicyContract, python_source_sha256
 from robonex_common.protocol import MECHANICAL_VELOCITY_INDEX
 from robonex_common.runtime import (
@@ -68,6 +68,7 @@ from robonex_common.runtime import (
 )
 from safety import (
     AxisLimiter,
+    ThermalLoad,
     align_angle,
     brake_and_stop,
     enable_with_runtime_feedback,
@@ -1019,7 +1020,8 @@ def _round(value, digits=5):
         return ""
 
 
-def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, notes, stats, faults):
+def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, notes, stats,
+                faults, thermal):
     period = 1.0 / contract.policy_hz
     stats.started = time.monotonic()
     next_tick = time.monotonic()
@@ -1046,6 +1048,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
             now = time.monotonic()
             joints.poll()
             faults.update(motors, now, "policy")
+            thermal.update(motors, now - last_tick)
             reason = runtime_safety_reason(motors, commander.commands, limits, now, SETTINGS)
             if reason:
                 raise RuntimeError("Safety stop: " + reason)
@@ -1123,6 +1126,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     + " deg"
                 )
                 lines.append("")
+                lines.append(thermal.worst_line())
                 lines.append(faults.current_line(motors))
                 lines.append(faults.history_line())
                 if notes:
@@ -1169,6 +1173,9 @@ def run_deploy(policy_path, contract, args):
     stats = LoopStats()
     commander = None
     faults = FaultMonitor()
+    thermal = ThermalLoad({
+        motor_id: RATED_TORQUE[JOINT_BY_ID[motor_id].motor_model] for motor_id in motor_ids
+    })
     try:
         buses, motors, hubs = open_hardware(motor_ids, SETTINGS.interface, SETTINGS.host_id)
         _, blocking = inspect_zero_positions(motors, SETTINGS.approach_tolerance_deg * DEG, hard_limits)
@@ -1195,20 +1202,17 @@ def run_deploy(policy_path, contract, args):
         confirm("Press Enter to enable the motors and start, or Ctrl-C to cancel: ")
 
         stop_ids = list(motor_ids)
-        try:
-            starts, enabled_ids = enable_with_runtime_feedback(
-                motors, hubs, ENABLE_KP, ENABLE_KD, hard_limits
-            )
-        except RuntimeError as error:
-            enabled_ids = getattr(error, "enabled_ids", enabled_ids)
-            raise
+        starts, enabled_ids = enable_with_runtime_feedback(
+            motors, hubs, ENABLE_KP, ENABLE_KD, hard_limits, enabled_out=enabled_ids
+        )
 
         joints = RuntimeJointSource(motors, hubs)
         commander = TargetCommander(motors, starts, SETTINGS)
         approach_pose(commander, joints, home_targets, motors, hard_limits, SETTINGS, "default", faults)
         runner.reset()
         policy_loop(
-            runner, commander, joints, imu, motors, hard_limits, contract, args, notes, stats, faults
+            runner, commander, joints, imu, motors, hard_limits, contract, args, notes, stats,
+            faults, thermal
         )
     except KeyboardInterrupt:
         print("\nStop requested.")

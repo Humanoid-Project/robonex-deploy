@@ -147,9 +147,9 @@ def gain_for(gains, motor_id):
     return gains
 
 
-def enable_with_runtime_feedback(motors, hubs, kp, kd, limits):
+def enable_with_runtime_feedback(motors, hubs, kp, kd, limits, enabled_out=None):
     starts = {}
-    enabled_ids = []
+    enabled_ids = enabled_out if enabled_out is not None else []
 
     stop_errors = []
     for mid, motor in motors.items():
@@ -225,6 +225,54 @@ def inspect_zero_positions(motors, tolerance_rad, limits):
             f"{(-wrapped_deg):+11.3f} deg  {status}"
         )
     return measured, blocking_failures
+
+class ThermalLoad:
+    """Accumulate time spent above the continuous torque rating, and leak it back.
+
+    `runtime_safety_reason` checks instantaneous torque for finiteness only, so a motor can sit
+    above its continuous rating indefinitely with no software action until it reaches `max_temp`.
+    A continuous rating is not an instantaneous limit, so the magnitude alone means nothing --
+    what matters is magnitude times duration, which is what this integrates.
+
+    The accumulator is `d/dt A = max((tau/rated)^2 - 1, 0) - A/tau_leak`, in units of
+    rated-squared-seconds, evaluated per motor.
+    """
+
+    def __init__(self, rated_by_id, budget=30.0, leak_s=30.0):
+        self.rated = dict(rated_by_id)
+        self.budget = budget
+        self.leak_s = leak_s
+        self.load = {mid: 0.0 for mid in rated_by_id}
+        self.peak = {mid: 0.0 for mid in rated_by_id}
+
+    def update(self, motors, dt):
+        if not math.isfinite(dt) or dt <= 0.0:
+            return
+        for mid, rated in self.rated.items():
+            motor = motors.get(mid)
+            torque = getattr(motor, "last_torque", None) if motor is not None else None
+            if torque is None or not math.isfinite(torque) or rated <= 0.0:
+                continue
+            excess = max((torque / rated) ** 2 - 1.0, 0.0)
+            value = self.load[mid] + (excess - self.load[mid] / self.leak_s) * dt
+            self.load[mid] = max(value, 0.0)
+            if self.load[mid] > self.peak[mid]:
+                self.peak[mid] = self.load[mid]
+
+    def reason(self):
+        for mid in sorted(self.load):
+            if self.load[mid] >= self.budget:
+                return (f"ID {mid} has been over its {self.rated[mid]:.0f} N.m continuous rating "
+                        f"for too long (thermal load {self.load[mid]:.1f} of {self.budget:.0f})")
+        return None
+
+    def worst_line(self):
+        if not self.peak:
+            return "thermal load: no motors tracked"
+        mid = max(self.peak, key=self.peak.get)
+        return (f"thermal load peak {self.peak[mid]:.2f} of {self.budget:.0f} on ID {mid} "
+                f"(now {self.load[mid]:.2f})")
+
 
 def runtime_safety_reason(motors, commands, limits, now, args):
     for mid, motor in motors.items():
