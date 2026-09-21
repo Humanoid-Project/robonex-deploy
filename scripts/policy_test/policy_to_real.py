@@ -1279,7 +1279,10 @@ def run_deploy(policy_path, contract, args):
 
 # The policy is only trained inside this envelope; a command outside it is out of
 # distribution and the response is undefined, so refuse it rather than clamp silently.
-COMMAND_LIMITS = ((0.0, 0.3), (0.0, 0.0), (0.0, 0.0))
+# These are the ranges the velocity curriculum actually reached, not its starting
+# ranges: it widens both ways from (0.1, 0.1) toward limit_ranges, and S30, S33 and S34
+# all hit the full -0.2..0.5 on x by iteration ~160, spending 84% of training there.
+COMMAND_LIMITS = ((-0.2, 0.5), (-0.2, 0.2), (-0.2, 0.2))
 
 
 def parse_args(argv=None):
