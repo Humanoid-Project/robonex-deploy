@@ -5,6 +5,7 @@ import argparse
 import atexit
 import csv
 import json
+from datetime import datetime, timezone
 import math
 import os
 import select
@@ -372,6 +373,7 @@ class ImuSource:
 
 class PolicyRunner:
     def __init__(self, policy_path, contract):
+        self.policy_path = policy_path
         self.contract = contract
         self.pipeline = ActionPipeline(contract)
         self.session = ort.InferenceSession(str(policy_path), providers=["CPUExecutionProvider"])
@@ -961,6 +963,7 @@ class TelemetryRecorder:
                 f"{short}.temp", f"{short}.fault", f"{short}.raw_action",
                 f"{short}.target", f"{short}.commanded",
             ]
+        header.append("stop_reason")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
             raise SystemExit(
@@ -979,7 +982,7 @@ class TelemetryRecorder:
         self.step = 0
 
     def record(self, now, started, dt, inference_ms, ramp, raw_action, targets, commands,
-               gravity=None, gyro=None, imu_age=None, velocity_command=None):
+               gravity=None, gyro=None, imu_age=None, velocity_command=None, stop_reason=""):
         row = [
             round(now - started, 4), self.step, round(dt * 1000.0, 3),
             round(inference_ms, 3), round(ramp, 4),
@@ -1007,10 +1010,66 @@ class TelemetryRecorder:
                 round(float(targets[index]), 5),
                 _round(commands.get(motor_id)),
             ]
+        row.append(stop_reason)
         self.rows.append(row)
         self.step += 1
         if len(self.rows) >= self.MAX_ROWS:
             self.flush()
+
+    def write_sidecar(self, policy_path, contract, settings, args):
+        """Record which policy produced this file, next to it.
+
+        The CSV carries no policy identity, so a recording cannot be traced back to the
+        weights that made it -- and a run analysed under the wrong assumption is worse than
+        one that is skipped. This is the same idea as the exporter's `export_receipt.json`.
+        """
+        meta = {
+            "telemetry_file": self.path.name,
+            "written_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            "policy_file": str(policy_path),
+            "policy_sha256": contract.policy_sha256,
+            "task": contract.task,
+            "policy_hz": contract.policy_hz,
+            "training_commit": contract.training_commit,
+            "common_commit": contract.common_commit,
+            "description_commit": contract.description_commit,
+            "deploy_source_sha256": python_source_sha256(
+                Path(__file__).resolve().parents[2], ("scripts",)
+            ),
+            "command": {"vx": args.vx, "vy": args.vy, "wz": args.wz,
+                        "keyboard": bool(getattr(args, "keyboard", False))},
+            "settings": {
+                "gain_scale": settings.gain_scale,
+                "max_error_deg": settings.max_error_deg,
+                "max_tilt_deg": settings.max_tilt_deg,
+                "max_temp": settings.max_temp,
+                "overspeed": settings.overspeed,
+                "approach_tolerance_deg": settings.approach_tolerance_deg,
+                "policy_max_speed": settings.policy_max_speed,
+                "policy_max_accel": settings.policy_max_accel,
+            },
+        }
+        path = self.path.with_name(self.path.stem + "_meta.json")
+        path.write_text(json.dumps(meta, indent=2) + "\n")
+        return path
+
+    def record_stop(self, now, started, reason, commands, gravity=None, gyro=None, imu_age=None,
+                    velocity_command=None):
+        """Write the sample that tripped a safety stop.
+
+        The checks run at the top of the loop and raise, while `record` is called near the
+        bottom, so the sample that actually breached a limit was never written -- the one
+        row an operator most wants to see. This captures the motor state as the check saw
+        it, against the commands it compared them to. The policy columns are blank because
+        this step never reached inference.
+        """
+        self.record(
+            now, started, float("nan"), float("nan"), float("nan"),
+            [float("nan")] * len(self.order), [float("nan")] * len(self.order), commands,
+            gravity=gravity, gyro=gyro, imu_age=imu_age, velocity_command=velocity_command,
+            stop_reason=reason,
+        )
+        self.flush()
 
     def flush_if_idle(self, slack_s):
         """Write only while the loop is waiting for its next tick.
@@ -1070,6 +1129,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
     )
     if telemetry is not None:
         print(f"Telemetry   : {telemetry.path}  ({contract.policy_hz:.0f} Hz per-motor record)")
+        print(f"Provenance  : {telemetry.write_sidecar(runner.policy_path, contract, SETTINGS, args).name}")
 
     print(
         f"\nPolicy control is active at {contract.policy_hz:.0f} Hz "
@@ -1081,23 +1141,32 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
             joints.poll()
             faults.update(motors, now, "policy")
             thermal.update(motors, now - last_tick)
+            def stop(reason, gravity=None, gyro=None, imu_age=None):
+                if telemetry is not None:
+                    telemetry.record_stop(
+                        now, stats.started, reason, commander.commands,
+                        gravity=gravity, gyro=gyro, imu_age=imu_age,
+                        velocity_command=tuple(float(v) for v in runner.velocity_command),
+                    )
+                return RuntimeError("Safety stop: " + reason)
+
             fault_reason = faults.blocking_reason()
             if fault_reason:
-                raise RuntimeError("Safety stop: " + fault_reason)
+                raise stop(fault_reason)
             reason = runtime_safety_reason(motors, commander.commands, limits, now, SETTINGS)
             if reason:
-                raise RuntimeError("Safety stop: " + reason)
+                raise stop(reason)
 
             positions, velocities, missing = runner.joint_state(joints.snapshot())
             if missing:
-                raise RuntimeError(f"Safety stop: no feedback for motor IDs {sorted(missing)}")
+                raise stop(f"no feedback for motor IDs {sorted(missing)}")
             angular_velocity, gravity, age = imu.read(now)
             imu_reason = imu.failure_reason(age)
             if imu_reason:
-                raise RuntimeError("Safety stop: " + imu_reason)
+                raise stop(imu_reason)
             tilt = tilt_reason(gravity, SETTINGS.max_tilt_deg)
             if tilt:
-                raise RuntimeError("Safety stop: " + tilt)
+                raise stop(tilt, gravity=gravity, gyro=angular_velocity, imu_age=age)
 
             try:
                 observation = runner.observation(positions, velocities, angular_velocity, gravity)
