@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import json
 import math
 import os
+import select
 import shutil
 import sys
 import tempfile
+import termios
 import threading
 import time
+import tty
 from dataclasses import dataclass, field, replace
 from importlib import metadata
 from pathlib import Path
@@ -1049,7 +1053,7 @@ def _round(value, digits=5):
 
 
 def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, notes, stats,
-                faults, thermal):
+                faults, thermal, keyboard=None):
     period = 1.0 / contract.policy_hz
     stats.started = time.monotonic()
     next_tick = time.monotonic()
@@ -1160,6 +1164,12 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     + " deg"
                 )
                 lines.append("")
+                if keyboard is not None:
+                    lines.append(
+                        f"command  vx {runner.velocity_command[0]:+.2f}  "
+                        f"vy {runner.velocity_command[1]:+.2f}  "
+                        f"wz {runner.velocity_command[2]:+.2f}    {keyboard.legend()}"
+                    )
                 lines.append(thermal.worst_line())
                 lines.append(faults.current_line(motors))
                 lines.append(faults.history_line())
@@ -1168,6 +1178,14 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     lines.extend(notes)
                 sys.stdout.write("\n".join(lines) + "\n")
                 sys.stdout.flush()
+
+            if keyboard is not None:
+                note = keyboard.poll(runner.velocity_command)
+                if note:
+                    print(f"  [command] {note}   "
+                          f"vx {runner.velocity_command[0]:+.2f} "
+                          f"vy {runner.velocity_command[1]:+.2f} "
+                          f"wz {runner.velocity_command[2]:+.2f}", flush=True)
 
             next_tick += period
             sleep = next_tick - time.monotonic()
@@ -1207,6 +1225,7 @@ def run_deploy(policy_path, contract, args):
     stats = LoopStats()
     commander = None
     faults = FaultMonitor()
+    keyboard = KeyboardCommand(COMMAND_LIMITS) if args.keyboard else None
     thermal = ThermalLoad({
         motor_id: RATED_TORQUE[JOINT_BY_ID[motor_id].motor_model] for motor_id in motor_ids
     })
@@ -1235,6 +1254,8 @@ def run_deploy(policy_path, contract, args):
         print("  The robot must hang on the stand or be held; this tool cannot catch a fall.")
         print("  Keep the emergency stop within reach.")
         confirm("Press Enter to enable the motors and start, or Ctrl-C to cancel: ")
+        if keyboard is not None and keyboard.start():
+            print(f"  {keyboard.legend()}")
 
         stop_ids = list(motor_ids)
         starts, enabled_ids = enable_with_runtime_feedback(
@@ -1247,7 +1268,7 @@ def run_deploy(policy_path, contract, args):
         runner.reset()
         policy_loop(
             runner, commander, joints, imu, motors, hard_limits, contract, args, notes, stats,
-            faults, thermal
+            faults, thermal, keyboard
         )
     except KeyboardInterrupt:
         print("\nStop requested.")
@@ -1274,7 +1295,79 @@ def run_deploy(policy_path, contract, args):
                 f"runner clip {pipeline.runner_clip_count / calls * 100:.2f}%, "
                 f"target clip {pipeline.target_clip_count / calls * 100:.2f}%."
             )
+        if keyboard is not None:
+            keyboard.stop()
     return 0
+
+
+class KeyboardCommand:
+    """Drive the velocity command from the terminal while the policy runs.
+
+    cbreak, not raw: `tty.setraw` clears ISIG, which would stop Ctrl-C from raising
+    SIGINT and take away the operator's primary way to stop a moving robot.
+    `tty.setcbreak` clears only ECHO and ICANON, so keys arrive one at a time and
+    Ctrl-C still works.
+
+    Losing the terminal means losing control, so stdin reaching EOF -- an SSH session
+    dropping, most likely -- zeroes the command and disables further input rather than
+    leaving the robot walking on the last thing it was told.
+    """
+
+    KEYS = {
+        "w": (0, +0.05), "s": (0, -0.05),
+        "q": (1, +0.05), "e": (1, -0.05),
+        "a": (2, +0.05), "d": (2, -0.05),
+    }
+
+    def __init__(self, limits):
+        self.limits = limits
+        self.fd = None
+        self.saved = None
+        self.active = False
+        self.lost = False
+
+    def start(self):
+        if not sys.stdin.isatty():
+            print("Keyboard control needs an interactive terminal; the command stays fixed.")
+            return False
+        self.fd = sys.stdin.fileno()
+        self.saved = termios.tcgetattr(self.fd)
+        atexit.register(self.stop)
+        tty.setcbreak(self.fd)
+        self.active = True
+        termios.tcflush(self.fd, termios.TCIFLUSH)
+        return True
+
+    def stop(self):
+        if self.active and self.saved is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+            self.active = False
+
+    def poll(self, command):
+        """Apply whatever has been typed. Returns a note to display, or None."""
+        if not self.active or self.lost:
+            return None
+        note = None
+        while select.select([sys.stdin], [], [], 0.0)[0]:
+            data = os.read(self.fd, 64)
+            if not data:
+                self.lost = True
+                command[:] = (0.0, 0.0, 0.0)
+                return "stdin closed; command zeroed and keyboard disabled"
+            for byte in data:
+                key = chr(byte).lower()
+                if key == " ":
+                    command[:] = (0.0, 0.0, 0.0)
+                    note = "command zeroed"
+                elif key in self.KEYS:
+                    axis, delta = self.KEYS[key]
+                    low, high = self.limits[axis]
+                    command[axis] = max(low, min(high, float(command[axis]) + delta))
+        return note
+
+    def legend(self):
+        return ("keys: w/s forward  q/e strafe  a/d turn  SPACE zero  Ctrl-C stop"
+                if self.active else "keyboard: off")
 
 
 # The policy is only trained inside this envelope; a command outside it is out of
@@ -1296,6 +1389,14 @@ def parse_args(argv=None):
         help="Read-only preview: print observation, action and targets without commanding any motor",
     )
     parser.add_argument("--duration", type=float, help="Stop after this many seconds")
+    parser.add_argument(
+        "--keyboard",
+        action="store_true",
+        help="Steer the velocity command from the terminal while the policy runs: w/s "
+             "forward, q/e strafe, a/d turn, SPACE to zero every axis. Values are clamped "
+             "to the same trained envelope as --vx/--vy/--wz. Needs an interactive "
+             "terminal; Ctrl-C keeps working.",
+    )
     parser.add_argument(
         "--max-tilt-deg",
         type=float,
