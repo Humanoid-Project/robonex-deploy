@@ -8,7 +8,12 @@ import numpy as np
 import onnxruntime as ort
 
 from robonex_common.policy import PolicyContract
-from robonex_common.runtime import ActionPipeline
+from robonex_common.runtime import (
+    OBSERVATION_TERM_SIZES,
+    ActionPipeline,
+    ObservationHistory,
+    assemble_observation_frame,
+)
 
 
 def infer(session, input_name, output_name, observation):
@@ -49,17 +54,9 @@ def run(args):
     selected = contract.verify_policy(manifest_path)
     if selected.resolve() != args.policy:
         raise ValueError(f"policy_manifest.json selects {selected.name}, not {args.policy.name}")
-    expected_terms = (
-        "joint_pos_rel:12",
-        "joint_vel_rel:12",
-        "imu_ang_vel:3",
-        "projected_gravity:3",
-        "last_action:12",
-    )
-    if contract.observation_terms != expected_terms:
+    layout = ObservationHistory.from_contract(contract)
+    if layout.term_sizes != OBSERVATION_TERM_SIZES:
         raise ValueError(f"unsupported observation layout: {contract.observation_terms}")
-    if contract.observation_size != contract.action_size * 3 + 6:
-        raise ValueError(f"unsupported observation size: {contract.observation_size}")
 
     session = ort.InferenceSession(str(args.policy), providers=["CPUExecutionProvider"])
     inputs = session.get_inputs()
@@ -69,9 +66,21 @@ def run(args):
     input_name = inputs[0].name
     output_name = outputs[0].name
 
-    observation = np.zeros(contract.observation_size, dtype=np.float32)
-    gravity_start = contract.action_size * 2 + 3
-    observation[gravity_start:gravity_start + 3] = (0.0, 0.0, -1.0)
+    def observe(joint_pos):
+        frame = assemble_observation_frame(
+            joint_pos,
+            np.zeros(contract.action_size),
+            np.zeros(3),
+            (0.0, 0.0, -1.0),
+            np.zeros(3),
+            np.zeros(2),
+            np.zeros(contract.action_size),
+            frame_size=layout.frame_size,
+        )
+        layout.reset()
+        return layout.append(frame).observation()
+
+    observation = observe(np.zeros(contract.action_size))
     pipeline = ActionPipeline(contract)
     baseline_raw = infer(session, input_name, output_name, observation)
     baseline_target, baseline_clipped = apply(pipeline, baseline_raw)
@@ -85,8 +94,9 @@ def run(args):
         best_gain = -1.0
         best_output = ""
         for sign in (-1.0, 1.0):
-            sample = observation.copy()
-            sample[input_index] += sign * perturb
+            joint_pos = np.zeros(contract.action_size)
+            joint_pos[input_index] = sign * perturb
+            sample = observe(joint_pos)
             raw_action = infer(session, input_name, output_name, sample)
             target, clipped = apply(pipeline, raw_action)
             any_clipped |= clipped
