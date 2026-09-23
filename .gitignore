@@ -1,23 +1,16 @@
-.venv/
+# Agent settings
+.claude/
+
+# Python
 .venv*/
 __pycache__/
-*.pyc
+
+# Compiled IMU binding
 *.so
-*.a
 build/
+
+# Local hardware runs and policies
 results/
 policies/
-
-.vscode/
-
-.agents/
-.codex/
-.claude/
-.grok/
-AGENTS.md
-
-# Local hardware-check procedure, kept out of the repo like the other working notes.
 READ_CHECK.md
-
-# Retired deploy bundles: every exported policy except the current candidate.
 etc/
