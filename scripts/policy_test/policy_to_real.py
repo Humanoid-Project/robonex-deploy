@@ -304,6 +304,8 @@ class ImuSource:
         self.bias_raw = None
         self._last_seq = None
         self._last_seq_time = 0.0
+        self._last_imu_frames = None
+        self._last_imu_time = 0.0
 
     def start(self, calibrate):
         self.driver = n100.ImuDriver(
@@ -326,12 +328,22 @@ class ImuSource:
             self.status = "no sample in 3 s"
             self.notes.append(f"[IMU] {self.driver.last_error() or 'unknown error'}")
             return False
+        deadline = time.monotonic() + 1.0
+        while self.driver.stats().imu_frames == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if self.driver.stats().imu_frames == 0:
+            self.status = "no raw IMU frame"
+            self.notes.append("[IMU] AHRS samples arrive but no raw IMU frame; the policy needs the raw gyro")
+            return False
         if calibrate:
             print(
                 f"Calibrating the gyro bias for {self.settings.imu_calibration_seconds:.1f} s. "
                 "Keep the robot completely still."
             )
-            self.driver.calibrate_gyro_bias(self.settings.imu_calibration_seconds)
+            if not self.driver.calibrate_gyro_bias(self.settings.imu_calibration_seconds):
+                self.status = "gyro calibration failed"
+                self.notes.append("[IMU] gyro bias calibration received no sample")
+                return False
             self.bias_raw = self.driver.gyro_bias_raw
             print(
                 f"  raw gyro bias  x {self.bias_raw.x:+.6f}  y {self.bias_raw.y:+.6f}  "
@@ -340,6 +352,8 @@ class ImuSource:
         self.status = "ready"
         self._last_seq = None
         self._last_seq_time = time.monotonic()
+        self._last_imu_frames = None
+        self._last_imu_time = self._last_seq_time
         return True
 
     def stop(self):
@@ -353,12 +367,16 @@ class ImuSource:
         if sample.seq != self._last_seq:
             self._last_seq = sample.seq
             self._last_seq_time = now
+        imu_frames = self.driver.stats().imu_frames
+        if sample.has_imu_frame and imu_frames != self._last_imu_frames:
+            self._last_imu_frames = imu_frames
+            self._last_imu_time = now
         angular_velocity = sample.angular_velocity_raw
         gravity = sample.projected_gravity
         return (
             (angular_velocity.x, angular_velocity.y, angular_velocity.z),
             (gravity.x, gravity.y, gravity.z),
-            now - self._last_seq_time,
+            now - min(self._last_seq_time, self._last_imu_time),
         )
 
     def failure_reason(self, age):
@@ -391,7 +409,6 @@ class PolicyRunner:
         self.velocity_command = np.zeros(3, dtype=np.float32)
         self.history = ObservationHistory.from_contract(contract)
         self.gait_step = 0
-        self.mask_gait_on_standing = True
         self.inference_ms = 0.0
 
     def reset(self):
@@ -413,8 +430,6 @@ class PolicyRunner:
 
     def gait_phase_observation(self):
         phase = gait_phase_at(self.gait_step, step_dt=1.0 / self.contract.policy_hz)
-        if not self.mask_gait_on_standing:
-            return phase
         if float(np.linalg.norm(self.velocity_command)) <= GAIT_COMMAND_DEADBAND:
             return np.zeros_like(phase)
         return phase
@@ -746,7 +761,6 @@ def run_read(policy_path, contract, args):
     notes = []
     runner = PolicyRunner(policy_path, contract)
     runner.velocity_command[:] = (args.vx, args.vy, args.wz)
-    runner.mask_gait_on_standing = not args.no_gait_mask
     joints = ReadOnlyJointSource(SETTINGS, notes)
     imu = ImuSource(SETTINGS, notes)
 
@@ -762,7 +776,9 @@ def run_read(policy_path, contract, args):
     if args.telemetry:
         read_log = ReadRecorder(args.telemetry, contract)
         print(f"Recording   : {read_log.path}")
-    period = 1.0 / SETTINGS.read_print_hz
+    period = 1.0 / contract.policy_hz
+    print_every = max(1, round(contract.policy_hz / SETTINGS.read_print_hz))
+    step = 0
     deadline = None if args.duration is None else time.monotonic() + args.duration
     # The preview prints at read_print_hz, not the policy rate, and nothing here commits a
     # command, so the gait clock has no step counter to ride on. Derive it from elapsed time
@@ -778,6 +794,14 @@ def run_read(policy_path, contract, args):
             angular_velocity, gravity, age = imu.read(now)
             observation = runner.observation(positions, velocities, angular_velocity, gravity)
             raw_action, _, targets = runner.step(observation, commit=True)
+            if read_log is not None:
+                read_log.record(now, observation, gravity, angular_velocity, age, positions, missing)
+            step += 1
+            if (step - 1) % print_every:
+                sleep = period - (time.monotonic() - now)
+                if sleep > 0.0:
+                    time.sleep(sleep)
+                continue
 
             lines = [CLEAR_SCREEN]
             lines.append(f"Policy preview (read-only)   {joints.rate_text()}   (Ctrl-C to stop)\n")
@@ -796,8 +820,6 @@ def run_read(policy_path, contract, args):
                 lines.extend(notes)
             sys.stdout.write("\n".join(lines) + "\n")
             sys.stdout.flush()
-            if read_log is not None:
-                read_log.record(now, observation, gravity, angular_velocity, age, positions, missing)
 
             sleep = period - (time.monotonic() - now)
             if sleep > 0.0:
@@ -1119,7 +1141,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
     last_tick = next_tick
     last_status = 0.0
     ramp_started = next_tick
-    home = {motor_id: commander.commands[motor_id] for motor_id in motors}
+    home = {motor_id: wrap_to_pi(commander.commands[motor_id]) for motor_id in motors}
     deadline = None if args.duration is None else next_tick + args.duration
     commander.reset_stats()
     telemetry = (
@@ -1276,7 +1298,6 @@ def run_deploy(policy_path, contract, args):
     verify_common_source(contract)
     runner = PolicyRunner(policy_path, contract)
     runner.velocity_command[:] = (args.vx, args.vy, args.wz)
-    runner.mask_gait_on_standing = not args.no_gait_mask
     imu = ImuSource(SETTINGS, notes)
 
     motor_ids = [JOINT_BY_MODEL_NAME[name].motor_id for name in contract.joint_order]
@@ -1390,6 +1411,7 @@ class KeyboardCommand:
 
     def __init__(self, limits):
         self.limits = limits
+        self.escape_state = 0
         self.fd = None
         self.saved = None
         self.active = False
@@ -1424,6 +1446,18 @@ class KeyboardCommand:
                 command[:] = (0.0, 0.0, 0.0)
                 return "stdin closed; command zeroed and keyboard disabled"
             for byte in data:
+                if self.escape_state == 2:
+                    if 0x40 <= byte <= 0x7E:
+                        self.escape_state = 0
+                    continue
+                if self.escape_state == 1:
+                    self.escape_state = 0
+                    if byte in (0x5B, 0x4F):
+                        self.escape_state = 2
+                        continue
+                if byte == 0x1B:
+                    self.escape_state = 1
+                    continue
                 key = chr(byte).lower()
                 if key == " ":
                     command[:] = (0.0, 0.0, 0.0)
@@ -1495,11 +1529,6 @@ def parse_args(argv=None):
              "temperature and fault, plus raw action, clipped target and commanded position. "
              "Omit PATH for an automatic timestamped file under results/policy_to_real. "
              "An existing file is never overwritten",
-    )
-    parser.add_argument(
-        "--no-gait-mask",
-        action="store_true",
-        help="Feed the raw gait clock even on a standing command, for policies trained before the mask",
     )
     parser.add_argument(
         "--vx", type=float, default=0.0, help="Forward velocity command (m/s)"

@@ -7,11 +7,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import signal
+import threading
 import time
 
 import can
 import mujoco
 import numpy as np
+from robonex_common.can import drain
 
 from robonex_can import (
     FeedbackHub,
@@ -24,6 +27,9 @@ from robonex_can import (
     channel_for_id,
     clamp,
 )
+
+
+MODE_RUNNING = 2
 
 
 def wrap_to_pi(angle):
@@ -160,6 +166,8 @@ def enable_with_runtime_feedback(motors, hubs, kp, kd, limits, enabled_out=None)
     if stop_errors:
         raise RuntimeError("Preflight stop failed: " + "; ".join(stop_errors))
     time.sleep(0.05)
+    for hub in hubs.values():
+        drain(hub.bus)
 
     for mid in sorted(motors):
         motor = motors[mid]
@@ -175,6 +183,13 @@ def enable_with_runtime_feedback(motors, hubs, kp, kd, limits, enabled_out=None)
             raise error
         lower, upper = limits[mid]
         wrapped = wrap_to_pi(start) if math.isfinite(start) else start
+        if math.isfinite(start) and abs(start) > math.pi:
+            error = RuntimeError(
+                f"ID {mid} type-0x02 position {math.degrees(start):+.3f}deg is outside "
+                "-180..+180 deg; set zero_sta=1 (0x7029) on this motor"
+            )
+            error.enabled_ids = enabled_ids
+            raise error
         if not math.isfinite(start) or not lower <= wrapped <= upper:
             error = RuntimeError(
                 f"ID {mid} feedback is non-finite or outside the safe range after enable: "
@@ -187,6 +202,17 @@ def enable_with_runtime_feedback(motors, hubs, kp, kd, limits, enabled_out=None)
             pos=start, vel=0.0,
             kp=gain_for(kp, mid), kd=gain_for(kd, mid), torque=0.0,
         )
+        deadline = time.monotonic() + 0.3
+        while motor.last_mode_status != MODE_RUNNING and time.monotonic() < deadline:
+            if hub.wait_for(mid, timeout=max(0.0, deadline - time.monotonic())) is None:
+                break
+        if motor.last_mode_status != MODE_RUNNING:
+            error = RuntimeError(
+                f"ID {mid} is not running after enable "
+                f"(mode {motor.last_mode_status}, expected {MODE_RUNNING})"
+            )
+            error.enabled_ids = enabled_ids
+            raise error
     return starts, enabled_ids
 
 def inspect_zero_positions(motors, tolerance_rad, limits):
@@ -209,7 +235,13 @@ def inspect_zero_positions(motors, tolerance_rad, limits):
         degrees = math.degrees(position)
         wrapped_deg = math.degrees(wrapped)
         lower, upper = limits[mid]
-        if not lower <= wrapped <= upper:
+        if abs(position) > math.pi:
+            status = "BLOCK"
+            blocking_failures.append(
+                f"ID {mid} raw mechPos {degrees:+.3f} deg is outside -180..+180 deg; "
+                "set zero_sta=1 (0x7029) on this motor"
+            )
+        elif not lower <= wrapped <= upper:
             status = "BLOCK"
             blocking_failures.append(
                 f"ID {mid} {degrees:+.3f} deg (wrapped {wrapped_deg:+.3f} deg) is outside "
@@ -281,6 +313,8 @@ def runtime_safety_reason(motors, commands, limits, now, args):
         age = now - motor.last_feedback_time
         if age > args.feedback_timeout:
             return f"ID {mid} feedback timeout ({age:.3f} s > {args.feedback_timeout:.3f} s)"
+        if motor.last_mode_status != MODE_RUNNING:
+            return f"ID {mid} left run mode (mode {motor.last_mode_status})"
         if not all(math.isfinite(v) for v in (
             motor.last_position, motor.last_velocity, motor.last_torque, motor.last_temp
         )):
@@ -331,24 +365,38 @@ def tilt_reason(gravity, max_tilt_deg):
 
 
 def brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd):
+    previous = None
+    if threading.current_thread() is threading.main_thread():
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        return _brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd)
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGINT, previous)
+
+
+def _brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd):
     damping_errors = {}
     stop_errors = {}
     stop_sent = []
     enabled = [mid for mid in sorted(set(enabled_ids)) if mid in motors]
     if enabled and duration > 0.0:
         deadline = time.monotonic() + duration
-        while time.monotonic() < deadline:
-            for mid in enabled:
-                try:
-                    motor = motors[mid]
-                    motor.control(
-                        pos=0.0, vel=0.0, kp=0.0,
-                        kd=min(gain_for(kd, mid), motor.spec.kd_max), torque=0.0,
-                    )
-                except (OSError, can.CanError) as error:
-                    damping_errors[mid] = error
+        try:
+            while time.monotonic() < deadline:
+                for mid in enabled:
+                    try:
+                        motor = motors[mid]
+                        motor.control(
+                            pos=0.0, vel=0.0, kp=0.0,
+                            kd=min(gain_for(kd, mid), motor.spec.kd_max), torque=0.0,
+                        )
+                    except (OSError, can.CanError) as error:
+                        damping_errors[mid] = error
 
-            time.sleep(0.01)
+                time.sleep(0.01)
+        except KeyboardInterrupt:
+            pass
 
     for mid in sorted(set(stop_ids)):
         motor = motors.get(mid)
@@ -356,7 +404,7 @@ def brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd):
             continue
         try:
             motor.stop()
-        except (OSError, can.CanError) as error:
+        except (OSError, can.CanError, KeyboardInterrupt) as error:
             stop_errors[mid] = error
         else:
             stop_sent.append(mid)

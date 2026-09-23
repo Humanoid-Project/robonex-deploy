@@ -395,7 +395,7 @@ def run(args):
         stop_ids = list(motor_ids)
         try:
             starts, enabled_ids = enable_with_runtime_feedback(
-                motors, hubs, args.kp, args.kd, hard_limits,
+                motors, hubs, args.kp, args.kd, hard_limits, enabled_out=enabled_ids,
             )
         except RuntimeError as error:
             enabled_ids = getattr(error, "enabled_ids", enabled_ids)
