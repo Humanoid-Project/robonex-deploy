@@ -1,8 +1,10 @@
 import argparse
 import json
 import math
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -30,6 +32,7 @@ from robonex_common.runtime import (
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
+import robonex_common
 from robonex_common.paths import DESCRIPTION_REPO_NAMES, description_model, git_commit, resolve_repo
 
 file_hash = sha256_file
@@ -132,7 +135,6 @@ class PolicyAdapter:
         self.last_action.fill(0.0)
         self.history.reset()
         self.gait_step = 0
-        self.mask_gait_on_standing = True
 
     def gait_phase_observation(self):
         """The clock the policy sees, zeroed on a standing command.
@@ -143,8 +145,6 @@ class PolicyAdapter:
         term is still ``gait_phase:2x5`` either way, only the values differ.
         """
         phase = gait_phase_at(self.gait_step, step_dt=1.0 / self.contract.policy_hz)
-        if not self.mask_gait_on_standing:
-            return phase
         if float(np.linalg.norm(self.velocity_command)) <= GAIT_COMMAND_DEADBAND:
             return np.zeros_like(phase)
         return phase
@@ -413,7 +413,7 @@ COMMAND_KEYS = {
     ord("Q"): (0.0, 0.05, 0.0),
     ord("E"): (0.0, -0.05, 0.0),
 }
-COMMAND_LIMITS = ((-0.5, 0.5), (-0.3, 0.3), (-1.0, 1.0))
+COMMAND_LIMITS = ((-0.2, 0.5), (-0.2, 0.2), (-0.2, 0.2))
 
 
 def make_key_callback(adapter):
@@ -510,13 +510,8 @@ def parse_args():
     parser.add_argument("--output", type=Path, help="Optional JSON output path")
     parser.add_argument("--duration", type=float, help="Stop after this many simulated seconds")
     parser.add_argument("--headless", action="store_true", help="Run without opening the viewer")
-    parser.add_argument(
-        "--no-gait-mask",
-        action="store_true",
-        help="Feed the raw gait clock even on a standing command, for policies trained before the mask",
-    )
     parser.add_argument("--vx", type=float, default=0.3,
-                        help="Forward velocity command in m/s (the policy was trained on 0.0-0.3)")
+                        help="Forward velocity command in m/s (trained envelope -0.2..0.5)")
     parser.add_argument("--vy", type=float, default=0.0, help="Lateral velocity command in m/s")
     parser.add_argument("--wz", type=float, default=0.0, help="Yaw rate command in rad/s")
     args = parser.parse_args()
@@ -564,11 +559,17 @@ def parse_args():
                 f"robonex-common commit mismatch: manifest={args.contract.common_commit}, "
                 f"checkout={actual_common_commit}"
             )
-        actual_common_sha256 = python_source_sha256(common_root, ("src/robonex_common",))
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copytree(
+                Path(robonex_common.__file__).parent,
+                Path(tmp, "src", "robonex_common"),
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
+            actual_common_sha256 = python_source_sha256(tmp, ("src/robonex_common",))
         if actual_common_sha256 != args.contract.common_sha256:
             parser.error(
-                f"robonex-common source mismatch: manifest={args.contract.common_sha256}, "
-                f"checkout={actual_common_sha256}"
+                f"imported robonex-common source mismatch: manifest={args.contract.common_sha256}, "
+                f"imported={actual_common_sha256} ({Path(robonex_common.__file__).parent})"
             )
         args.model = description_model(args.contract.description_model, description_root)
     except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as error:
@@ -586,7 +587,6 @@ def main():
     model = mujoco.MjModel.from_xml_path(str(args.model))
     data = mujoco.MjData(model)
     adapter = PolicyAdapter(model, args.policy, args.contract)
-    adapter.mask_gait_on_standing = not args.no_gait_mask
     adapter.velocity_command[:] = (args.vx, args.vy, args.wz)
     if args.headless:
         result = simulate(model, data, adapter, args, HeadlessViewer())
