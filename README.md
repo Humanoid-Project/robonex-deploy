@@ -54,6 +54,9 @@ robonex-deploy/
 | - | `--output` | Terminal only | Optional JSON output path |
 | - | `--duration` | Until the viewer closes | Stop after this many simulated seconds |
 | - | `--headless` | Viewer on | Run without a viewer; requires `--duration` |
+| - | `--vx` / `--vy` / `--wz` | `0.3` / `0.0` / `0.0` | Constant velocity command (m/s, m/s, rad/s) |
+| - | `--scenario` | - | Command schedule `T:VX,VY,WZ;...` in seconds; replaces `--vx/--vy/--wz` |
+| - | `--trace` | - | Per-policy-step CSV trace for `scenario_metrics.py` |
 
 ```bash
 # Example
@@ -69,6 +72,14 @@ python3 scripts/sim_to_sim/isaac_to_mujoco.py \
   --headless \
   --duration 15 \
   --output /tmp/sim_to_sim.json
+
+# Fixed command scenario with a trace
+python3 scripts/sim_to_sim/isaac_to_mujoco.py \
+  --policy policies/<run>/policy.onnx \
+  --headless \
+  --duration 30 \
+  --scenario "0:0,0,0;10:0.1,0,0;20:0.2,0,0" \
+  --trace /tmp/scenario_trace.csv
 ```
 
 The required schema-2 manifest verifies the policy file, MuJoCo XML/mesh bundle, action

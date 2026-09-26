@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import math
 import shutil
@@ -440,10 +441,62 @@ def make_key_callback(adapter):
     return on_key
 
 
+def parse_scenario(text):
+    schedule = []
+    for part in text.split(";"):
+        start, values = part.split(":")
+        command = tuple(float(v) for v in values.split(","))
+        if len(command) != 3:
+            raise ValueError(f"scenario segment {part!r} needs vx,vy,wz")
+        schedule.append((float(start), command))
+    schedule.sort()
+    if schedule[0][0] != 0.0:
+        raise ValueError("scenario must start at 0")
+    return schedule
+
+
+def command_at(schedule, t):
+    return [command for start, command in schedule if start <= t + 1.0e-9][-1]
+
+
+def trace_header(adapter):
+    header = ["t_s", "step", "dt_ms", "ramp", "cmd_vx", "cmd_vy", "cmd_wz",
+              "gravity_x", "gravity_y", "gravity_z", "gyro_x", "gyro_y", "gyro_z",
+              "root_x", "root_y", "root_z", "root_vx_b", "root_vy_b", "reset"]
+    for name in adapter.joint_names:
+        short = name[:-6] if name.endswith("_joint") else name
+        header += [f"{short}.pos", f"{short}.vel", f"{short}.torque", f"{short}.target"]
+    return header
+
+
+def trace_row(model, data, adapter, step, policy_period, minimum_height):
+    mujoco.mj_objectVelocity(
+        model, data, mujoco.mjtObj.mjOBJ_XBODY, adapter.base_body_id, adapter.object_velocity, 1
+    )
+    rotation_world_from_base = data.xmat[adapter.base_body_id].reshape(3, 3)
+    gravity = rotation_world_from_base.T @ adapter.gravity_world
+    root = data.qpos[adapter.root_qpos_address:adapter.root_qpos_address + 3]
+    row = [round(float(data.time), 4), step, round(policy_period * 1000.0, 3), 1.0,
+           *[float(v) for v in adapter.velocity_command],
+           *[round(float(v), 5) for v in gravity],
+           *[round(float(v), 5) for v in adapter.object_velocity[:3]],
+           *[round(float(v), 5) for v in root],
+           round(float(adapter.object_velocity[3]), 5), round(float(adapter.object_velocity[4]), 5),
+           int(float(root[2]) < minimum_height)]
+    for index in range(len(adapter.joint_names)):
+        row += [round(float(data.qpos[adapter.qpos_addresses[index]]), 6),
+                round(float(data.qvel[adapter.dof_addresses[index]]), 6),
+                round(float(data.actuator_force[adapter.actuator_ids[index]]), 5),
+                round(float(data.ctrl[adapter.actuator_ids[index]]), 6)]
+    return row
+
+
 def simulate(model, data, adapter, args, viewer_handle):
     reset_simulation(model, data, adapter)
     diagnostics = Diagnostics(model, adapter)
     policy_period = 1.0 / args.policy_hz
+    schedule = parse_scenario(args.scenario) if getattr(args, "scenario", None) else None
+    trace = [] if getattr(args, "trace", None) else None
     next_policy_time = 0.0
     next_viewer_sync = 0.0
     wall_start = time.perf_counter()
@@ -457,6 +510,12 @@ def simulate(model, data, adapter, args, viewer_handle):
         if args.duration is not None and data.time >= args.duration:
             break
         if data.time + 1.0e-12 >= next_policy_time:
+            mujoco.mj_forward(model, data)
+            if trace is not None and diagnostics.policy_steps:
+                trace.append(trace_row(model, data, adapter, diagnostics.policy_steps - 1, policy_period,
+                                       args.minimum_height))
+            if schedule is not None:
+                adapter.velocity_command[:] = command_at(schedule, data.time)
             try:
                 _, action, targets = adapter.apply(data, args.max_raw_action)
             except RuntimeError as error:
@@ -494,6 +553,12 @@ def simulate(model, data, adapter, args, viewer_handle):
             if sleep_seconds > 0.0:
                 time.sleep(sleep_seconds)
     wall_seconds = time.perf_counter() - wall_start
+    if trace is not None:
+        args.trace.parent.mkdir(parents=True, exist_ok=True)
+        with open(args.trace, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(trace_header(adapter))
+            writer.writerows(trace)
     return diagnostics.result(
         data,
         status,
@@ -514,6 +579,10 @@ def parse_args():
                         help="Forward velocity command in m/s (trained envelope -0.2..0.5)")
     parser.add_argument("--vy", type=float, default=0.0, help="Lateral velocity command in m/s")
     parser.add_argument("--wz", type=float, default=0.0, help="Yaw rate command in rad/s")
+    parser.add_argument("--scenario", type=str,
+                        help="Command schedule T:VX,VY,WZ;... in seconds, e.g. 0:0,0,0;10:0.1,0,0;20:0.2,0,0 "
+                        "(replaces --vx/--vy/--wz)")
+    parser.add_argument("--trace", type=Path, help="Optional per-policy-step CSV trace (scenario_metrics.py input)")
     args = parser.parse_args()
     if args.headless and args.duration is None:
         parser.error("--headless requires --duration")
@@ -579,6 +648,13 @@ def parse_args():
         parser.error(f"MuJoCo model not found: {args.model}")
     if args.output is not None:
         args.output = args.output.resolve()
+    if args.trace is not None:
+        args.trace = args.trace.resolve()
+    if args.scenario:
+        try:
+            parse_scenario(args.scenario)
+        except ValueError as error:
+            parser.error(f"--scenario: {error}")
     return args
 
 
