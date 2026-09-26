@@ -35,6 +35,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import robonex_common
 from robonex_common.paths import DESCRIPTION_REPO_NAMES, description_model, git_commit, resolve_repo
+from sim_to_real.safety import AxisLimiter
+
+SLEW_MAX_SPEED = 6.0
+SLEW_MAX_ACCEL = 120.0
 
 file_hash = sha256_file
 
@@ -469,7 +473,7 @@ def trace_header(adapter):
     return header
 
 
-def trace_row(model, data, adapter, step, policy_period, minimum_height):
+def trace_row(model, data, adapter, commanded, step, policy_period, minimum_height):
     mujoco.mj_objectVelocity(
         model, data, mujoco.mjtObj.mjOBJ_XBODY, adapter.base_body_id, adapter.object_velocity, 1
     )
@@ -487,7 +491,7 @@ def trace_row(model, data, adapter, step, policy_period, minimum_height):
         row += [round(float(data.qpos[adapter.qpos_addresses[index]]), 6),
                 round(float(data.qvel[adapter.dof_addresses[index]]), 6),
                 round(float(data.actuator_force[adapter.actuator_ids[index]]), 5),
-                round(float(data.ctrl[adapter.actuator_ids[index]]), 6)]
+                round(float(commanded[index]), 6)]
     return row
 
 
@@ -497,6 +501,30 @@ def simulate(model, data, adapter, args, viewer_handle):
     policy_period = 1.0 / args.policy_hz
     schedule = parse_scenario(args.scenario) if getattr(args, "scenario", None) else None
     trace = [] if getattr(args, "trace", None) else None
+    hip_yaw_kp = getattr(args, "hip_yaw_kp", None)
+    if hip_yaw_kp is not None:
+        for name, actuator_id in zip(adapter.joint_names, adapter.actuator_ids):
+            if "hip_yaw" in name:
+                if not np.isclose(model.actuator_biasprm[actuator_id, 1], -model.actuator_gainprm[actuator_id, 0]):
+                    raise RuntimeError(f"{name} is not a position actuator; cannot set kp")
+                model.actuator_gainprm[actuator_id, 0] = hip_yaw_kp
+                model.actuator_biasprm[actuator_id, 1] = -hip_yaw_kp
+    backlash = getattr(args, "hip_yaw_backlash", None)
+    backlash_joints = []
+    if backlash is not None:
+        for index, (name, actuator_id) in enumerate(zip(adapter.joint_names, adapter.actuator_ids)):
+            if "hip_yaw" in name:
+                kp = float(model.actuator_gainprm[actuator_id, 0])
+                kd = float(-model.actuator_biasprm[actuator_id, 2])
+                model.actuator_gainprm[actuator_id, 0] = 1.0
+                model.actuator_biasprm[actuator_id, :3] = 0.0
+                model.actuator_ctrllimited[actuator_id] = 0
+                backlash_joints.append((index, actuator_id, kp, kd))
+    backlash_targets = {}
+    commanded = np.array(adapter.default_positions, dtype=np.float64)
+    limiters = None
+    if getattr(args, "slew_limit", False):
+        limiters = [AxisLimiter(float(p)) for p in adapter.default_positions]
     next_policy_time = 0.0
     next_viewer_sync = 0.0
     wall_start = time.perf_counter()
@@ -512,18 +540,35 @@ def simulate(model, data, adapter, args, viewer_handle):
         if data.time + 1.0e-12 >= next_policy_time:
             mujoco.mj_forward(model, data)
             if trace is not None and diagnostics.policy_steps:
-                trace.append(trace_row(model, data, adapter, diagnostics.policy_steps - 1, policy_period,
+                trace.append(trace_row(model, data, adapter, commanded, diagnostics.policy_steps - 1, policy_period,
                                        args.minimum_height))
             if schedule is not None:
                 adapter.velocity_command[:] = command_at(schedule, data.time)
             try:
                 _, action, targets = adapter.apply(data, args.max_raw_action)
+                if limiters is not None:
+                    for index, limiter in enumerate(limiters):
+                        position, _ = limiter.step(float(targets[index]), policy_period, SLEW_MAX_SPEED, SLEW_MAX_ACCEL)
+                        targets[index] = position
+                    data.ctrl[adapter.actuator_ids] = targets
+                commanded[:] = targets
+                for index, _, _, _ in backlash_joints:
+                    backlash_targets[index] = float(targets[index])
             except RuntimeError as error:
                 status = "policy_error"
                 reason = str(error)
                 break
             diagnostics.record_policy(action, targets)
             next_policy_time += policy_period
+        for index, actuator_id, kp, kd in backlash_joints:
+            target = backlash_targets.get(index, float(adapter.default_positions[index]))
+            error = target - float(data.qpos[adapter.qpos_addresses[index]])
+            free = 0.5 * backlash
+            if abs(error) > free:
+                torque = kp * (error - math.copysign(free, error)) - kd * float(data.qvel[adapter.dof_addresses[index]])
+            else:
+                torque = 0.0
+            data.ctrl[actuator_id] = torque
         mujoco.mj_step(model, data)
         if not state_is_finite(data):
             status = "nonfinite"
@@ -583,6 +628,11 @@ def parse_args():
                         help="Command schedule T:VX,VY,WZ;... in seconds, e.g. 0:0,0,0;10:0.1,0,0;20:0.2,0,0 "
                         "(replaces --vx/--vy/--wz)")
     parser.add_argument("--trace", type=Path, help="Optional per-policy-step CSV trace (scenario_metrics.py input)")
+    parser.add_argument("--slew-limit", action="store_true",
+                        help="Pass targets through the deploy slew limiter (policy_to_real defaults)")
+    parser.add_argument("--hip-yaw-kp", type=float, help="Override the hip-yaw position gain (diagnostic)")
+    parser.add_argument("--hip-yaw-backlash", type=float,
+                        help="Total free play in rad inside the hip-yaw PD, no torque within it (diagnostic)")
     args = parser.parse_args()
     if args.headless and args.duration is None:
         parser.error("--headless requires --duration")

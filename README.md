@@ -57,6 +57,9 @@ robonex-deploy/
 | - | `--vx` / `--vy` / `--wz` | `0.3` / `0.0` / `0.0` | Constant velocity command (m/s, m/s, rad/s) |
 | - | `--scenario` | - | Command schedule `T:VX,VY,WZ;...` in seconds; replaces `--vx/--vy/--wz` |
 | - | `--trace` | - | Per-policy-step CSV trace for `scenario_metrics.py` |
+| - | `--slew-limit` | Off | Pass targets through the deploy slew limiter (6 rad/s, 120 rad/s²) |
+| - | `--hip-yaw-kp` | Model value | Hip-yaw position gain override (diagnostic) |
+| - | `--hip-yaw-backlash` | - | Hip-yaw free play in rad, no torque inside it (diagnostic) |
 
 ```bash
 # Example
