@@ -44,7 +44,7 @@ from safety import (
     wrap_to_pi,
 )
 
-DEFAULT_MODEL_PATH = description_model("mujoco/robot/scene_fixed.xml", anchors=(__file__,))
+DEFAULT_MODEL_PATH = description_model("ver2/mujoco/robot/edu/scene_fixed.xml", anchors=(__file__,))
 
 ZERO_SETTLE_TIMEOUT = 5.0
 
