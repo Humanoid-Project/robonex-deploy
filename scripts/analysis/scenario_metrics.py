@@ -13,8 +13,10 @@ JOINTS = (
 )
 PEAK_TORQUE = {"hip_yaw": 17.0, "ankle_upper": 17.0, "ankle_lower": 17.0,
                "hip_pitch": 60.0, "hip_roll": 60.0, "knee_pitch": 60.0}
-RATED_TORQUE = {"hip_yaw": 6.0, "ankle_upper": 6.0, "ankle_lower": 6.0,
-                "hip_pitch": 20.0, "hip_roll": 20.0, "knee_pitch": 20.0}
+STANDSTILL_TORQUE = {"hip_yaw": 6.0, "ankle_upper": 6.0, "ankle_lower": 6.0,
+                     "hip_pitch": 13.0, "hip_roll": 13.0, "knee_pitch": 13.0}
+SPINNING_TORQUE = {"hip_yaw": 6.0, "ankle_upper": 6.0, "ankle_lower": 6.0,
+                   "hip_pitch": 20.0, "hip_roll": 20.0, "knee_pitch": 20.0}
 
 
 def load(path):
@@ -77,7 +79,10 @@ def band_rms(x, dt, low, high):
         return None
     spectrum = np.abs(np.fft.rfft(x)) ** 2
     freq = np.fft.rfftfreq(len(x), dt)
-    weight = np.where((freq == 0) | (freq == freq[-1]), 1.0, 2.0)
+    weight = np.full(freq.shape, 2.0)
+    weight[0] = 1.0
+    if len(x) % 2 == 0:
+        weight[-1] = 1.0
     mask = (freq >= low) & (freq < high)
     return float(np.sqrt(np.sum(spectrum[mask] * weight[mask]) / len(x) ** 2))
 
@@ -90,8 +95,8 @@ def segment_metrics(columns, kind, index):
     t = columns["t_s"][index]
     dt = float(np.median(np.diff(t)))
     gx, gy, gz = (columns[f"gravity_{a}"][index] for a in "xyz")
-    roll = np.degrees(np.arctan2(gy, -gz))
-    pitch = np.degrees(np.arctan2(-gx, np.sqrt(gy ** 2 + gz ** 2)))
+    roll = np.degrees(np.arctan2(-gy, -gz))
+    pitch = np.degrees(np.arctan2(gx, np.sqrt(gy ** 2 + gz ** 2)))
     gyro = {a: columns[f"gyro_{a}"][index] for a in "xyz"}
     out = {
         "duration_s": float(t[-1] - t[0] + dt),
@@ -116,8 +121,8 @@ def segment_metrics(columns, kind, index):
         target = columns.get(f"{joint}.{target_key}")
         if pos is not None and target is not None:
             if kind == "hardware":
-                later = np.minimum(index + 1, len(pos) - 1)
-                error = target[index] - pos[later]
+                paired = index[index + 1 < len(pos)]
+                error = target[paired] - pos[paired + 1]
             else:
                 error = target[index] - pos[index]
             tracking[joint] = float(np.degrees(rms(error)))
@@ -126,7 +131,8 @@ def segment_metrics(columns, kind, index):
             kind_name = joint[2:]
             values = np.abs(tau[index])
             torque[joint] = {"rms_nm": rms(tau[index]), "max_nm": float(np.max(values)),
-                             "above_rated_frac": float(np.mean(values > RATED_TORQUE[kind_name])),
+                             "above_standstill_rating_frac": float(np.mean(values > STANDSTILL_TORQUE[kind_name])),
+                             "above_spinning_rating_frac": float(np.mean(values > SPINNING_TORQUE[kind_name])),
                              "near_peak_frac": float(np.mean(values >= 0.95 * PEAK_TORQUE[kind_name]))}
     out["tracking_rms_deg"] = tracking
     out["torque"] = torque
@@ -140,7 +146,11 @@ def segment_metrics(columns, kind, index):
 def analyse(path, settle_s, min_ramp):
     columns = load(path)
     kind = source_kind(columns)
-    result = {"file": str(path), "source": kind, "segments": []}
+    result = {"file": str(path), "source": kind,
+              "conventions": {"pitch_deg": "positive = nose down (x toward -z), from projected gravity",
+                              "roll_deg": "positive rotation about +x (left side up)",
+                              "torque": "type-0x02 feedback estimate" if kind == "hardware" else "simulator actuator torque"},
+              "segments": []}
     for cmd, index in segments(columns, settle_s, min_ramp):
         entry = {"command": {"vx": cmd[0], "vy": cmd[1], "wz": cmd[2]}}
         entry.update(segment_metrics(columns, kind, index))
