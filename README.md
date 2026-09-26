@@ -162,6 +162,34 @@ python3 scripts/sim_to_real/real_to_mujoco.py --motor-id 4
 
 ## policy-test
 
+### `policy_to_real.py`
+
+| Command | Option | Default | Description |
+| --- | --- | --- | --- |
+| - | `--policy` | `Required` | ONNX policy path (manifest next to it) |
+| - | `--read` | Off | Read-only preview; no motor is commanded |
+| - | `--duration` | Until Ctrl-C | Stop after this many seconds |
+| - | `--vx` / `--vy` / `--wz` | `0.0` | Constant velocity command inside the trained envelope |
+| - | `--scenario` | - | Command schedule `T:VX,VY,WZ;...` from the start of policy control; starts with a 0,0,0 stand, needs `--duration`, any key cancels it |
+| - | `--keyboard` | Off | Steer the command with w/s, q/e, a/d, SPACE |
+| - | `--telemetry` | Off | Per-step CSV; no path = timestamped file under `results/policy_to_real` |
+| - | `--log` | Off | Save terminal output; no path = timestamped file |
+| - | `--gain-scale` | `1.0` | Fraction of the trained per-joint gains |
+| - | `--max-tilt-deg` | `40` | Trunk tilt stop |
+| - | `--approach-tolerance-deg` | `1.0` | Default-pose tolerance before policy control |
+
+```bash
+# Example
+python3 scripts/policy_test/policy_to_real.py \
+  --policy policies/<run>/policy.onnx \
+  --duration 32 \
+  --scenario "0:0,0,0;10:0.1,0,0;20:0.2,0,0" \
+  --telemetry \
+  --log
+```
+
+<br>
+
 ```bash
 # Example
 cd ~/humanoid_project/robonex-deploy/scripts/policy_test
