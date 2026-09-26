@@ -509,6 +509,19 @@ def simulate(model, data, adapter, args, viewer_handle):
                     raise RuntimeError(f"{name} is not a position actuator; cannot set kp")
                 model.actuator_gainprm[actuator_id, 0] = hip_yaw_kp
                 model.actuator_biasprm[actuator_id, 1] = -hip_yaw_kp
+    if getattr(args, "match_isaac", False):
+        for geom_id in range(model.ngeom):
+            if geom_id == adapter.floor_geom_id:
+                model.geom_contype[geom_id] = 1
+                model.geom_conaffinity[geom_id] = 2
+            elif model.geom_contype[geom_id] or model.geom_conaffinity[geom_id]:
+                model.geom_contype[geom_id] = 2
+                model.geom_conaffinity[geom_id] = 1
+        actuated_dofs = set(int(d) for d in adapter.dof_addresses)
+        root_dofs = set(range(int(model.jnt_dofadr[adapter.root_joint_id]), int(model.jnt_dofadr[adapter.root_joint_id]) + 6))
+        for dof in range(model.nv):
+            if dof not in actuated_dofs and dof not in root_dofs:
+                model.dof_damping[dof] = 0.0
     backlash = getattr(args, "hip_yaw_backlash", None)
     backlash_joints = []
     if backlash is not None:
@@ -630,6 +643,8 @@ def parse_args():
     parser.add_argument("--trace", type=Path, help="Optional per-policy-step CSV trace (scenario_metrics.py input)")
     parser.add_argument("--slew-limit", action="store_true",
                         help="Pass targets through the deploy slew limiter (policy_to_real defaults)")
+    parser.add_argument("--match-isaac", action="store_true",
+                        help="Robot-robot collisions off and passive-joint damping 0, as in the Isaac training model")
     parser.add_argument("--hip-yaw-kp", type=float, help="Override the hip-yaw position gain (diagnostic)")
     parser.add_argument("--hip-yaw-backlash", type=float,
                         help="Total free play in rad inside the hip-yaw PD, no torque within it (diagnostic)")
