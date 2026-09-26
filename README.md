@@ -27,6 +27,9 @@ robonex-deploy/
 │   ├── robonex_can.py
 │   ├── analysis/
 │   │   └── scenario_metrics.py
+│   ├── sysid/
+│   │   ├── joint_probe.py
+│   │   └── analyze_probe.py
 │   ├── sim_to_sim/
 │   │   └── isaac_to_mujoco.py
 │   ├── sim_to_real/
@@ -109,6 +112,49 @@ Per-command-segment metrics for hardware telemetry and Isaac/MuJoCo traces: spee
 python3 scripts/analysis/scenario_metrics.py \
   results/policy_to_real/<stamp>_live_telemetry.csv \
   --output /tmp/metrics.json
+```
+
+<br>
+
+## sysid
+
+### `joint_probe.py`
+
+Drives ONE motor of a hung robot around its current position and logs feedback at the command rate; refuses a PD torque demand (kp × amplitude) above the motor's continuous rating.
+
+| Command | Option | Default | Description |
+| --- | --- | --- | --- |
+| - | `--motor-id` | `Required` | The single motor to move |
+| - | `--profile` | `Required` | `step` (latency), `triangle` (hysteresis), `chirp` (frequency response) |
+| - | `--amplitude` | `0.05` | rad, at most 0.15 |
+| - | `--duration` | `20.0` | s, at most 120 |
+| - | `--hold` | `1.0` | step: seconds per level |
+| - | `--period` | `10.0` | triangle: seconds per cycle |
+| - | `--f0` / `--f1` | `0.2` / `5.0` | chirp: start / end frequency (Hz) |
+| - | `--rate` | `200.0` | Command and feedback rate (Hz), 50–250 |
+| - | `--gain-scale` | `1.0` | Fraction of the walking gains |
+| - | `--output` | `results/sysid/<stamp>_id<ID>_<profile>.csv` | CSV path (never overwritten) |
+
+```bash
+# Example
+python3 scripts/sysid/joint_probe.py --motor-id 1 --profile step --amplitude 0.05
+python3 scripts/sysid/joint_probe.py --motor-id 1 --profile triangle --amplitude 0.05 --period 10 --duration 30
+python3 scripts/sysid/joint_probe.py --motor-id 1 --profile chirp --amplitude 0.03 --f0 0.2 --f1 5 --duration 40
+```
+
+<br>
+
+### `analyze_probe.py`
+
+| Command | Option | Default | Description |
+| --- | --- | --- | --- |
+| - | `csv` | `Required` | One or more `joint_probe.py` recordings |
+| - | `--threshold-deg` | `0.2` | Step: motion-onset threshold |
+| - | `--output` | - | JSON output path |
+
+```bash
+# Example
+python3 scripts/sysid/analyze_probe.py results/sysid/*_id1_*.csv --output /tmp/probe.json
 ```
 
 <br>
