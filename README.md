@@ -25,6 +25,8 @@ robonex-deploy/
 ├── policies/
 ├── scripts/
 │   ├── robonex_can.py
+│   ├── analysis/
+│   │   └── scenario_metrics.py
 │   ├── sim_to_sim/
 │   │   └── isaac_to_mujoco.py
 │   ├── sim_to_real/
@@ -71,6 +73,28 @@ python3 scripts/sim_to_sim/isaac_to_mujoco.py \
 
 The required schema-2 manifest verifies the policy file, MuJoCo XML/mesh bundle, action
 contract, and `robonex-common` runtime source before simulation starts.
+
+<br>
+
+## analysis
+
+### `scenario_metrics.py`
+
+Per-command-segment metrics for hardware telemetry and Isaac/MuJoCo traces: speed (sim only), heading drift, yaw-rate oscillation (gait band and above 3 Hz), roll/pitch, joint tracking, torque.
+
+| Command | Option | Default | Description |
+| --- | --- | --- | --- |
+| - | `csv` | `Required` | One or more `*_live_telemetry.csv` or sim trace CSVs |
+| - | `--settle` | `2.0` | Seconds skipped after every command change |
+| - | `--min-ramp` | `0.999` | Hardware rows with a lower policy ramp are skipped |
+| - | `--output` | - | JSON output path |
+
+```bash
+# Example
+python3 scripts/analysis/scenario_metrics.py \
+  results/policy_to_real/<stamp>_live_telemetry.csv \
+  --output /tmp/metrics.json
+```
 
 <br>
 
