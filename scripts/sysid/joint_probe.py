@@ -19,7 +19,7 @@ sys.path.insert(0, str(SCRIPTS_DIR / "sim_to_real"))
 
 from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
 from robonex_common.joints import JOINT_BY_ID
-from robonex_can import DEFAULT_INTERFACE, HOST_ID, JOINT_MAP
+from robonex_can import DEFAULT_INTERFACE, HOST_ID, JOINT_MAP, MOTOR_MODELS, SPECS, Motor
 from safety import (
     brake_and_stop,
     enable_with_runtime_feedback,
@@ -31,6 +31,7 @@ from safety import (
 )
 
 MAX_AMPLITUDE_RAD = 0.15
+CONTINUOUS_TORQUE = {"rs02": 6.0, "rs03": 13.0}
 MAX_TARGET_SPEED = 3.0
 MAX_DURATION_S = 120.0
 LIMIT_MARGIN_RAD = math.radians(3.0)
@@ -71,7 +72,7 @@ def parse_args(argv=None):
     parser.add_argument("--period", type=float, default=10.0, help="triangle: seconds per cycle")
     parser.add_argument("--f0", type=float, default=0.2, help="chirp: start frequency (Hz)")
     parser.add_argument("--f1", type=float, default=5.0, help="chirp: end frequency (Hz)")
-    parser.add_argument("--rate", type=float, default=200.0, help="command/feedback rate (Hz)")
+    parser.add_argument("--rate", type=float, default=200.0, help="command/feedback rate (Hz), 50..250")
     parser.add_argument("--gain-scale", type=float, default=1.0,
                         help="fraction of the per-joint walking gains (kp, kd)")
     parser.add_argument("--output", type=Path, help="CSV path; default results/sysid/<stamp>_<id>_<profile>.csv")
@@ -90,8 +91,10 @@ def parse_args(argv=None):
         parser.error("--gain-scale must be at most 1.0")
     if args.f1 <= args.f0:
         parser.error("--f1 must be above --f0")
-    if not 50.0 <= args.rate <= 500.0:
-        parser.error("--rate must be 50..500 Hz")
+    if not 50.0 <= args.rate <= 250.0:
+        parser.error("--rate must be 50..250 Hz (the measured per-motor CAN ceiling is ~250 Hz)")
+    if args.profile == "step" and args.hold < 0.2:
+        parser.error("--hold must be at least 0.2 s so each step settles before the next")
     if peak_target_speed(args) > MAX_TARGET_SPEED:
         parser.error(
             f"the profile's peak target speed {peak_target_speed(args):.2f} rad/s exceeds {MAX_TARGET_SPEED} rad/s; "
@@ -115,12 +118,20 @@ def parse_args(argv=None):
 def run(args):
     mid = args.motor_id
     spec = JOINT_BY_ID[mid]
-    kp, kd = CONTROL_GAINS_BY_JOINT[spec.model_name]
-    kp, kd = kp * args.gain_scale, kd * args.gain_scale
+    kp_full, kd_full = CONTROL_GAINS_BY_JOINT[spec.model_name]
+    kp, kd = kp_full * args.gain_scale, kd_full * args.gain_scale
+    step_torque = kp * args.amplitude
+    limit = CONTINUOUS_TORQUE[spec.motor_model]
+    if step_torque > limit:
+        raise SystemExit(
+            f"kp {kp:g} x amplitude {args.amplitude:g} rad can demand {step_torque:.1f} N·m, above the "
+            f"{spec.motor_model.upper()} continuous {limit:g} N·m; lower --amplitude or --gain-scale"
+        )
     limits = safe_limits([mid], LIMIT_MARGIN_RAD)
     print(f"\nSystem-identification probe: ONE motor, ID {mid} ({JOINT_MAP[mid]}, {spec.model_name}).")
     print(f"  profile {args.profile}, amplitude {args.amplitude:.3f} rad ({math.degrees(args.amplitude):.1f} deg) "
           f"around the position at enable, {args.duration:.1f} s, {args.rate:.0f} Hz, kp {kp:g} kd {kd:g}")
+    print(f"  worst-case PD torque demand {step_torque:.1f} N·m (continuous rating {limit:g} N·m)")
     print("  The robot must hang so that this joint moves freely; all other motors stay disabled.")
     print("  Ctrl-C brakes and stops. Keep the emergency stop within reach.")
     input("Press Enter to enable the motor and start, or Ctrl-C to cancel: ")
@@ -130,6 +141,10 @@ def run(args):
     status = "completed"
     try:
         buses, motors, hubs = open_hardware([mid], DEFAULT_INTERFACE, HOST_ID)
+        bus = next(iter(buses.values()))
+        for other in sorted(JOINT_BY_ID):
+            if other != mid and JOINT_BY_ID[other].channel == spec.channel:
+                Motor(bus, other, SPECS[MOTOR_MODELS[other]], host_id=HOST_ID).stop()
         starts, enabled = enable_with_runtime_feedback(motors, hubs, {mid: kp}, {mid: kd}, limits, enabled_out=enabled)
         center = starts[mid]
         lower, upper = limits[mid]
@@ -174,10 +189,12 @@ def run(args):
         status = str(error)
         print(f"\nStopped: {error}")
     finally:
-        report = brake_and_stop(motors, buses, enabled, list(motors), 0.3, {mid: kd} if motors else 0.0)
+        report = brake_and_stop(motors, buses, enabled, list(motors), 0.3, {mid: kd_full} if motors else 0.0)
         if motors:
             for line in shutdown_report_lines(report):
                 print(line)
+            if report["stop_errors"]:
+                status = "stop frame failed: " + "; ".join(f"ID {k}: {v}" for k, v in report["stop_errors"].items())
         if rows:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             with args.output.open("x", newline="") as handle:

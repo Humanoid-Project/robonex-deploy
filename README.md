@@ -120,7 +120,7 @@ python3 scripts/analysis/scenario_metrics.py \
 
 ### `joint_probe.py`
 
-Drives ONE motor of a hung robot around its current position and logs feedback at the command rate.
+Drives ONE motor of a hung robot around its current position and logs feedback at the command rate; refuses a PD torque demand (kp × amplitude) above the motor's continuous rating.
 
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
@@ -131,7 +131,7 @@ Drives ONE motor of a hung robot around its current position and logs feedback a
 | - | `--hold` | `1.0` | step: seconds per level |
 | - | `--period` | `10.0` | triangle: seconds per cycle |
 | - | `--f0` / `--f1` | `0.2` / `5.0` | chirp: start / end frequency (Hz) |
-| - | `--rate` | `200.0` | Command and feedback rate (Hz), 50–500 |
+| - | `--rate` | `200.0` | Command and feedback rate (Hz), 50–250 |
 | - | `--gain-scale` | `1.0` | Fraction of the walking gains |
 | - | `--output` | `results/sysid/<stamp>_id<ID>_<profile>.csv` | CSV path (never overwritten) |
 

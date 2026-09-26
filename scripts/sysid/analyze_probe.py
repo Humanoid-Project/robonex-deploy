@@ -24,7 +24,7 @@ def load(path):
     return columns, meta
 
 
-def step_latency(c, threshold_rad):
+def step_latency(c, threshold_rad, window_s=1.0):
     target = c["target"]
     edges = np.flatnonzero(np.abs(np.diff(target)) > 1e-6) + 1
     results = []
@@ -35,8 +35,10 @@ def step_latency(c, threshold_rad):
             continue
         base = float(np.mean(before))
         direction = np.sign(target[edge] - target[edge - 1])
-        later = np.arange(edge, min(len(target), edge + 200))
-        moved = later[(direction * (c["pos"][later] - base) > threshold_rad) & (c["new_frame"][later] > 0)]
+        later = np.flatnonzero((c["t_s"] > c["t_s"][edge]) & (c["t_s"] <= c["t_s"][edge] + window_s))
+        ok = (direction * (c["pos"][later] - base) > threshold_rad) & (c["new_frame"][later] > 0) & (
+            c["rx_kernel_time"][later] > sent_wall)
+        moved = later[ok]
         if len(moved) == 0:
             continue
         first = moved[0]
@@ -70,32 +72,37 @@ def triangle_hysteresis(c):
         "median_target_minus_pos_rising_rad": lag_up,
         "median_target_minus_pos_falling_rad": lag_down,
         "position_hysteresis_width_rad": float(np.median(widths)) if widths else None,
-        "note": "width = pos(falling) - pos(rising) at the same target; free play plus friction-held error",
+        "note": "width = pos(falling) - pos(rising) at the same target, from the motor-side encoder: friction, kd and "
+                "delay (2 x speed x delay); gearbox play is invisible to this encoder",
     }
 
 
-def chirp_response(c, frequencies):
-    t, target, pos = c["t_s"], c["target"], c["pos"]
-    fresh = (c["new_frame"] > 0) & np.isfinite(pos)
-    t, target, pos = t[fresh], target[fresh], pos[fresh]
-    dt = float(np.median(np.diff(t)))
-    grid = np.arange(t[0], t[-1], dt)
-    x = np.interp(grid, t, target) - np.mean(target)
-    y = np.interp(grid, t, pos) - np.mean(pos)
+def chirp_response(c, meta, frequencies):
+    wall, target = c["wall_time"], c["target"]
+    fresh = (c["new_frame"] > 0) & np.isfinite(c["pos"]) & np.isfinite(c["rx_kernel_time"])
+    rx, pos = c["rx_kernel_time"][fresh], c["pos"][fresh]
+    t0 = wall[0]
+    f0, f1, duration = float(meta["f0"]), float(meta["f1"]), float(meta["duration"])
+    k = np.log(f1 / f0) / duration
+    dt = float(np.median(np.diff(wall)))
     out = []
-    window = int(round(4.0 / dt))
     for f in frequencies:
-        phase_ref = np.exp(-2j * np.pi * f * grid)
-        best = None
-        for start in range(0, max(1, len(grid) - window), max(1, window // 4)):
-            seg = slice(start, start + window)
-            xs = np.sum(x[seg] * phase_ref[seg])
-            ys = np.sum(y[seg] * phase_ref[seg])
-            if best is None or abs(xs) > abs(best[0]):
-                best = (xs, ys)
-        if best is None or abs(best[0]) < 1e-9:
+        if not f0 < f < f1:
             continue
-        h = best[1] / best[0]
+        center = np.log(f / f0) / k
+        half = 2.0 / f
+        if center - half < 0.0 or center + half > duration:
+            continue
+        grid = np.arange(center - half, center + half, dt / 4.0) + t0
+        x = np.interp(grid, wall, target)
+        y = np.interp(grid, rx, pos)
+        x -= x.mean()
+        y -= y.mean()
+        ref = np.exp(-2j * np.pi * f * (grid - t0)) * np.hanning(len(grid))
+        xs, ys = np.sum(x * ref), np.sum(y * ref)
+        if abs(xs) < 1e-12:
+            continue
+        h = ys / xs
         out.append({"hz": f, "gain": float(abs(h)), "phase_deg": float(np.degrees(np.angle(h))),
                     "delay_ms_equiv": float(-np.angle(h) / (2 * np.pi * f) * 1000.0)})
     return out
@@ -110,7 +117,9 @@ def main():
     results = []
     for path in args.csv:
         c, meta = load(path)
-        profile = meta.get("profile") or ("step" if len(np.unique(np.round(c["target"], 6))) <= 5 else "chirp")
+        profile = meta.get("profile")
+        if profile is None:
+            raise SystemExit(f"{path}: the *_meta.json written by joint_probe.py is missing")
         result = {"file": str(path), "profile": profile, "motor_id": meta.get("motor_id"),
                   "kp": meta.get("kp"), "kd": meta.get("kd")}
         if profile == "step":
@@ -123,7 +132,7 @@ def main():
         elif profile == "triangle":
             result["hysteresis"] = triangle_hysteresis(c)
         else:
-            result["response"] = chirp_response(c, [0.5, 1.0, 1.29, 2.0, 3.0, 5.0])
+            result["response"] = chirp_response(c, meta, [0.3, 0.5, 1.0, 1.29, 2.0, 3.0, 4.0, 5.0, 8.0])
         results.append(result)
         print(json.dumps(result if profile != "step" else {k: v for k, v in result.items() if k != "steps"}, indent=1))
     if args.output:
