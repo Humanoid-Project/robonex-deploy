@@ -137,7 +137,7 @@ def open_hardware(motor_ids, interface, host_id):
                 pass
         raise
     hubs = {
-        channel: FeedbackHub(
+        channel: TimestampedFeedbackHub(
             bus,
             [motor for mid, motor in motors.items() if channel_for_id(mid) == channel],
             host_id,
@@ -145,6 +145,18 @@ def open_hardware(motor_ids, interface, host_id):
         for channel, bus in buses.items()
     }
     return buses, motors, hubs
+
+class TimestampedFeedbackHub(FeedbackHub):
+    def pump(self, max_frames=512):
+        now = time.monotonic()
+        for _ in range(max_frames):
+            msg = self.bus.recv(timeout=0.0)
+            if msg is None:
+                return
+            motor = self.route(msg, now)
+            if motor is not None:
+                motor.last_rx_kernel_time = msg.timestamp
+
 
 def gain_for(gains, motor_id):
     """Accept either a scalar gain or a per-motor {id: value} mapping."""
