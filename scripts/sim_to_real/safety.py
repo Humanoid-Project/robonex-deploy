@@ -154,7 +154,7 @@ class TimestampedFeedbackHub(FeedbackHub):
             if msg is None:
                 return
             motor = self.route(msg, now)
-            if motor is not None:
+            if motor is not None and getattr(motor, "last_feedback_time", None) == now:
                 motor.last_rx_kernel_time = msg.timestamp
 
 

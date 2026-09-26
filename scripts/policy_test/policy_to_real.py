@@ -1283,11 +1283,14 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                 sys.stdout.flush()
 
             if keyboard is not None:
-                before = runner.velocity_command.copy()
+                consumed = keyboard.consumed
                 note = keyboard.poll(runner.velocity_command)
-                if scenario and (note or not np.array_equal(before, runner.velocity_command)):
+                if scenario and (note or keyboard.consumed != consumed):
                     scenario = None
-                    print("  [command] keyboard input: scenario cancelled, keyboard has control", flush=True)
+                    runner.velocity_command[:] = (0.0, 0.0, 0.0)
+                    note = "scenario cancelled by keyboard input; command zeroed (stand)"
+                    if keyboard.steer and not keyboard.lost:
+                        note += "; keys steer from now"
                 if note:
                     print(f"  [command] {note}   "
                           f"vx {runner.velocity_command[0]:+.2f} "
@@ -1333,7 +1336,11 @@ def run_deploy(policy_path, contract, args):
     stats = LoopStats()
     commander = None
     faults = FaultMonitor()
-    keyboard = KeyboardCommand(COMMAND_LIMITS) if args.keyboard else None
+    keyboard = None
+    if args.keyboard:
+        keyboard = KeyboardCommand(COMMAND_LIMITS)
+    elif args.scenario:
+        keyboard = KeyboardCommand(COMMAND_LIMITS, steer=False)
     thermal = ThermalLoad({
         motor_id: RATED_TORQUE[JOINT_BY_ID[motor_id].motor_model] for motor_id in motor_ids
     })
@@ -1366,6 +1373,8 @@ def run_deploy(policy_path, contract, args):
         confirm("Press Enter to enable the motors and start, or Ctrl-C to cancel: ")
         if keyboard is not None and keyboard.start():
             print(f"  {keyboard.legend()}")
+        if args.scenario and (keyboard is None or not keyboard.active):
+            raise RuntimeError("--scenario needs a working key reader to be cancellable; motors were not enabled")
 
         stop_ids = list(motor_ids)
         starts, enabled_ids = enable_with_runtime_feedback(
@@ -1429,8 +1438,10 @@ class KeyboardCommand:
         "a": (2, +0.05), "d": (2, -0.05),
     }
 
-    def __init__(self, limits):
+    def __init__(self, limits, steer=True):
         self.limits = limits
+        self.steer = steer
+        self.consumed = 0
         self.escape_state = 0
         self.fd = None
         self.saved = None
@@ -1465,6 +1476,9 @@ class KeyboardCommand:
                 self.lost = True
                 command[:] = (0.0, 0.0, 0.0)
                 return "stdin closed; command zeroed and keyboard disabled"
+            self.consumed += len(data)
+            if not self.steer:
+                continue
             for byte in data:
                 if self.escape_state == 2:
                     if 0x40 <= byte <= 0x7E:
@@ -1489,8 +1503,11 @@ class KeyboardCommand:
         return note
 
     def legend(self):
-        return ("keys: w/s forward  q/e strafe  a/d turn  SPACE zero  Ctrl-C stop"
-                if self.active else "keyboard: off")
+        if not self.active:
+            return "keyboard: off"
+        if not self.steer:
+            return "any key: cancel the scenario and stand   Ctrl-C stop"
+        return "keys: w/s forward  q/e strafe  a/d turn  SPACE zero  Ctrl-C stop"
 
 
 # The policy is only trained inside this envelope; a command outside it is out of
@@ -1628,6 +1645,8 @@ def parse_args(argv=None):
             parser.error(f"--scenario: {error}")
         if args.read:
             parser.error("--scenario applies to live control only")
+        if not sys.stdin.isatty():
+            parser.error("--scenario needs an interactive terminal so that a key press can cancel it")
         if args.duration is None or args.duration < args.scenario[-1][0]:
             parser.error("--scenario needs --duration covering its last segment")
         if any(args.scenario[0][1]) or (len(args.scenario) > 1 and args.scenario[1][0] < Settings.ramp_seconds):
