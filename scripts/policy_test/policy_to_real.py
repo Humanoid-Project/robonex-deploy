@@ -50,7 +50,6 @@ except ImportError as error:
 from robonex_can import (
     DEFAULT_INTERFACE,
     HOST_ID,
-    JOINT_LIMITS_RAD,
     MECH_POS_INDEX,
     MOTOR_MODELS,
     Motor,
@@ -60,6 +59,7 @@ from robonex_can import (
 import robonex_common
 from robonex_common.imu import DEFAULT_IMU_BAUDRATE, DEFAULT_IMU_PORT, MOUNT_ROLL_DEG
 from robonex_common.joints import CHANNEL_MOTOR_IDS, JOINT_BY_MODEL_NAME, JOINT_BY_ID
+from robonex_common.models import robot_model
 from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
 from robonex_common.motors import MOTOR_CONTROL_KD, MOTOR_CONTROL_KP, RATED_TORQUE
 from robonex_common.policy import PolicyContract, python_source_sha256
@@ -172,6 +172,17 @@ ENABLE_KP, ENABLE_KD = resolve_gains(SETTINGS.gain_scale)
 
 def joint_row_order(contract):
     return [(name, JOINT_BY_MODEL_NAME[name].motor_id) for name in contract.joint_order]
+
+
+def roll_reprojector(pipeline, motor_ids):
+    if not pipeline.roll_pairs:
+        return None
+
+    def reproject(commands):
+        clipped, _ = pipeline.clip_roll([commands[motor_id] for motor_id in motor_ids])
+        return {motor_id: float(clipped[index]) for index, motor_id in enumerate(motor_ids)}
+
+    return reproject
 
 
 class MechPosReader(threading.Thread):
@@ -503,6 +514,7 @@ class TargetCommander:
         self.slew_lag_step_max = 0.0
         self.slew_lag_run_max = 0.0
         self.slew_lag_max_by_motor = {motor_id: 0.0 for motor_id in motors}
+        self.roll_reprojected_count = 0
 
     def reset_stats(self):
         self.slew_limited_count = 0
@@ -512,11 +524,14 @@ class TargetCommander:
         self.slew_lag_step_max = 0.0
         self.slew_lag_run_max = 0.0
         self.slew_lag_max_by_motor = {motor_id: 0.0 for motor_id in self.motors}
+        self.roll_reprojected_count = 0
 
-    def send(self, motor_ids_targets, dt, max_speed, max_accel, use_velocity_target):
+    def send(self, motor_ids_targets, dt, max_speed, max_accel, use_velocity_target, reproject=None):
         step_lag_max = 0.0
+        previous = {}
         for motor_id, target in motor_ids_targets.items():
             limiter = self.limiters[motor_id]
+            previous[motor_id] = limiter.position
             aligned = align_angle(limiter.position, target)
             position, velocity = limiter.step(aligned, dt, max_speed, max_accel)
             lag = abs(position - aligned)
@@ -534,6 +549,19 @@ class TargetCommander:
         self.slew_lag_step_max = step_lag_max
         if step_lag_max > self.slew_lag_run_max:
             self.slew_lag_run_max = step_lag_max
+        if reproject is not None:
+            projected = reproject(self.commands)
+            moved = False
+            for motor_id, position in projected.items():
+                if motor_id not in previous:
+                    continue
+                moved |= position != self.commands[motor_id]
+                limiter = self.limiters[motor_id]
+                limiter.position = position
+                limiter.velocity = (position - previous[motor_id]) / dt
+                self.commands[motor_id] = position
+                self.velocities[motor_id] = limiter.velocity
+            self.roll_reprojected_count += int(moved)
         for motor_id, motor in self.motors.items():
             motor.control(
                 pos=self.commands[motor_id],
@@ -1150,6 +1178,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
     deadline = None if args.duration is None else next_tick + args.duration
     scenario = getattr(args, "scenario", None)
     commander.reset_stats()
+    reproject = roll_reprojector(runner.pipeline, runner.motor_ids)
     telemetry = (
         TelemetryRecorder(args.telemetry, contract, motors)
         if getattr(args, "telemetry", None)
@@ -1220,6 +1249,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                 SETTINGS.policy_max_speed,
                 SETTINGS.policy_max_accel,
                 use_velocity_target=False,
+                reproject=reproject,
             )
             send_ms = (time.monotonic() - send_started) * 1000.0
             commanded_targets = [
@@ -1322,7 +1352,8 @@ def run_deploy(policy_path, contract, args):
     imu = ImuSource(SETTINGS, notes)
 
     motor_ids = [JOINT_BY_MODEL_NAME[name].motor_id for name in contract.joint_order]
-    hard_limits = {motor_id: JOINT_LIMITS_RAD[motor_id] for motor_id in motor_ids}
+    model_limits = robot_model(contract.robot_model).joint_limits_by_id()
+    hard_limits = {motor_id: model_limits[motor_id] for motor_id in motor_ids}
     home_targets = {
         JOINT_BY_MODEL_NAME[name].motor_id: float(contract.action_offsets[index])
         for index, name in enumerate(contract.joint_order)

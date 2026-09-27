@@ -15,6 +15,7 @@ import can
 import mujoco
 import numpy as np
 from robonex_common.can import drain
+from robonex_common.models import ROBOT_MODELS
 
 from robonex_can import (
     FeedbackHub,
@@ -74,10 +75,11 @@ class AxisLimiter:
         self.velocity = next_velocity
         return self.position, self.velocity
 
-def safe_limits(motor_ids, margin_rad):
+def safe_limits(motor_ids, margin_rad, limits=None):
+    limits = JOINT_LIMITS_RAD if limits is None else limits
     result = {}
     for mid in motor_ids:
-        lower, upper = JOINT_LIMITS_RAD[mid]
+        lower, upper = limits[mid]
         inner = (lower + margin_rad, upper - margin_rad)
         if inner[0] >= inner[1]:
             raise ValueError(f"ID {mid}: limit margin is larger than the joint range")
@@ -85,14 +87,19 @@ def safe_limits(motor_ids, margin_rad):
     return result
 
 def verify_model_limits(model, actuator_ids, motor_ids):
-    for mid in motor_ids:
-        got = tuple(float(v) for v in model.actuator_ctrlrange[actuator_ids[mid]])
-        want = JOINT_LIMITS_RAD[mid]
-        if not np.allclose(got, want, atol=5e-6, rtol=0.0):
-            raise RuntimeError(
-                f"ID {mid} limit mismatch: MuJoCo={got}, common={want}. "
-                "Use matching source and generated models."
-            )
+    got = {mid: tuple(float(v) for v in model.actuator_ctrlrange[actuator_ids[mid]]) for mid in motor_ids}
+    matches = []
+    for profile in ROBOT_MODELS.values():
+        want = profile.joint_limits_by_id()
+        if all(np.allclose(got[mid], want[mid], atol=5e-6, rtol=0.0) for mid in motor_ids):
+            matches.append(profile)
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"MuJoCo actuator limits {got} match {len(matches)} robonex-common robot models "
+            f"({', '.join(sorted(ROBOT_MODELS))}); exactly one must match. "
+            "Use matching source and generated models."
+        )
+    return matches[0]
 
 def load_fixed_model(path, motor_ids):
     path = path.expanduser().resolve()
