@@ -79,8 +79,10 @@ from safety import (
     enable_with_runtime_feedback,
     inspect_zero_positions,
     open_hardware,
+    roll_pairs_for,
     runtime_safety_reason,
     shutdown_report_lines,
+    start_roll_blocks,
     tilt_reason,
     wrap_to_pi,
 )
@@ -1381,7 +1383,11 @@ def run_deploy(policy_path, contract, args):
     })
     try:
         buses, motors, hubs = open_hardware(motor_ids, SETTINGS.interface, SETTINGS.host_id)
-        _, blocking = inspect_zero_positions(motors, SETTINGS.approach_tolerance_deg * DEG, hard_limits)
+        measured, blocking = inspect_zero_positions(motors, SETTINGS.approach_tolerance_deg * DEG, hard_limits)
+        profile = robot_model(contract.robot_model)
+        roll_pairs = roll_pairs_for(profile, motor_ids)
+        if roll_pairs:
+            blocking += start_roll_blocks(measured, roll_pairs, profile.foot_roll, math.radians(1.0))
         if blocking:
             raise RuntimeError(
                 "Preflight safety check failed; motors will not be enabled:\n  " + "\n  ".join(blocking)

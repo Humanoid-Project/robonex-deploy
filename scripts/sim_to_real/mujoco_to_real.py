@@ -309,7 +309,7 @@ def run(args):
                 previous = {mid: limiters[mid].position for mid in motor_ids}
                 for mid in motor_ids:
                     position, velocity = limiters[mid].step(
-                        align_angle(limiters[mid].position, targets[mid]),
+                        targets[mid],
                         dt, args.max_speed, args.max_accel,
                     )
                     commands[mid] = position

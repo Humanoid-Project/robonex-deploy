@@ -15,7 +15,7 @@ import can
 import mujoco
 import numpy as np
 from robonex_common.can import drain
-from robonex_common.foot_roll import clip_foot_roll
+from robonex_common.foot_roll import clip_foot_roll, foot_roll
 from robonex_common.joints import JOINT_BY_MODEL_NAME
 from robonex_common.models import ROBOT_MODELS
 
@@ -116,6 +116,24 @@ def roll_pairs_for(profile, motor_ids):
         if all(selected):
             pairs.append((upper_id, lower_id, float(sign)))
     return pairs
+
+
+def start_roll_blocks(measured, pairs, roll, tolerance_rad):
+    blocks = []
+    for upper_id, lower_id, sign in pairs:
+        upper, lower = measured.get(upper_id), measured.get(lower_id)
+        if upper is None or lower is None or not (math.isfinite(upper) and math.isfinite(lower)):
+            continue
+        value = foot_roll(sign * wrap_to_pi(upper), sign * wrap_to_pi(lower), roll.coeffs)
+        status = "BLOCK" if abs(value) > roll.limit + tolerance_rad else "ok"
+        print(f"  foot roll from IDs {upper_id}/{lower_id}: {math.degrees(value):+6.2f} deg "
+              f"(limit {math.degrees(roll.limit):.0f} deg)  {status}")
+        if status == "BLOCK":
+            blocks.append(
+                f"IDs {upper_id}/{lower_id}: start foot roll {math.degrees(value):+.2f} deg is outside the "
+                f"{math.degrees(roll.limit):.0f} deg band; set the ankle by hand before enabling"
+            )
+    return blocks
 
 
 def clip_roll_targets(targets, pairs, limits, roll):
