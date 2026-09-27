@@ -20,7 +20,7 @@ sys.path.insert(0, str(SCRIPTS_DIR / "sim_to_real"))
 from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
 from robonex_common.joints import JOINT_BY_ID
 from robonex_can import DEFAULT_INTERFACE, HOST_ID, JOINT_MAP, MOTOR_MODELS, SPECS, Motor
-from robonex_common.models import robot_model
+from robonex_common.models import ROBOT_MODELS, robot_model
 from safety import (
     brake_and_stop,
     enable_with_runtime_feedback,
@@ -68,7 +68,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--motor-id", type=lambda v: int(v, 0), required=True)
     parser.add_argument("--profile", choices=("step", "triangle", "chirp"), required=True)
-    parser.add_argument("--robot-model", choices=("ver1", "ver2_edu"), required=True,
+    parser.add_argument("--robot-model", choices=tuple(sorted(ROBOT_MODELS)), required=True,
                         help="robonex-common robot profile whose joint limits bound the probe")
     parser.add_argument("--amplitude", type=float, default=0.05, help="rad, at most %.2f" % MAX_AMPLITUDE_RAD)
     parser.add_argument("--duration", type=float, default=20.0, help="seconds, at most %.0f" % MAX_DURATION_S)

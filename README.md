@@ -12,8 +12,8 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Robot identity: the model physically attached (ver1 or ver2_edu); every motor-enabling script checks it
-mkdir -p ~/.config/robonex && echo ver1 > ~/.config/robonex/robot_model
+# Robot identity: the model physically attached (ver2_edu); every motor-enabling script checks it
+mkdir -p ~/.config/robonex && echo ver2_edu > ~/.config/robonex/robot_model
 ```
 
 `robonex-common` is pinned in `requirements.txt` — see [`robonex-common/setup/SETUP.md`](https://github.com/Humanoid-Project/robonex-common/blob/main/setup/SETUP.md).
@@ -129,7 +129,7 @@ Drives ONE motor of a hung robot around its current position and logs feedback a
 | --- | --- | --- | --- |
 | - | `--motor-id` | `Required` | The single motor to move |
 | - | `--profile` | `Required` | `step` (latency), `triangle` (hysteresis), `chirp` (frequency response) |
-| - | `--robot-model` | `Required` | `ver1` or `ver2_edu`; the robonex-common joint limits that bound the probe |
+| - | `--robot-model` | `Required` | `ver2_edu`; the robonex-common joint limits that bound the probe |
 | - | `--amplitude` | `0.05` | rad, at most 0.15 |
 | - | `--duration` | `20.0` | s, at most 120 |
 | - | `--hold` | `1.0` | step: seconds per level |

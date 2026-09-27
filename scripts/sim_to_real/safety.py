@@ -121,7 +121,7 @@ def require_robot_model(expected, path=None):
     if attached is None:
         raise RuntimeError(
             f"No robot identity: write the attached robot's model ({known}) to {path}, e.g. "
-            f"`mkdir -p {path.parent} && echo ver1 > {path}`. Motors will not be enabled."
+            f"`mkdir -p {path.parent} && echo ver2_edu > {path}`. Motors will not be enabled."
         )
     if attached not in ROBOT_MODELS:
         raise RuntimeError(f"{path} names an unknown robot model {attached!r} (known: {known})")
