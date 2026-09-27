@@ -38,6 +38,8 @@ from safety import (
     open_hardware,
     runtime_safety_reason,
     shutdown_report_lines,
+    clip_roll_targets,
+    roll_pairs_for,
     safe_limits,
     verify_model_limits,
     wrap_to_pi,
@@ -234,6 +236,7 @@ def run(args):
     hard_limits = {mid: model_limits[mid] for mid in motor_ids}
     command_limits = safe_limits(motor_ids, margin_rad, model_limits)
     print(f"Robot model: {profile.name} (from the MuJoCo actuator limits)")
+    roll_pairs = roll_pairs_for(profile, motor_ids)
     data = mujoco.MjData(model)
     data.ctrl[:] = 0.0
     mujoco.mj_forward(model, data)
@@ -297,10 +300,13 @@ def run(args):
                             raise RuntimeError(f"ID {mid} MuJoCo target is NaN or infinite")
                         lower, upper = command_limits[mid]
                         targets[mid] = clamp(raw_target, lower, upper)
+                if roll_pairs:
+                    targets = clip_roll_targets(targets, roll_pairs, command_limits, profile.foot_roll)
 
                 dt = clamp(now - last_tick, period * 0.25, period * 2.0)
                 last_tick = now
                 command_velocities = {}
+                previous = {mid: limiters[mid].position for mid in motor_ids}
                 for mid in motor_ids:
                     position, velocity = limiters[mid].step(
                         align_angle(limiters[mid].position, targets[mid]),
@@ -308,6 +314,13 @@ def run(args):
                     )
                     commands[mid] = position
                     command_velocities[mid] = velocity
+                if roll_pairs:
+                    projected = clip_roll_targets(commands, roll_pairs, command_limits, profile.foot_roll)
+                    for mid in motor_ids:
+                        limiters[mid].position = projected[mid]
+                        limiters[mid].velocity = (projected[mid] - previous[mid]) / dt
+                        commands[mid] = projected[mid]
+                        command_velocities[mid] = limiters[mid].velocity
 
                 for mid, motor in motors.items():
                     motor.control(

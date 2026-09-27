@@ -126,6 +126,7 @@ Drives ONE motor of a hung robot around its current position and logs feedback a
 | --- | --- | --- | --- |
 | - | `--motor-id` | `Required` | The single motor to move |
 | - | `--profile` | `Required` | `step` (latency), `triangle` (hysteresis), `chirp` (frequency response) |
+| - | `--robot-model` | `Required` | `ver1` or `ver2_edu`; the robonex-common joint limits that bound the probe |
 | - | `--amplitude` | `0.05` | rad, at most 0.15 |
 | - | `--duration` | `20.0` | s, at most 120 |
 | - | `--hold` | `1.0` | step: seconds per level |
@@ -137,9 +138,9 @@ Drives ONE motor of a hung robot around its current position and logs feedback a
 
 ```bash
 # Example
-python3 scripts/sysid/joint_probe.py --motor-id 1 --profile step --amplitude 0.05
-python3 scripts/sysid/joint_probe.py --motor-id 1 --profile triangle --amplitude 0.05 --period 10 --duration 30
-python3 scripts/sysid/joint_probe.py --motor-id 1 --profile chirp --amplitude 0.03 --f0 0.2 --f1 5 --duration 40
+python3 scripts/sysid/joint_probe.py --motor-id 1 --robot-model ver2_edu --profile step --amplitude 0.05
+python3 scripts/sysid/joint_probe.py --motor-id 1 --robot-model ver2_edu --profile triangle --amplitude 0.05 --period 10 --duration 30
+python3 scripts/sysid/joint_probe.py --motor-id 1 --robot-model ver2_edu --profile chirp --amplitude 0.03 --f0 0.2 --f1 5 --duration 40
 ```
 
 <br>

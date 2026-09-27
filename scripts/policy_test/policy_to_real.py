@@ -526,13 +526,13 @@ class TargetCommander:
         self.slew_lag_max_by_motor = {motor_id: 0.0 for motor_id in self.motors}
         self.roll_reprojected_count = 0
 
-    def send(self, motor_ids_targets, dt, max_speed, max_accel, use_velocity_target, reproject=None):
+    def send(self, motor_ids_targets, dt, max_speed, max_accel, use_velocity_target, reproject=None, align=True):
         step_lag_max = 0.0
         previous = {}
         for motor_id, target in motor_ids_targets.items():
             limiter = self.limiters[motor_id]
             previous[motor_id] = limiter.position
-            aligned = align_angle(limiter.position, target)
+            aligned = align_angle(limiter.position, target) if align else target
             position, velocity = limiter.step(aligned, dt, max_speed, max_accel)
             lag = abs(position - aligned)
             if lag > 1.0e-9:
@@ -773,7 +773,9 @@ def format_pipeline(runner):
     return (
         f"clip: runner |a|>{pipeline.runner_clip:.1f} {pipeline.runner_clip_count / calls * 100:5.2f}%   "
         f"target {pipeline.target_clip_count / calls * 100:5.2f}%   "
-        f"inference {runner.inference_ms:5.2f} ms"
+        + (f"roll {pipeline.roll_clip_count / max(1, pipeline.policy_call_count) * 100:5.2f}%   "
+           if pipeline.roll_pairs else "")
+        + f"inference {runner.inference_ms:5.2f} ms"
     )
 
 
@@ -1083,6 +1085,7 @@ class TelemetryRecorder:
             "policy_file": str(policy_path),
             "policy_sha256": contract.policy_sha256,
             "task": contract.task,
+            "robot_model": contract.robot_model,
             "policy_hz": contract.policy_hz,
             "training_commit": contract.training_commit,
             "common_commit": contract.common_commit,
@@ -1250,6 +1253,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                 SETTINGS.policy_max_accel,
                 use_velocity_target=False,
                 reproject=reproject,
+                align=False,
             )
             send_ms = (time.monotonic() - send_started) * 1000.0
             commanded_targets = [
