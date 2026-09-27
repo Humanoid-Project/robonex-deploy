@@ -36,6 +36,7 @@ from safety import (
     open_hardware,
     runtime_safety_reason,
     shutdown_report_lines,
+    require_robot_model,
     safe_limits,
     verify_model_limits,
     wrap_to_pi,
@@ -372,6 +373,7 @@ def run(args):
     if args.dry_run:
         print("\nDry run only. The sequence and the model are valid; nothing was executed.")
         return
+    require_robot_model(profile.name)
 
     buses = {}
     motors = {}

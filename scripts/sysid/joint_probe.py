@@ -25,6 +25,7 @@ from safety import (
     brake_and_stop,
     enable_with_runtime_feedback,
     open_hardware,
+    require_robot_model,
     runtime_safety_reason,
     safe_limits,
     shutdown_report_lines,
@@ -137,6 +138,7 @@ def run(args):
     print(f"  worst-case PD torque demand {step_torque:.1f} N·m (continuous rating {limit:g} N·m)")
     print("  The robot must hang so that this joint moves freely; all other motors stay disabled.")
     print("  Ctrl-C brakes and stops. Keep the emergency stop within reach.")
+    require_robot_model(args.robot_model)
     input("Press Enter to enable the motor and start, or Ctrl-C to cancel: ")
 
     buses, motors, hubs, enabled = {}, {}, {}, []

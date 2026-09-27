@@ -39,6 +39,7 @@ from safety import (
     runtime_safety_reason,
     shutdown_report_lines,
     clip_roll_targets,
+    require_robot_model,
     roll_pairs_for,
     safe_limits,
     verify_model_limits,
@@ -237,6 +238,7 @@ def run(args):
     command_limits = safe_limits(motor_ids, margin_rad, model_limits)
     print(f"Robot model: {profile.name} (from the MuJoCo actuator limits)")
     roll_pairs = roll_pairs_for(profile, motor_ids)
+    require_robot_model(profile.name)
     data = mujoco.MjData(model)
     data.ctrl[:] = 0.0
     mujoco.mj_forward(model, data)

@@ -11,6 +11,9 @@ cd robonex-deploy
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# Robot identity: the model physically attached (ver1 or ver2_edu); every motor-enabling script checks it
+mkdir -p ~/.config/robonex && echo ver1 > ~/.config/robonex/robot_model
 ```
 
 `robonex-common` is pinned in `requirements.txt` — see [`robonex-common/setup/SETUP.md`](https://github.com/Humanoid-Project/robonex-common/blob/main/setup/SETUP.md).

@@ -79,6 +79,7 @@ from safety import (
     enable_with_runtime_feedback,
     inspect_zero_positions,
     open_hardware,
+    require_robot_model,
     roll_pairs_for,
     runtime_safety_reason,
     shutdown_report_lines,
@@ -1351,6 +1352,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
 def run_deploy(policy_path, contract, args):
     notes = []
     verify_common_source(contract)
+    require_robot_model(contract.robot_model)
     runner = PolicyRunner(policy_path, contract)
     runner.velocity_command[:] = (args.vx, args.vy, args.wz)
     if args.scenario:
