@@ -15,10 +15,12 @@ import can
 import mujoco
 import numpy as np
 from robonex_common.can import drain
+from robonex_common.foot_roll import clip_foot_roll, foot_roll
+from robonex_common.joints import JOINT_BY_MODEL_NAME
+from robonex_common.models import ROBOT_MODELS
 
 from robonex_can import (
     FeedbackHub,
-    JOINT_LIMITS_RAD,
     JOINT_MAP,
     MOTOR_ACTUATORS,
     MOTOR_MODELS,
@@ -74,10 +76,10 @@ class AxisLimiter:
         self.velocity = next_velocity
         return self.position, self.velocity
 
-def safe_limits(motor_ids, margin_rad):
+def safe_limits(motor_ids, margin_rad, limits):
     result = {}
     for mid in motor_ids:
-        lower, upper = JOINT_LIMITS_RAD[mid]
+        lower, upper = limits[mid]
         inner = (lower + margin_rad, upper - margin_rad)
         if inner[0] >= inner[1]:
             raise ValueError(f"ID {mid}: limit margin is larger than the joint range")
@@ -85,14 +87,66 @@ def safe_limits(motor_ids, margin_rad):
     return result
 
 def verify_model_limits(model, actuator_ids, motor_ids):
-    for mid in motor_ids:
-        got = tuple(float(v) for v in model.actuator_ctrlrange[actuator_ids[mid]])
-        want = JOINT_LIMITS_RAD[mid]
-        if not np.allclose(got, want, atol=5e-6, rtol=0.0):
+    got = {mid: tuple(float(v) for v in model.actuator_ctrlrange[actuator_ids[mid]]) for mid in motor_ids}
+    matches = []
+    for profile in ROBOT_MODELS.values():
+        want = profile.joint_limits_by_id()
+        if all(np.allclose(got[mid], want[mid], atol=5e-6, rtol=0.0) for mid in motor_ids):
+            matches.append(profile)
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"MuJoCo actuator limits {got} match {len(matches)} robonex-common robot models "
+            f"({', '.join(sorted(ROBOT_MODELS))}); exactly one must match. "
+            "Use matching source and generated models."
+        )
+    return matches[0]
+
+def roll_pairs_for(profile, motor_ids):
+    if profile.foot_roll is None:
+        return []
+    pairs = []
+    for upper, lower, sign in profile.foot_roll.pairs:
+        upper_id, lower_id = JOINT_BY_MODEL_NAME[upper].motor_id, JOINT_BY_MODEL_NAME[lower].motor_id
+        selected = (upper_id in motor_ids, lower_id in motor_ids)
+        if any(selected) and not all(selected):
             raise RuntimeError(
-                f"ID {mid} limit mismatch: MuJoCo={got}, common={want}. "
-                "Use matching source and generated models."
+                f"{profile.name}: ankle motors {upper_id} and {lower_id} share the coupled foot-roll limit; "
+                "select both or neither"
             )
+        if all(selected):
+            pairs.append((upper_id, lower_id, float(sign)))
+    return pairs
+
+
+def start_roll_blocks(measured, pairs, roll, tolerance_rad):
+    blocks = []
+    for upper_id, lower_id, sign in pairs:
+        upper, lower = measured.get(upper_id), measured.get(lower_id)
+        if upper is None or lower is None or not (math.isfinite(upper) and math.isfinite(lower)):
+            continue
+        value = foot_roll(sign * wrap_to_pi(upper), sign * wrap_to_pi(lower), roll.coeffs)
+        status = "BLOCK" if abs(value) > roll.limit + tolerance_rad else "ok"
+        print(f"  foot roll from IDs {upper_id}/{lower_id}: {math.degrees(value):+6.2f} deg "
+              f"(limit {math.degrees(roll.limit):.0f} deg)  {status}")
+        if status == "BLOCK":
+            blocks.append(
+                f"IDs {upper_id}/{lower_id}: start foot roll {math.degrees(value):+.2f} deg is outside the "
+                f"{math.degrees(roll.limit):.0f} deg band; set the ankle by hand before enabling"
+            )
+    return blocks
+
+
+def clip_roll_targets(targets, pairs, limits, roll):
+    out = dict(targets)
+    for upper_id, lower_id, sign in pairs:
+        upper_range = sorted((sign * limits[upper_id][0], sign * limits[upper_id][1]))
+        lower_range = sorted((sign * limits[lower_id][0], sign * limits[lower_id][1]))
+        upper, lower = clip_foot_roll(
+            sign * out[upper_id], sign * out[lower_id], upper_range, lower_range, roll.coeffs, roll.limit
+        )
+        out[upper_id], out[lower_id] = sign * float(upper), sign * float(lower)
+    return out
+
 
 def load_fixed_model(path, motor_ids):
     path = path.expanduser().resolve()

@@ -19,7 +19,6 @@ sys.path.insert(0, str(THIS_FILE.parent))
 
 from robonex_common.paths import description_model
 from robonex_can import (
-    JOINT_LIMITS_RAD,
     DEFAULT_INTERFACE,
     HOST_ID,
     JOINT_MAP,
@@ -352,8 +351,12 @@ def run(args):
         raise RuntimeError("Argument error:\n  " + "\n  ".join(problems))
 
     margin_rad = math.radians(args.limit_margin_deg)
-    hard_limits = {mid: JOINT_LIMITS_RAD[mid] for mid in motor_ids}
-    command_limits = safe_limits(motor_ids, margin_rad)
+    model_path, model, actuator_ids = load_fixed_model(args.model, motor_ids)
+    profile = verify_model_limits(model, actuator_ids, motor_ids)
+    model_limits = profile.joint_limits_by_id()
+    hard_limits = {mid: model_limits[mid] for mid in motor_ids}
+    command_limits = safe_limits(motor_ids, margin_rad, model_limits)
+    print(f"Robot model: {profile.name} (from the MuJoCo actuator limits)")
 
     seq_problems, segments = validate_sequence(
         SEQUENCE, motor_ids, command_limits, args.max_speed, args.time_scale
@@ -362,8 +365,6 @@ def run(args):
         raise RuntimeError("Sequence error:\n  " + "\n  ".join(seq_problems))
     report_sequence(SEQUENCE, motor_ids, segments, command_limits, args)
 
-    model_path, model, actuator_ids = load_fixed_model(args.model, motor_ids)
-    verify_model_limits(model, actuator_ids, motor_ids)
     data = mujoco.MjData(model)
     data.ctrl[:] = 0.0
     mujoco.mj_forward(model, data)
