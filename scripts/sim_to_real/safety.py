@@ -6,6 +6,7 @@ these; the per-script speed/accel caps stay in the scripts themselves.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import math
 import signal
 import threading
@@ -100,6 +101,37 @@ def verify_model_limits(model, actuator_ids, motor_ids):
             "Use matching source and generated models."
         )
     return matches[0]
+
+ROBOT_IDENTITY_FILE = Path.home() / ".config" / "robonex" / "robot_model"
+
+
+def attached_robot_model(path=None):
+    path = ROBOT_IDENTITY_FILE if path is None else Path(path)
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    return value or None
+
+
+def require_robot_model(expected, path=None):
+    path = ROBOT_IDENTITY_FILE if path is None else Path(path)
+    attached = attached_robot_model(path)
+    known = ", ".join(sorted(ROBOT_MODELS))
+    if attached is None:
+        raise RuntimeError(
+            f"No robot identity: write the attached robot's model ({known}) to {path}, e.g. "
+            f"`mkdir -p {path.parent} && echo ver1 > {path}`. Motors will not be enabled."
+        )
+    if attached not in ROBOT_MODELS:
+        raise RuntimeError(f"{path} names an unknown robot model {attached!r} (known: {known})")
+    if attached != expected:
+        raise RuntimeError(
+            f"The attached robot is {attached} ({path}), but this run is for {expected}. "
+            "Motors will not be enabled."
+        )
+    print(f"Robot       : {attached} (from {path})")
+
 
 def roll_pairs_for(profile, motor_ids):
     if profile.foot_roll is None:
