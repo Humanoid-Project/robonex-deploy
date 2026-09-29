@@ -162,6 +162,7 @@ class Settings:
     policy_max_speed: float = 6.0
     policy_max_accel: float = 120.0
     ramp_seconds: float = 1.0
+    command_hold_seconds: float = 0.5
 
     imu_calibration_seconds: float = 2.0
     brake_time: float = 0.20
@@ -1234,11 +1235,16 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
             if scenario:
                 runner.velocity_command[:] = scenario_command(scenario, now - stats.started)
 
+            requested_command = runner.velocity_command.copy()
+            if now - ramp_started < SETTINGS.ramp_seconds + SETTINGS.command_hold_seconds:
+                runner.velocity_command[:] = 0.0
             try:
                 observation = runner.observation(positions, velocities, angular_velocity, gravity)
                 raw_action, policy_action, targets = runner.step(observation, commit=False)
             except ValueError as error:
                 raise RuntimeError(f"Safety stop: {error}") from error
+            finally:
+                runner.velocity_command[:] = requested_command
 
             blend = clamp((now - ramp_started) / SETTINGS.ramp_seconds, 0.0, 1.0)
             commanded = {}
