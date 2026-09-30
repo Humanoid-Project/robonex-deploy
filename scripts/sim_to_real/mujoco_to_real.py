@@ -283,7 +283,7 @@ def run(args):
     actuator_ids = {mid: aid for mid, aid in variant_actuators.items() if mid in motor_ids}
     profile = verify_model_limits(model, actuator_ids, motor_ids)
     model_limits = profile.joint_limits_by_id()
-    hard_limits = {mid: model_limits[mid] if mid in actuator_ids else JOINT_LIMITS_RAD[mid] for mid in motor_ids}
+    hard_limits = {mid: model_limits[mid] if mid in model_limits else JOINT_LIMITS_RAD[mid] for mid in motor_ids}
     command_limits = safe_limits(motor_ids, margin_rad, hard_limits)
     print_banner(
         args.variant, args.variant_source, motor_ids, variant_actuators, model_path.name,

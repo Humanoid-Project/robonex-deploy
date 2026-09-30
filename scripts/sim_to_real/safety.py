@@ -21,9 +21,10 @@ from robonex_common.joints import JOINT_BY_MODEL_NAME
 from robonex_common.models import ROBOT_MODELS
 from robonex_common.paths import description_model
 
-from bench import ROBOT_IDENTITY_FILE, ROBOT_VARIANTS, attached_robot_model
+from bench import LEG_MOTOR_IDS, ROBOT_IDENTITY_FILE, ROBOT_VARIANTS, attached_robot_model
 from robonex_can import (
     FeedbackHub,
+    JOINT_LIMITS_RAD,
     JOINT_MAP,
     MOTOR_ACTUATORS,
     MOTOR_MODELS,
@@ -91,15 +92,29 @@ def safe_limits(motor_ids, margin_rad, limits):
     return result
 
 def verify_model_limits(model, actuator_ids, motor_ids):
-    motor_ids = [mid for mid in motor_ids if mid in actuator_ids]
+    simulated = [mid for mid in motor_ids if mid in actuator_ids]
+    got = {mid: tuple(float(v) for v in model.actuator_ctrlrange[actuator_ids[mid]]) for mid in simulated}
+    mismatched = [
+        f"ID {mid} {JOINT_MAP[mid]} (actuator {MOTOR_ACTUATORS[mid]}): MuJoCo ctrlrange {got[mid]} "
+        f"!= robonex-common {JOINT_LIMITS_RAD[mid]}"
+        for mid in simulated
+        if mid not in LEG_MOTOR_IDS and not np.allclose(got[mid], JOINT_LIMITS_RAD[mid], atol=5e-6, rtol=0.0)
+    ]
+    if mismatched:
+        raise RuntimeError(
+            "MuJoCo actuator limits differ from robonex-common MOTOR_LIMITS_BY_ID:\n  "
+            + "\n  ".join(mismatched)
+            + "\nUse matching source and generated models."
+        )
+    motor_ids = [mid for mid in simulated if mid in LEG_MOTOR_IDS]
     if not motor_ids:
         if len(ROBOT_MODELS) != 1:
             raise RuntimeError(
-                "no selected motor has a MuJoCo actuator, so the robot model cannot be inferred from the model; "
+                "no selected leg motor has a MuJoCo actuator, so the robot model cannot be inferred from the model; "
                 "select at least one leg motor"
             )
         return next(iter(ROBOT_MODELS.values()))
-    got = {mid: tuple(float(v) for v in model.actuator_ctrlrange[actuator_ids[mid]]) for mid in motor_ids}
+    got = {mid: got[mid] for mid in motor_ids}
     matches = []
     for profile in ROBOT_MODELS.values():
         want = profile.joint_limits_by_id()
