@@ -21,7 +21,10 @@ from robonex_common.joints import JOINT_BY_MODEL_NAME
 from robonex_common.models import ROBOT_MODELS
 from robonex_common.paths import description_model
 
-from bench import LEG_MOTOR_IDS, ROBOT_IDENTITY_FILE, ROBOT_VARIANTS, attached_robot_model
+try:
+    from bench import LEG_MOTOR_IDS, ROBOT_IDENTITY_FILE, ROBOT_VARIANTS, attached_robot_model
+except ModuleNotFoundError:
+    from .bench import LEG_MOTOR_IDS, ROBOT_IDENTITY_FILE, ROBOT_VARIANTS, attached_robot_model
 from robonex_can import (
     FeedbackHub,
     JOINT_LIMITS_RAD,
