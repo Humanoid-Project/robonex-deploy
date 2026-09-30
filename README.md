@@ -36,6 +36,7 @@ robonex-deploy/
 │   ├── sim_to_sim/
 │   │   └── isaac_to_mujoco.py
 │   ├── sim_to_real/
+│   │   ├── bench.py
 │   │   ├── safety.py
 │   │   ├── mujoco_to_real.py
 │   │   └── real_to_mujoco.py
@@ -126,7 +127,7 @@ Drives ONE motor of a hung robot around its current position and logs feedback a
 
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
-| - | `--motor-id` | `Required` | The single motor to move |
+| - | `--motor-id` | `Required` | The single motor to move; must be on `--robot-model` |
 | - | `--profile` | `Required` | `step` (latency), `triangle` (hysteresis), `chirp` (frequency response) |
 | - | `--robot-model` | `Required` | `ver2_edu`, `ver2_pro` or `ver2_max`; must match the robot identity |
 | - | `--amplitude` | `0.05` | rad, at most 0.15 |
@@ -143,6 +144,7 @@ Drives ONE motor of a hung robot around its current position and logs feedback a
 python3 scripts/sysid/joint_probe.py --motor-id 1 --robot-model ver2_edu --profile step --amplitude 0.05
 python3 scripts/sysid/joint_probe.py --motor-id 1 --robot-model ver2_edu --profile triangle --amplitude 0.05 --period 10 --duration 30
 python3 scripts/sysid/joint_probe.py --motor-id 1 --robot-model ver2_edu --profile chirp --amplitude 0.03 --f0 0.2 --f1 5 --duration 40
+python3 scripts/sysid/joint_probe.py --motor-id 13 --robot-model ver2_edu --profile step --amplitude 0.05
 ```
 
 <br>
@@ -164,22 +166,42 @@ python3 scripts/sysid/analyze_probe.py results/sysid/*_id1_*.csv --output /tmp/p
 
 ## sim-to-real
 
+The variant comes from `~/.config/robonex/robot_model`; CAN channels from `~/.config/robonex/bus_map.json` (default below).
+
+| Group | IDs | Motor | Default CAN | edu | pro | max |
+| --- | --- | --- | --- | --- | --- | --- |
+| `left_leg` | `1`–`6` | rs02 / rs03 | `can0` | ✓ | ✓ | ✓ |
+| `right_leg` | `7`–`12` | rs02 / rs03 | `can1` | ✓ | ✓ | ✓ |
+| `head` | `13` neck_pitch, `14` neck_yaw | rs05 | `can4` | `13` | `13` | `13`, `14` |
+| `left_arm` | `15`–`18` shoulder_pitch/roll/yaw, elbow | rs02 | `can2` | - | ✓ | ✓ |
+| `right_arm` | `20`–`23` shoulder_pitch/roll/yaw, elbow | rs02 | `can3` | - | ✓ | ✓ |
+
+PLACEHOLDER until measured: head limits ±30° with kp 20 / kd 1, arm limits ±45° with kp 40 / kd 2. Motors without a MuJoCo actuator (head, arms today) show `not in sim`.
+
 ### `mujoco_to_real.py`
 
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
-| - | `--motor-id` | `1`–`12` | One or more motor IDs to control; `13` (head, no MuJoCo actuator) is moved to zero and held there |
-
-Gains come from `robonex-common` `CONTROL_GAINS_BY_JOINT` per motor (hip 100/2, knee 150/4, ankle 40/2); a motor without a table entry (`13`) uses kp 40 / kd 2. Other registered motors on the opened buses get one stop frame at start.
-| - | `--robot` | `edu` | Ver.2 variant: `edu`, `pro` or `max` |
+| - | `--motor-id` | `legs` (`1`–`12`) | IDs, groups (`left_leg`, `right_leg`, `head`, `left_arm`, `right_arm`, `legs`, `arms`, `all`) or joint names (`left_knee_pitch`); `not in sim` motors are moved to zero and held |
+| - | `--robot` | Identity file | `edu`, `pro`, `max` (or `ver2_*`); must match the identity file |
+| - | `--dry-run` | Off | Print variant, buses and the per-motor kp/kd/limit table, then exit; no CAN bus is opened |
 
 ```bash
 # Example
-python3 scripts/sim_to_real/mujoco_to_real.py \
-  --motor-id 4
+cd ~/humanoid_project/robonex-deploy
+source .venv/bin/activate
 
-python3 scripts/sim_to_real/mujoco_to_real.py \
-  --robot pro
+python3 scripts/sim_to_real/mujoco_to_real.py --dry-run
+python3 scripts/sim_to_real/mujoco_to_real.py --dry-run --motor-id all
+
+python3 scripts/sim_to_real/mujoco_to_real.py
+python3 scripts/sim_to_real/mujoco_to_real.py --motor-id left_leg
+python3 scripts/sim_to_real/mujoco_to_real.py --motor-id 4
+python3 scripts/sim_to_real/mujoco_to_real.py --motor-id head
+
+# pro / max identity file
+python3 scripts/sim_to_real/mujoco_to_real.py --motor-id legs arms
+python3 scripts/sim_to_real/mujoco_to_real.py --robot max --motor-id all
 ```
 
 <br>
@@ -188,15 +210,23 @@ python3 scripts/sim_to_real/mujoco_to_real.py \
 
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
-| - | `--motor-id` | `1`–`12` | One or more motor IDs to read; `13` (head) is read and printed, not simulated |
-| - | `--robot` | `edu` | Ver.2 variant: `edu`, `pro` or `max` |
+| - | `--motor-id` | `legs` (`1`–`12`) | Same selection as `mujoco_to_real.py`; `not in sim` motors are read and printed only |
+| - | `--robot` | Identity file | `edu`, `pro`, `max` (or `ver2_*`); must match the identity file, sets the variant when there is none |
+| - | `--once` | Off | Read once, print one table, exit; no viewer, no stop frame |
 
 ```bash
 # Example
+python3 scripts/sim_to_real/real_to_mujoco.py
 python3 scripts/sim_to_real/real_to_mujoco.py --motor-id 4
-python3 scripts/sim_to_real/real_to_mujoco.py --motor-id 13
+python3 scripts/sim_to_real/real_to_mujoco.py --motor-id head
 
-python3 scripts/sim_to_real/real_to_mujoco.py --robot pro
+python3 scripts/sim_to_real/real_to_mujoco.py --once
+python3 scripts/sim_to_real/real_to_mujoco.py --once --motor-id all
+
+# Without an identity file
+python3 scripts/sim_to_real/real_to_mujoco.py --robot edu
+python3 scripts/sim_to_real/real_to_mujoco.py --robot pro --motor-id arms
+python3 scripts/sim_to_real/real_to_mujoco.py --robot max --once --motor-id head
 ```
 
 <br>
