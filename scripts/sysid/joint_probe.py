@@ -18,9 +18,10 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR / "sim_to_real"))
 
 from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
-from robonex_common.joints import MOTOR_BY_ID, MOTOR_LIMITS_BY_ID
+from robonex_common.joints import MOTOR_BY_ID, MOTOR_LIMITS_BY_ID, VARIANT_MOTOR_IDS
 from robonex_can import DEFAULT_INTERFACE, HOST_ID, JOINT_MAP, stop_idle_motors
 from robonex_common.models import robot_model
+from bench import format_ids
 from safety import (
     LEG_PROFILE,
     ROBOT_VARIANTS,
@@ -85,6 +86,9 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.motor_id not in MOTOR_BY_ID:
         parser.error(f"unknown motor id {args.motor_id}")
+    if args.motor_id not in VARIANT_MOTOR_IDS[args.robot_model]:
+        parser.error(f"motor id {args.motor_id} is not on {args.robot_model} "
+                     f"(its motors: {format_ids(VARIANT_MOTOR_IDS[args.robot_model])})")
     if MOTOR_BY_ID[args.motor_id].model_name not in CONTROL_GAINS_BY_JOINT:
         parser.error(f"motor id {args.motor_id} ({MOTOR_BY_ID[args.motor_id].model_name}) has no entry in CONTROL_GAINS_BY_JOINT; add one to robonex-common first")
     for name in ("amplitude", "duration", "hold", "period", "f0", "f1", "rate", "gain_scale"):

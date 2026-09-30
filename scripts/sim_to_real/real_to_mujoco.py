@@ -23,11 +23,24 @@ from robonex_can import (
     JOINT_LIMITS_RAD,
     JOINT_MAP,
     MOTOR_MODELS,
-    POLICY_MOTOR_IDS,
     channel_for_id,
     clamp,
 )
-from safety import ROBOT_VARIANTS, fixed_model_path, load_fixed_model, open_hardware
+from robonex_common.joints import VARIANT_MOTOR_IDS
+from bench import (
+    ROBOT_VARIANTS,
+    deg_text,
+    open_checked,
+    print_banner,
+    print_table,
+    resolve_motor_ids,
+    resolve_variant,
+    selection_help,
+    sim_state,
+)
+from safety import fixed_model_path, load_fixed_model, open_hardware
+
+ROBOT_VARIANTS_SHORT = {name: short for short, name in ROBOT_VARIANTS.items()}
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
@@ -40,14 +53,20 @@ def parse_args(argv=None):
         "--motor-id",
         dest="motor_id",
         nargs="+",
-        type=lambda value: int(value, 0),
-        default=sorted(POLICY_MOTOR_IDS),
-        help="Motor IDs to read. Default: the 12 leg motors; a motor without a MuJoCo actuator (13, head) is read and printed only",
+        metavar="MOTOR",
+        help=selection_help() + ". A motor without a MuJoCo actuator (head, arms) is read and printed only",
     )
-    parser.add_argument("--robot", choices=tuple(ROBOT_VARIANTS), default="edu",
-                        help="Ver.2 variant: edu, pro or max. Default: edu")
+    parser.add_argument("--robot", choices=(*ROBOT_VARIANTS, *ROBOT_VARIANTS.values()),
+                        help="Variant check: must match the robot identity file; without that file it sets the variant")
+    parser.add_argument("--once", action="store_true",
+                        help="Read every selected motor once, print one table and exit; no viewer, no stop frame")
     args = parser.parse_args(argv)
-    args.model = fixed_model_path(args.robot)
+    try:
+        args.variant, args.variant_source = resolve_variant(args.robot, need_identity=False)
+        args.motor_ids = resolve_motor_ids(args.motor_id, args.variant)
+    except ValueError as error:
+        parser.error(str(error))
+    args.model = fixed_model_path(ROBOT_VARIANTS_SHORT[args.variant])
     args.interface = DEFAULT_INTERFACE
     args.host_id = HOST_ID
     args.rate = 30.0
@@ -60,7 +79,7 @@ def parse_args(argv=None):
 
 def validate_args(args):
     problems = []
-    motor_ids = sorted(set(args.motor_id))
+    motor_ids = sorted(set(args.motor_ids))
     unknown = [motor_id for motor_id in motor_ids if motor_id not in MOTOR_MODELS]
     if unknown:
         problems.append(f"Unsupported motor ID: {unknown}")
@@ -153,22 +172,32 @@ def wrap_to_pi(angle):
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
+def position_state(value, limits, tolerance_rad):
+    if not math.isfinite(value):
+        return None, "NaN"
+    wrapped = wrap_to_pi(value)
+    lower, upper = limits
+    if wrapped < lower - tolerance_rad or wrapped > upper + tolerance_rad:
+        return wrapped, "LIMIT"
+    target = clamp(wrapped, lower, upper)
+    return target, "CLAMP" if target != wrapped else "OK"
+
+
 def validate_positions(positions, limits, tolerance_rad):
     targets = {}
     clamped = set()
     for motor_id, value in positions.items():
-        if not math.isfinite(value):
+        target, state = position_state(value, limits[motor_id], tolerance_rad)
+        if state == "NaN":
             raise RuntimeError(f"ID {motor_id} mechPos is NaN or infinite")
-        wrapped = wrap_to_pi(value)
-        lower, upper = limits[motor_id]
-        if wrapped < lower - tolerance_rad or wrapped > upper + tolerance_rad:
+        if state == "LIMIT":
+            lower, upper = limits[motor_id]
             raise RuntimeError(
                 f"ID {motor_id} mechPos {math.degrees(value):+.2f}deg "
-                f"(wrapped {math.degrees(wrapped):+.2f} deg) is outside the model range "
+                f"(wrapped {math.degrees(target):+.2f} deg) is outside the model range "
                 f"{math.degrees(lower):+.2f}..{math.degrees(upper):+.2f} deg"
             )
-        target = clamp(wrapped, lower, upper)
-        if target != wrapped:
+        if state == "CLAMP":
             clamped.add(motor_id)
         targets[motor_id] = target
     return targets, clamped
@@ -209,31 +238,84 @@ def initialize_simulation(model, data, actuator_ids, targets):
 
 def sim_qpos_text(data, qpos_addresses, motor_id):
     if motor_id not in qpos_addresses:
-        return "not in sim"
-    return f"{math.degrees(data.qpos[qpos_addresses[motor_id]]):+8.2f}deg"
+        return "--"
+    return deg_text(data.qpos[qpos_addresses[motor_id]])
 
 
 def print_status(data, qpos_addresses, positions, targets, clamped):
     print(f"[{time.strftime('%H:%M:%S')}] real -> MuJoCo")
-    print(f"  {'ID':>2} {'joint':<18} {'real':>11} {'sim target':>11} {'sim qpos':>11} {'state':>7}")
-    for motor_id in sorted(targets):
-        state = "CLAMP" if motor_id in clamped else "OK"
-        print(
-            f"  {motor_id:>2} {JOINT_MAP[motor_id]:<18} "
-            f"{math.degrees(positions[motor_id]):+8.2f}deg "
-            f"{math.degrees(targets[motor_id]):+8.2f}deg "
-            f"{sim_qpos_text(data, qpos_addresses, motor_id):>11} "
-            f"{state:>7}"
-        )
+    print_table(("ID", "joint", "real", "sim target", "sim qpos", "state", "sim"), [
+        [
+            motor_id, JOINT_MAP[motor_id], deg_text(positions[motor_id]),
+            deg_text(targets[motor_id]) if motor_id in qpos_addresses else "--",
+            sim_qpos_text(data, qpos_addresses, motor_id),
+            "CLAMP" if motor_id in clamped else "OK",
+            sim_state(motor_id, qpos_addresses),
+        ]
+        for motor_id in sorted(targets)
+    ])
+
+
+def print_once(motor_ids, positions, limits, actuator_ids, tolerance_rad):
+    print(f"[{time.strftime('%H:%M:%S')}] real mechPos (one read)")
+    rows = []
+    for motor_id in motor_ids:
+        value = positions.get(motor_id)
+        if value is None:
+            rows.append([motor_id, JOINT_MAP[motor_id], "no response", "--", "--", "NO REPLY", sim_state(motor_id, actuator_ids)])
+            continue
+        _, state = position_state(value, limits[motor_id], tolerance_rad)
+        lower, upper = limits[motor_id]
+        rows.append([
+            motor_id, JOINT_MAP[motor_id], deg_text(value),
+            deg_text(wrap_to_pi(value)) if math.isfinite(value) else "--",
+            f"{math.degrees(lower):+.1f}..{math.degrees(upper):+.1f}",
+            state, sim_state(motor_id, actuator_ids),
+        ])
+    print_table(("ID", "joint", "raw", "wrapped", "limit deg", "state", "sim"), rows)
+    return [row[0] for row in rows if row[5] not in ("OK", "CLAMP")]
+
+
+def run_once(args, motor_ids, limits, actuator_ids):
+    buses = {}
+    try:
+        buses, motors, _ = open_checked(open_hardware, motor_ids, args.interface, args.host_id)
+        groups = motors_by_channel(motors)
+        with ThreadPoolExecutor(max_workers=max(1, len(groups))) as executor:
+            positions = {}
+            deadline = time.monotonic() + args.startup_timeout
+            while len(positions) < len(motors) and time.monotonic() < deadline:
+                remaining = {
+                    channel: {mid: motor for mid, motor in group.items() if mid not in positions}
+                    for channel, group in groups.items()
+                }
+                positions.update(read_all_positions(
+                    {channel: group for channel, group in remaining.items() if group}, executor, args.read_timeout
+                ))
+    finally:
+        for bus in buses.values():
+            try:
+                bus.shutdown()
+            except Exception:
+                pass
+    flagged = print_once(motor_ids, positions, limits, actuator_ids, math.radians(args.limit_tolerance_deg))
+    return 1 if flagged else 0
 
 
 def run(args):
     motor_ids, problems = validate_args(args)
     if problems:
         raise RuntimeError("Argument error:\n  " + "\n  ".join(problems))
-    model_path, model, actuator_ids = load_fixed_model(args.model, motor_ids)
+    model_path, model, variant_actuators = load_fixed_model(args.model, VARIANT_MOTOR_IDS[args.variant])
+    actuator_ids = {mid: aid for mid, aid in variant_actuators.items() if mid in motor_ids}
     limits = model_limits_rad(model, actuator_ids)
     limits.update({mid: JOINT_LIMITS_RAD[mid] for mid in motor_ids if mid not in actuator_ids})
+    print_banner(
+        args.variant, args.variant_source, motor_ids, variant_actuators, model_path.name,
+        "read and printed only", args.interface,
+    )
+    if args.once:
+        return run_once(args, motor_ids, limits, actuator_ids)
     model.opt.gravity[:] = 0.0
     confirm_hardware(args, motor_ids, model_path)
 
@@ -241,9 +323,7 @@ def run(args):
     motors = {}
     positions = {}
     try:
-        buses, motors, _ = open_hardware(
-            motor_ids, args.interface, args.host_id
-        )
+        buses, motors, _ = open_checked(open_hardware, motor_ids, args.interface, args.host_id)
         stop_motors(motors, required=True)
         time.sleep(0.05)
         groups = motors_by_channel(motors)
@@ -312,12 +392,13 @@ def run(args):
             except Exception:
                 pass
     print("Stop state held and CAN shutdown completed.")
+    return 0
 
 
 def main(argv=None):
     args = parse_args(argv)
     try:
-        run(args)
+        return run(args)
     except KeyboardInterrupt:
         print("\nStop requested.")
         return 0

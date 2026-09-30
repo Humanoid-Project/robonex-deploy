@@ -21,6 +21,7 @@ from robonex_common.joints import JOINT_BY_MODEL_NAME
 from robonex_common.models import ROBOT_MODELS
 from robonex_common.paths import description_model
 
+from bench import ROBOT_IDENTITY_FILE, ROBOT_VARIANTS, attached_robot_model
 from robonex_can import (
     FeedbackHub,
     JOINT_MAP,
@@ -112,22 +113,11 @@ def verify_model_limits(model, actuator_ids, motor_ids):
         )
     return matches[0]
 
-ROBOT_IDENTITY_FILE = Path.home() / ".config" / "robonex" / "robot_model"
-ROBOT_VARIANTS = {"edu": "ver2_edu", "pro": "ver2_pro", "max": "ver2_max"}
 LEG_PROFILE = {identity: "ver2_edu" for identity in ROBOT_VARIANTS.values()}
 
 
 def fixed_model_path(robot):
     return description_model(f"ver2/mujoco/robot/{robot}/scene_fixed.xml", anchors=(__file__,))
-
-
-def attached_robot_model(path=None):
-    path = ROBOT_IDENTITY_FILE if path is None else Path(path)
-    try:
-        value = path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return None
-    return value or None
 
 
 def require_robot_model(expected, path=None):
@@ -215,7 +205,6 @@ def load_fixed_model(path, motor_ids):
         if aid < 0:
             if mid in POLICY_MOTOR_IDS:
                 raise RuntimeError(f"MuJoCo actuator not found: ID {mid} -> {actuator_name}")
-            print(f"ID {mid} ({actuator_name}) has no actuator in {path.name}; it is held at zero and not simulated")
             continue
         joint_name = actuator_name + "_joint"
         jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)

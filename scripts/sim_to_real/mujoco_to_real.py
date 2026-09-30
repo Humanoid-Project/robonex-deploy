@@ -24,21 +24,36 @@ from robonex_can import (
     HOST_ID,
     JOINT_LIMITS_RAD,
     JOINT_MAP,
-    POLICY_MOTOR_IDS,
     clamp,
-    gains_without_table_entry,
-    motor_gains,
     stop_idle_motors,
 )
 
 from robonex_can import MOTOR_MODELS
+from robonex_common.joints import MOTOR_BY_ID, VARIANT_MOTOR_IDS
+from bench import (
+    ROBOT_VARIANTS,
+    attached_robot_model,
+    bench_gains,
+    channel_problems,
+    check_gain_table,
+    deg_text,
+    format_ids,
+    identity_path,
+    open_checked,
+    placeholder_ids,
+    print_banner,
+    print_table,
+    resolve_motor_ids,
+    resolve_variant,
+    selection_help,
+    sim_state,
+)
 from safety import (
     AxisLimiter,
     align_angle,
     brake_and_stop,
     enable_with_runtime_feedback,
     inspect_zero_positions,
-    ROBOT_VARIANTS,
     fixed_model_path,
     load_fixed_model,
     open_hardware,
@@ -53,20 +68,26 @@ from safety import (
 )
 
 ZERO_SETTLE_TIMEOUT = 5.0
+ROBOT_VARIANTS_SHORT = {name: short for short, name in ROBOT_VARIANTS.items()}
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Track fixed-base MuJoCo targets with RoboNex motors."
     )
-    parser.add_argument("--motor-id", dest="motor_id",
-                        nargs="+", type=lambda v: int(v, 0),
-                        default=sorted(POLICY_MOTOR_IDS),
-                        help="Motor IDs to control. Default: the 12 leg motors; a motor without a MuJoCo actuator (13, head) is held at zero")
-    parser.add_argument("--robot", choices=tuple(ROBOT_VARIANTS), default="edu",
-                        help="Ver.2 variant: edu, pro or max. Default: edu")
+    parser.add_argument("--motor-id", dest="motor_id", nargs="+", metavar="MOTOR",
+                        help=selection_help() + ". A motor without a MuJoCo actuator (head, arms) is moved to zero and held there")
+    parser.add_argument("--robot", choices=(*ROBOT_VARIANTS, *ROBOT_VARIANTS.values()),
+                        help="Check only: must match the robot identity file, which sets the variant")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Resolve variant, motors, gains, limits and buses and print the start table; no CAN bus is opened")
     args = parser.parse_args(argv)
-    args.model = fixed_model_path(args.robot)
+    try:
+        args.variant, args.variant_source = resolve_variant(args.robot, need_identity=not args.dry_run)
+        args.motor_ids = resolve_motor_ids(args.motor_id, args.variant)
+    except ValueError as error:
+        parser.error(str(error))
+    args.model = fixed_model_path(ROBOT_VARIANTS_SHORT[args.variant])
     args.max_speed = 0.10
     args.max_accel = 0.25
     args.interface = DEFAULT_INTERFACE
@@ -85,7 +106,7 @@ def parse_args(argv=None):
 
 def validate_args(args):
     problems = []
-    motor_ids = sorted(set(args.motor_id))
+    motor_ids = sorted(set(args.motor_ids))
     unknown = [mid for mid in motor_ids if mid not in MOTOR_MODELS]
     if unknown:
         problems.append(f"Unsupported motor ID: {unknown}")
@@ -103,17 +124,28 @@ def validate_args(args):
 
 
 
-def confirm_hardware(args, motor_ids, model_path):
+def print_motor_table(args, motor_ids, hard_limits, actuator_ids, capped):
+    placeholders = set(placeholder_ids(motor_ids))
+    rows = []
+    for mid in motor_ids:
+        joint = MOTOR_BY_ID[mid]
+        lower, upper = hard_limits[mid]
+        notes = [text for flag, text in ((mid in placeholders, "PLACEHOLDER"), (mid in capped, "capped")) if flag]
+        rows.append([
+            mid, JOINT_MAP[mid], joint.motor_model, joint.channel,
+            f"{args.kp[mid]:g}", f"{args.kd[mid]:g}",
+            f"{math.degrees(lower):+.1f}..{math.degrees(upper):+.1f}",
+            sim_state(mid, actuator_ids), " ".join(notes),
+        ])
+    print_table(("ID", "joint", "motor", "bus", "kp", "kd", "limit deg", "sim", "note"), rows)
+
+
+def confirm_hardware(args, motor_ids, model_path, hard_limits, actuator_ids, capped):
     print("\nThe real motors will move.")
     print(f"  model       : {model_path}")
-    print(f"  motor IDs   : {motor_ids}")
     print(f"  max speed   : {args.max_speed:.3f} rad/s ({math.degrees(args.max_speed):.2f} deg/s)")
     print(f"  max accel   : {args.max_accel:.3f} rad/s^2")
-    print("  gains       : " + ", ".join(
-        f"ID {mid} kp {args.kp[mid]:g}/kd {args.kd[mid]:g}" for mid in motor_ids))
-    untabled = gains_without_table_entry(motor_ids)
-    if untabled:
-        print(f"  NOTE: no per-joint gain entry for ID {untabled}; using the fallback kp {args.kp[untabled[0]]:g} / kd {args.kd[untabled[0]]:g}")
+    print_motor_table(args, motor_ids, hard_limits, actuator_ids, capped)
     print("  Keep the robot fixed and the emergency stop ready.")
     if not sys.stdin.isatty():
         raise RuntimeError("Hardware confirmation requires an interactive terminal")
@@ -121,6 +153,17 @@ def confirm_hardware(args, motor_ids, model_path):
     if answer.strip():
         raise RuntimeError("Cancelled because the input was not empty")
 
+
+def dry_run_report(args, motor_ids, model_path, hard_limits, actuator_ids, capped):
+    print("\nDry run: nothing below is sent to a motor.")
+    print(f"  model       : {model_path}")
+    print_motor_table(args, motor_ids, hard_limits, actuator_ids, capped)
+    blockers = channel_problems(motor_ids, args.interface)
+    if attached_robot_model(identity_path()) is None:
+        blockers.append(f"no robot identity file at {identity_path()} (variant came from --robot)")
+    if blockers:
+        print("A real run would stop before enabling:\n  " + "\n  ".join(blockers))
+    print(f"Would enable ID {format_ids(motor_ids)} after the preflight zero check and the Enter confirmation.")
 
 
 def move_to_zero(motors, hubs, starts, limits, args):
@@ -163,17 +206,10 @@ def move_to_zero(motors, hubs, starts, limits, args):
         if now - last_print >= 1.0:
             last_print = now
             print(f"[{time.strftime('%H:%M:%S')}] Moving to zero")
-            print(f"  {'ID':>2} {'joint':<18} {'limited cmd':>12} {'actual':>11}")
-            for mid in sorted(motors):
-                actual = motors[mid].last_position
-                actual_text = (
-                    "--" if actual is None
-                    else f"{math.degrees(wrap_to_pi(actual)):+8.2f}deg"
-                )
-                print(
-                    f"  {mid:>2} {JOINT_MAP[mid]:<18} "
-                    f"{math.degrees(wrap_to_pi(commands[mid])):+9.2f}deg {actual_text:>11}"
-                )
+            print_table(("ID", "joint", "limited cmd", "actual"), [
+                [mid, JOINT_MAP[mid], deg_text(wrap_to_pi(commands[mid])), actual_deg(motors[mid])]
+                for mid in sorted(motors)
+            ])
 
         command_done = all(
             abs(commands[mid] - zero_targets[mid]) <= 1e-12
@@ -219,20 +255,20 @@ def move_to_zero(motors, hubs, starts, limits, args):
 
 
 
-def print_status(motors, commands, targets):
+def actual_deg(motor):
+    actual = motor.last_position
+    return deg_text(None if actual is None else wrap_to_pi(actual))
+
+
+def print_status(motors, commands, targets, actuator_ids):
     print(f"[{time.strftime('%H:%M:%S')}] hardware tracking")
-    print(f"  {'ID':>2} {'joint':<18} {'sim target':>11} {'limited cmd':>12} {'actual':>11}")
-    for mid in sorted(commands):
-        actual = motors[mid].last_position
-        actual_text = (
-            "--" if actual is None
-            else f"{math.degrees(wrap_to_pi(actual)):+8.2f}deg"
-        )
-        print(
-            f"  {mid:>2} {JOINT_MAP[mid]:<18} "
-            f"{math.degrees(targets[mid]):+8.2f}deg "
-            f"{math.degrees(wrap_to_pi(commands[mid])):+9.2f}deg {actual_text:>11}"
-        )
+    print_table(("ID", "joint", "sim target", "limited cmd", "actual", "sim"), [
+        [
+            mid, JOINT_MAP[mid], deg_text(targets[mid]), deg_text(wrap_to_pi(commands[mid])),
+            actual_deg(motors[mid]), sim_state(mid, actuator_ids),
+        ]
+        for mid in sorted(commands)
+    ])
 
 
 def run(args):
@@ -240,16 +276,25 @@ def run(args):
     if problems:
         raise RuntimeError("Argument error:\n  " + "\n  ".join(problems))
 
+    check_gain_table()
     margin_rad = math.radians(args.limit_margin_deg)
-    args.kp, args.kd = motor_gains(motor_ids, args.gain_scale)
-    model_path, model, actuator_ids = load_fixed_model(args.model, motor_ids)
+    args.kp, args.kd, capped = bench_gains(motor_ids, args.gain_scale)
+    model_path, model, variant_actuators = load_fixed_model(args.model, VARIANT_MOTOR_IDS[args.variant])
+    actuator_ids = {mid: aid for mid, aid in variant_actuators.items() if mid in motor_ids}
     profile = verify_model_limits(model, actuator_ids, motor_ids)
     model_limits = profile.joint_limits_by_id()
     hard_limits = {mid: model_limits[mid] if mid in actuator_ids else JOINT_LIMITS_RAD[mid] for mid in motor_ids}
     command_limits = safe_limits(motor_ids, margin_rad, hard_limits)
-    print(f"Robot model: {ROBOT_VARIANTS[args.robot]} (leg limits: {profile.name} profile)")
+    print_banner(
+        args.variant, args.variant_source, motor_ids, variant_actuators, model_path.name,
+        "moved to zero and held there", args.interface,
+    )
+    print(f"Leg limits  : {profile.name} profile")
     roll_pairs = roll_pairs_for(profile, motor_ids)
-    require_robot_model(ROBOT_VARIANTS[args.robot])
+    if args.dry_run:
+        dry_run_report(args, motor_ids, model_path, hard_limits, actuator_ids, capped)
+        return
+    require_robot_model(args.variant, identity_path())
     data = mujoco.MjData(model)
     data.ctrl[:] = 0.0
     mujoco.mj_forward(model, data)
@@ -263,8 +308,8 @@ def run(args):
     limiters = {mid: AxisLimiter(0.0) for mid in motor_ids}
 
     try:
-        buses, motors, hubs = open_hardware(motor_ids, args.interface, args.host_id)
-        idle = stop_idle_motors(buses, motor_ids, args.host_id)
+        buses, motors, hubs = open_checked(open_hardware, motor_ids, args.interface, args.host_id)
+        idle = stop_idle_motors(buses, motor_ids, args.host_id, VARIANT_MOTOR_IDS[args.variant])
         if idle:
             print(f"Stop sent to the other motors on the open buses: {idle}")
         _, zero_failures = inspect_zero_positions(
@@ -275,7 +320,7 @@ def run(args):
                 "Preflight safety check failed; motors will not be enabled:\n  "
                 + "\n  ".join(zero_failures)
             )
-        confirm_hardware(args, motor_ids, model_path)
+        confirm_hardware(args, motor_ids, model_path, hard_limits, actuator_ids, capped)
         stop_ids = list(motor_ids)
         try:
             starts, enabled_ids = enable_with_runtime_feedback(
@@ -353,7 +398,7 @@ def run(args):
 
                 if now - last_print >= 1.0:
                     last_print = now
-                    print_status(motors, commands, targets)
+                    print_status(motors, commands, targets, actuator_ids)
 
                 next_tick += period
                 sleep = next_tick - time.monotonic()
