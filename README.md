@@ -168,7 +168,7 @@ python3 scripts/sysid/analyze_probe.py results/sysid/*_id1_*.csv --output /tmp/p
 
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
-| - | `--motor-id` | `1`–`12` | One or more motor IDs to control |
+| - | `--motor-id` | `1`–`12` | One or more motor IDs to control; `13` (head, no MuJoCo actuator) is moved to zero and held there |
 | - | `--robot` | `edu` | Ver.2 variant: `edu`, `pro` or `max` |
 
 ```bash
@@ -186,12 +186,13 @@ python3 scripts/sim_to_real/mujoco_to_real.py \
 
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
-| - | `--motor-id` | `1`–`12` | One or more motor IDs to read |
+| - | `--motor-id` | `1`–`12` | One or more motor IDs to read; `13` (head) is read and printed, not simulated |
 | - | `--robot` | `edu` | Ver.2 variant: `edu`, `pro` or `max` |
 
 ```bash
 # Example
 python3 scripts/sim_to_real/real_to_mujoco.py --motor-id 4
+python3 scripts/sim_to_real/real_to_mujoco.py --motor-id 13
 
 python3 scripts/sim_to_real/real_to_mujoco.py --robot pro
 ```

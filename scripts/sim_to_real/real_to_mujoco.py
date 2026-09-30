@@ -20,8 +20,10 @@ sys.path.insert(0, str(THIS_FILE.parents[1]))
 from robonex_can import (
     DEFAULT_INTERFACE,
     HOST_ID,
+    JOINT_LIMITS_RAD,
     JOINT_MAP,
     MOTOR_MODELS,
+    POLICY_MOTOR_IDS,
     channel_for_id,
     clamp,
 )
@@ -39,8 +41,8 @@ def parse_args(argv=None):
         dest="motor_id",
         nargs="+",
         type=lambda value: int(value, 0),
-        default=list(range(1, 13)),
-        help="Motor IDs to read. Default: 1 through 12",
+        default=sorted(POLICY_MOTOR_IDS),
+        help="Motor IDs to read. Default: the 12 leg motors; a motor without a MuJoCo actuator (13, head) is read and printed only",
     )
     parser.add_argument("--robot", choices=tuple(ROBOT_VARIANTS), default="edu",
                         help="Ver.2 variant: edu, pro or max. Default: edu")
@@ -205,6 +207,12 @@ def initialize_simulation(model, data, actuator_ids, targets):
     return qpos_addresses
 
 
+def sim_qpos_text(data, qpos_addresses, motor_id):
+    if motor_id not in qpos_addresses:
+        return "not in sim"
+    return f"{math.degrees(data.qpos[qpos_addresses[motor_id]]):+8.2f}deg"
+
+
 def print_status(data, qpos_addresses, positions, targets, clamped):
     print(f"[{time.strftime('%H:%M:%S')}] real -> MuJoCo")
     print(f"  {'ID':>2} {'joint':<18} {'real':>11} {'sim target':>11} {'sim qpos':>11} {'state':>7}")
@@ -214,7 +222,7 @@ def print_status(data, qpos_addresses, positions, targets, clamped):
             f"  {motor_id:>2} {JOINT_MAP[motor_id]:<18} "
             f"{math.degrees(positions[motor_id]):+8.2f}deg "
             f"{math.degrees(targets[motor_id]):+8.2f}deg "
-            f"{math.degrees(data.qpos[qpos_addresses[motor_id]]):+8.2f}deg "
+            f"{sim_qpos_text(data, qpos_addresses, motor_id):>11} "
             f"{state:>7}"
         )
 
@@ -225,6 +233,7 @@ def run(args):
         raise RuntimeError("Argument error:\n  " + "\n  ".join(problems))
     model_path, model, actuator_ids = load_fixed_model(args.model, motor_ids)
     limits = model_limits_rad(model, actuator_ids)
+    limits.update({mid: JOINT_LIMITS_RAD[mid] for mid in motor_ids if mid not in actuator_ids})
     model.opt.gravity[:] = 0.0
     confirm_hardware(args, motor_ids, model_path)
 
@@ -279,7 +288,8 @@ def run(args):
                     )
                     with viewer.lock():
                         for motor_id, target in targets.items():
-                            data.ctrl[actuator_ids[motor_id]] = target
+                            if motor_id in actuator_ids:
+                                data.ctrl[actuator_ids[motor_id]] = target
                         mujoco.mj_step(model, data, nstep=sim_steps)
                         if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
                             raise RuntimeError("MuJoCo state contains NaN or infinity")

@@ -22,7 +22,9 @@ sys.path.insert(0, str(THIS_FILE.parent))
 from robonex_can import (
     DEFAULT_INTERFACE,
     HOST_ID,
+    JOINT_LIMITS_RAD,
     JOINT_MAP,
+    POLICY_MOTOR_IDS,
     clamp,
 )
 
@@ -56,8 +58,8 @@ def parse_args(argv=None):
     )
     parser.add_argument("--motor-id", dest="motor_id",
                         nargs="+", type=lambda v: int(v, 0),
-                        default=list(range(1, 13)),
-                        help="Motor IDs to control. Default: 1 through 12")
+                        default=sorted(POLICY_MOTOR_IDS),
+                        help="Motor IDs to control. Default: the 12 leg motors; a motor without a MuJoCo actuator (13, head) is held at zero")
     parser.add_argument("--robot", choices=tuple(ROBOT_VARIANTS), default="edu",
                         help="Ver.2 variant: edu, pro or max. Default: edu")
     args = parser.parse_args(argv)
@@ -235,8 +237,8 @@ def run(args):
     model_path, model, actuator_ids = load_fixed_model(args.model, motor_ids)
     profile = verify_model_limits(model, actuator_ids, motor_ids)
     model_limits = profile.joint_limits_by_id()
-    hard_limits = {mid: model_limits[mid] for mid in motor_ids}
-    command_limits = safe_limits(motor_ids, margin_rad, model_limits)
+    hard_limits = {mid: model_limits[mid] if mid in actuator_ids else JOINT_LIMITS_RAD[mid] for mid in motor_ids}
+    command_limits = safe_limits(motor_ids, margin_rad, hard_limits)
     print(f"Robot model: {ROBOT_VARIANTS[args.robot]} (leg limits: {profile.name} profile)")
     roll_pairs = roll_pairs_for(profile, motor_ids)
     require_robot_model(ROBOT_VARIANTS[args.robot])
@@ -298,6 +300,9 @@ def run(args):
                         raise RuntimeError("MuJoCo state contains NaN or infinity; motor commands stopped")
                     targets = {}
                     for mid in motor_ids:
+                        if mid not in actuator_ids:
+                            targets[mid] = commands[mid]
+                            continue
                         raw_target = float(data.ctrl[actuator_ids[mid]])
                         if not math.isfinite(raw_target):
                             raise RuntimeError(f"ID {mid} MuJoCo target is NaN or infinite")

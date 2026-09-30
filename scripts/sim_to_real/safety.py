@@ -26,6 +26,7 @@ from robonex_can import (
     JOINT_MAP,
     MOTOR_ACTUATORS,
     MOTOR_MODELS,
+    POLICY_MOTOR_IDS,
     Motor,
     SPECS,
     channel_for_id,
@@ -89,6 +90,7 @@ def safe_limits(motor_ids, margin_rad, limits):
     return result
 
 def verify_model_limits(model, actuator_ids, motor_ids):
+    motor_ids = [mid for mid in motor_ids if mid in actuator_ids]
     got = {mid: tuple(float(v) for v in model.actuator_ctrlrange[actuator_ids[mid]]) for mid in motor_ids}
     matches = []
     for profile in ROBOT_MODELS.values():
@@ -204,7 +206,10 @@ def load_fixed_model(path, motor_ids):
         actuator_name = MOTOR_ACTUATORS[mid]
         aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_name)
         if aid < 0:
-            raise RuntimeError(f"MuJoCo actuator not found: ID {mid} -> {actuator_name}")
+            if mid in POLICY_MOTOR_IDS:
+                raise RuntimeError(f"MuJoCo actuator not found: ID {mid} -> {actuator_name}")
+            print(f"ID {mid} ({actuator_name}) has no actuator in {path.name}; it is held at zero and not simulated")
+            continue
         joint_name = actuator_name + "_joint"
         jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
         if jid < 0 or int(model.actuator_trnid[aid, 0]) != jid:
