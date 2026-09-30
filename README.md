@@ -172,7 +172,7 @@ The variant comes from `~/.config/robonex/robot_model`; CAN channels from `~/.co
 | --- | --- | --- | --- | --- | --- | --- |
 | `left_leg` | `1`–`6` | rs02 / rs03 | `can0` | ✓ | ✓ | ✓ |
 | `right_leg` | `7`–`12` | rs02 / rs03 | `can1` | ✓ | ✓ | ✓ |
-| `head` | `13` neck_pitch, `14` neck_yaw | rs05 | `can4` | `13` | `13` | `13`, `14` |
+| `head` | `13` neck_pitch (`14` reserved for neck yaw, no motor yet) | rs05 | `can4` | `13` | `13` | `13` |
 | `left_arm` | `15`–`18` shoulder_pitch/roll/yaw, elbow | rs02 | `can2` | - | ✓ | ✓ |
 | `right_arm` | `20`–`23` shoulder_pitch/roll/yaw, elbow | rs02 | `can3` | - | ✓ | ✓ |
 
