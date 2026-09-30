@@ -52,6 +52,7 @@ from robonex_can import (
     HOST_ID,
     MECH_POS_INDEX,
     MOTOR_MODELS,
+    stop_idle_motors,
     Motor,
     SPECS,
     clamp,
@@ -1391,6 +1392,9 @@ def run_deploy(policy_path, contract, args):
     })
     try:
         buses, motors, hubs = open_hardware(motor_ids, SETTINGS.interface, SETTINGS.host_id)
+        idle = stop_idle_motors(buses, motor_ids, SETTINGS.host_id)
+        if idle:
+            print(f"Stop sent to the non-policy motors on the open buses: {idle}")
         measured, blocking = inspect_zero_positions(motors, SETTINGS.approach_tolerance_deg * DEG, hard_limits)
         profile = robot_model(contract.robot_model)
         roll_pairs = roll_pairs_for(profile, motor_ids)

@@ -169,6 +169,8 @@ python3 scripts/sysid/analyze_probe.py results/sysid/*_id1_*.csv --output /tmp/p
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
 | - | `--motor-id` | `1`–`12` | One or more motor IDs to control; `13` (head, no MuJoCo actuator) is moved to zero and held there |
+
+Gains come from `robonex-common` `CONTROL_GAINS_BY_JOINT` per motor (hip 100/2, knee 150/4, ankle 40/2); a motor without a table entry (`13`) uses kp 40 / kd 2. Other registered motors on the opened buses get one stop frame at start.
 | - | `--robot` | `edu` | Ver.2 variant: `edu`, `pro` or `max` |
 
 ```bash

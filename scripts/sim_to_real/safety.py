@@ -91,6 +91,13 @@ def safe_limits(motor_ids, margin_rad, limits):
 
 def verify_model_limits(model, actuator_ids, motor_ids):
     motor_ids = [mid for mid in motor_ids if mid in actuator_ids]
+    if not motor_ids:
+        if len(ROBOT_MODELS) != 1:
+            raise RuntimeError(
+                "no selected motor has a MuJoCo actuator, so the robot model cannot be inferred from the model; "
+                "select at least one leg motor"
+            )
+        return next(iter(ROBOT_MODELS.values()))
     got = {mid: tuple(float(v) for v in model.actuator_ctrlrange[actuator_ids[mid]]) for mid in motor_ids}
     matches = []
     for profile in ROBOT_MODELS.values():

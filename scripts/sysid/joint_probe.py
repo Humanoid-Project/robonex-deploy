@@ -18,8 +18,8 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR / "sim_to_real"))
 
 from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
-from robonex_common.joints import JOINT_BY_ID
-from robonex_can import DEFAULT_INTERFACE, HOST_ID, JOINT_MAP, MOTOR_MODELS, SPECS, Motor
+from robonex_common.joints import MOTOR_BY_ID, MOTOR_LIMITS_BY_ID
+from robonex_can import DEFAULT_INTERFACE, HOST_ID, JOINT_MAP, stop_idle_motors
 from robonex_common.models import robot_model
 from safety import (
     LEG_PROFILE,
@@ -35,7 +35,7 @@ from safety import (
 )
 
 MAX_AMPLITUDE_RAD = 0.15
-CONTINUOUS_TORQUE = {"rs02": 6.0, "rs03": 13.0}
+CONTINUOUS_TORQUE = {"rs02": 6.0, "rs03": 13.0, "rs05": 1.2}
 MAX_TARGET_SPEED = 3.0
 MAX_DURATION_S = 120.0
 LIMIT_MARGIN_RAD = math.radians(3.0)
@@ -83,8 +83,10 @@ def parse_args(argv=None):
                         help="fraction of the per-joint walking gains (kp, kd)")
     parser.add_argument("--output", type=Path, help="CSV path; default results/sysid/<stamp>_<id>_<profile>.csv")
     args = parser.parse_args(argv)
-    if args.motor_id not in JOINT_BY_ID:
+    if args.motor_id not in MOTOR_BY_ID:
         parser.error(f"unknown motor id {args.motor_id}")
+    if MOTOR_BY_ID[args.motor_id].model_name not in CONTROL_GAINS_BY_JOINT:
+        parser.error(f"motor id {args.motor_id} ({MOTOR_BY_ID[args.motor_id].model_name}) has no entry in CONTROL_GAINS_BY_JOINT; add one to robonex-common first")
     for name in ("amplitude", "duration", "hold", "period", "f0", "f1", "rate", "gain_scale"):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0.0:
@@ -123,7 +125,7 @@ def parse_args(argv=None):
 
 def run(args):
     mid = args.motor_id
-    spec = JOINT_BY_ID[mid]
+    spec = MOTOR_BY_ID[mid]
     kp_full, kd_full = CONTROL_GAINS_BY_JOINT[spec.model_name]
     kp, kd = kp_full * args.gain_scale, kd_full * args.gain_scale
     step_torque = kp * args.amplitude
@@ -133,7 +135,9 @@ def run(args):
             f"kp {kp:g} x amplitude {args.amplitude:g} rad can demand {step_torque:.1f} N·m, above the "
             f"{spec.motor_model.upper()} continuous {limit:g} N·m; lower --amplitude or --gain-scale"
         )
-    limits = safe_limits([mid], LIMIT_MARGIN_RAD, robot_model(LEG_PROFILE[args.robot_model]).joint_limits_by_id())
+    model_limits = dict(MOTOR_LIMITS_BY_ID)
+    model_limits.update(robot_model(LEG_PROFILE[args.robot_model]).joint_limits_by_id())
+    limits = safe_limits([mid], LIMIT_MARGIN_RAD, model_limits)
     print(f"\nSystem-identification probe: ONE motor, ID {mid} ({JOINT_MAP[mid]}, {spec.model_name}).")
     print(f"  profile {args.profile}, amplitude {args.amplitude:.3f} rad ({math.degrees(args.amplitude):.1f} deg) "
           f"around the position at enable, {args.duration:.1f} s, {args.rate:.0f} Hz, kp {kp:g} kd {kd:g}")
@@ -148,10 +152,7 @@ def run(args):
     status = "completed"
     try:
         buses, motors, hubs = open_hardware([mid], DEFAULT_INTERFACE, HOST_ID)
-        bus = next(iter(buses.values()))
-        for other in sorted(JOINT_BY_ID):
-            if other != mid and JOINT_BY_ID[other].channel == spec.channel:
-                Motor(bus, other, SPECS[MOTOR_MODELS[other]], host_id=HOST_ID).stop()
+        stop_idle_motors(buses, [mid], HOST_ID)
         starts, enabled = enable_with_runtime_feedback(motors, hubs, {mid: kp}, {mid: kd}, limits, enabled_out=enabled)
         center = starts[mid]
         lower, upper = limits[mid]

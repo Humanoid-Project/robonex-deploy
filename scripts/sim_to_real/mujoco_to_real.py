@@ -26,6 +26,9 @@ from robonex_can import (
     JOINT_MAP,
     POLICY_MOTOR_IDS,
     clamp,
+    gains_without_table_entry,
+    motor_gains,
+    stop_idle_motors,
 )
 
 from robonex_can import MOTOR_MODELS
@@ -69,8 +72,7 @@ def parse_args(argv=None):
     args.interface = DEFAULT_INTERFACE
     args.host_id = HOST_ID
     args.rate = 100.0
-    args.kp = 40.0
-    args.kd = 2.0
+    args.gain_scale = 1.0
     args.zero_tolerance_deg = 3.0
     args.limit_margin_deg = 3.0
     args.feedback_timeout = 0.30
@@ -107,6 +109,11 @@ def confirm_hardware(args, motor_ids, model_path):
     print(f"  motor IDs   : {motor_ids}")
     print(f"  max speed   : {args.max_speed:.3f} rad/s ({math.degrees(args.max_speed):.2f} deg/s)")
     print(f"  max accel   : {args.max_accel:.3f} rad/s^2")
+    print("  gains       : " + ", ".join(
+        f"ID {mid} kp {args.kp[mid]:g}/kd {args.kd[mid]:g}" for mid in motor_ids))
+    untabled = gains_without_table_entry(motor_ids)
+    if untabled:
+        print(f"  NOTE: no per-joint gain entry for ID {untabled}; using the fallback kp {args.kp[untabled[0]]:g} / kd {args.kd[untabled[0]]:g}")
     print("  Keep the robot fixed and the emergency stop ready.")
     if not sys.stdin.isatty():
         raise RuntimeError("Hardware confirmation requires an interactive terminal")
@@ -150,7 +157,7 @@ def move_to_zero(motors, hubs, starts, limits, args):
         for mid, motor in motors.items():
             motor.control(
                 pos=commands[mid], vel=velocities[mid],
-                kp=args.kp, kd=args.kd, torque=0.0,
+                kp=args.kp[mid], kd=args.kd[mid], torque=0.0,
             )
 
         if now - last_print >= 1.0:
@@ -234,6 +241,7 @@ def run(args):
         raise RuntimeError("Argument error:\n  " + "\n  ".join(problems))
 
     margin_rad = math.radians(args.limit_margin_deg)
+    args.kp, args.kd = motor_gains(motor_ids, args.gain_scale)
     model_path, model, actuator_ids = load_fixed_model(args.model, motor_ids)
     profile = verify_model_limits(model, actuator_ids, motor_ids)
     model_limits = profile.joint_limits_by_id()
@@ -256,6 +264,9 @@ def run(args):
 
     try:
         buses, motors, hubs = open_hardware(motor_ids, args.interface, args.host_id)
+        idle = stop_idle_motors(buses, motor_ids, args.host_id)
+        if idle:
+            print(f"Stop sent to the other motors on the open buses: {idle}")
         _, zero_failures = inspect_zero_positions(
             motors, math.radians(args.zero_tolerance_deg), hard_limits
         )
@@ -333,7 +344,7 @@ def run(args):
                 for mid, motor in motors.items():
                     motor.control(
                         pos=commands[mid], vel=command_velocities[mid],
-                        kp=args.kp, kd=args.kd, torque=0.0,
+                        kp=args.kp[mid], kd=args.kd[mid], torque=0.0,
                     )
 
                 with viewer.lock():
