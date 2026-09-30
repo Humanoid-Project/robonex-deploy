@@ -17,10 +17,6 @@ REPO_ROOT = THIS_FILE.parents[2]
 sys.path.insert(0, str(THIS_FILE.parent))
 sys.path.insert(0, str(THIS_FILE.parents[1]))
 
-from robonex_common.paths import description_model
-
-DEFAULT_MODEL_PATH = description_model("ver2/mujoco/robot/edu/scene_fixed.xml", anchors=(__file__,))
-
 from robonex_can import (
     DEFAULT_INTERFACE,
     HOST_ID,
@@ -29,7 +25,7 @@ from robonex_can import (
     channel_for_id,
     clamp,
 )
-from safety import load_fixed_model, open_hardware
+from safety import ROBOT_VARIANTS, fixed_model_path, load_fixed_model, open_hardware
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
@@ -46,8 +42,10 @@ def parse_args(argv=None):
         default=list(range(1, 13)),
         help="Motor IDs to read. Default: 1 through 12",
     )
+    parser.add_argument("--robot", choices=tuple(ROBOT_VARIANTS), default="edu",
+                        help="Ver.2 variant: edu, pro or max. Default: edu")
     args = parser.parse_args(argv)
-    args.model = DEFAULT_MODEL_PATH
+    args.model = fixed_model_path(args.robot)
     args.interface = DEFAULT_INTERFACE
     args.host_id = HOST_ID
     args.rate = 30.0

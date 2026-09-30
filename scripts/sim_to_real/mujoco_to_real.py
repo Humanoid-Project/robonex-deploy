@@ -19,7 +19,6 @@ REPO_ROOT = THIS_FILE.parents[2]
 sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(THIS_FILE.parent))
 
-from robonex_common.paths import description_model
 from robonex_can import (
     DEFAULT_INTERFACE,
     HOST_ID,
@@ -34,6 +33,8 @@ from safety import (
     brake_and_stop,
     enable_with_runtime_feedback,
     inspect_zero_positions,
+    ROBOT_VARIANTS,
+    fixed_model_path,
     load_fixed_model,
     open_hardware,
     runtime_safety_reason,
@@ -46,8 +47,6 @@ from safety import (
     wrap_to_pi,
 )
 
-DEFAULT_MODEL_PATH = description_model("ver2/mujoco/robot/edu/scene_fixed.xml", anchors=(__file__,))
-
 ZERO_SETTLE_TIMEOUT = 5.0
 
 
@@ -59,8 +58,10 @@ def parse_args(argv=None):
                         nargs="+", type=lambda v: int(v, 0),
                         default=list(range(1, 13)),
                         help="Motor IDs to control. Default: 1 through 12")
+    parser.add_argument("--robot", choices=tuple(ROBOT_VARIANTS), default="edu",
+                        help="Ver.2 variant: edu, pro or max. Default: edu")
     args = parser.parse_args(argv)
-    args.model = DEFAULT_MODEL_PATH
+    args.model = fixed_model_path(args.robot)
     args.max_speed = 0.10
     args.max_accel = 0.25
     args.interface = DEFAULT_INTERFACE
@@ -236,9 +237,9 @@ def run(args):
     model_limits = profile.joint_limits_by_id()
     hard_limits = {mid: model_limits[mid] for mid in motor_ids}
     command_limits = safe_limits(motor_ids, margin_rad, model_limits)
-    print(f"Robot model: {profile.name} (from the MuJoCo actuator limits)")
+    print(f"Robot model: {ROBOT_VARIANTS[args.robot]} (leg limits: {profile.name} profile)")
     roll_pairs = roll_pairs_for(profile, motor_ids)
-    require_robot_model(profile.name)
+    require_robot_model(ROBOT_VARIANTS[args.robot])
     data = mujoco.MjData(model)
     data.ctrl[:] = 0.0
     mujoco.mj_forward(model, data)

@@ -12,7 +12,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Robot identity: the model physically attached (ver2_edu); every motor-enabling script checks it
+# Robot identity: the model physically attached (ver2_edu, ver2_pro or ver2_max); every motor-enabling script checks it
 mkdir -p ~/.config/robonex && echo ver2_edu > ~/.config/robonex/robot_model
 ```
 
@@ -38,7 +38,6 @@ robonex-deploy/
 │   ├── sim_to_real/
 │   │   ├── safety.py
 │   │   ├── mujoco_to_real.py
-│   │   ├── process_mujoco_to_real.py
 │   │   └── real_to_mujoco.py
 │   └── policy_test/
 │       ├── CMakeLists.txt
@@ -129,7 +128,7 @@ Drives ONE motor of a hung robot around its current position and logs feedback a
 | --- | --- | --- | --- |
 | - | `--motor-id` | `Required` | The single motor to move |
 | - | `--profile` | `Required` | `step` (latency), `triangle` (hysteresis), `chirp` (frequency response) |
-| - | `--robot-model` | `Required` | `ver2_edu`; the robonex-common joint limits that bound the probe |
+| - | `--robot-model` | `Required` | `ver2_edu`, `ver2_pro` or `ver2_max`; must match the robot identity |
 | - | `--amplitude` | `0.05` | rad, at most 0.15 |
 | - | `--duration` | `20.0` | s, at most 120 |
 | - | `--hold` | `1.0` | step: seconds per level |
@@ -170,29 +169,15 @@ python3 scripts/sysid/analyze_probe.py results/sysid/*_id1_*.csv --output /tmp/p
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
 | - | `--motor-id` | `1`–`12` | One or more motor IDs to control |
+| - | `--robot` | `edu` | Ver.2 variant: `edu`, `pro` or `max` |
 
 ```bash
 # Example
 python3 scripts/sim_to_real/mujoco_to_real.py \
   --motor-id 4
-```
 
-<br>
-
-### `process_mujoco_to_real.py`
-
-| Command | Option | Default | Description |
-| --- | --- | --- | --- |
-| - | `--motor-id` | `1`–`12` | One or more motor IDs to control |
-| - | `--time-scale` | `1.0` | Sequence duration multiplier |
-| - | `--dry-run` | Off | Validate without CAN |
-
-```bash
-# Example
-python3 scripts/sim_to_real/process_mujoco_to_real.py --dry-run
-
-python3 scripts/sim_to_real/process_mujoco_to_real.py \
-  --time-scale 2
+python3 scripts/sim_to_real/mujoco_to_real.py \
+  --robot pro
 ```
 
 <br>
@@ -202,10 +187,13 @@ python3 scripts/sim_to_real/process_mujoco_to_real.py \
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
 | - | `--motor-id` | `1`–`12` | One or more motor IDs to read |
+| - | `--robot` | `edu` | Ver.2 variant: `edu`, `pro` or `max` |
 
 ```bash
 # Example
 python3 scripts/sim_to_real/real_to_mujoco.py --motor-id 4
+
+python3 scripts/sim_to_real/real_to_mujoco.py --robot pro
 ```
 
 <br>

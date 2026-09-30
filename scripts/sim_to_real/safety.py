@@ -1,7 +1,7 @@
 """Shared hardware-facing helpers for the sim_to_real teaching tools.
 
-Both mujoco_to_real.py and process_mujoco_to_real.py drive the real motors through
-these; the per-script speed/accel caps stay in the scripts themselves.
+mujoco_to_real.py and joint_probe.py drive the real motors through these; the
+per-script speed/accel caps stay in the scripts themselves.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from robonex_common.can import drain
 from robonex_common.foot_roll import clip_foot_roll, foot_roll
 from robonex_common.joints import JOINT_BY_MODEL_NAME
 from robonex_common.models import ROBOT_MODELS
+from robonex_common.paths import description_model
 
 from robonex_can import (
     FeedbackHub,
@@ -103,6 +104,12 @@ def verify_model_limits(model, actuator_ids, motor_ids):
     return matches[0]
 
 ROBOT_IDENTITY_FILE = Path.home() / ".config" / "robonex" / "robot_model"
+ROBOT_VARIANTS = {"edu": "ver2_edu", "pro": "ver2_pro", "max": "ver2_max"}
+LEG_PROFILE = {identity: "ver2_edu" for identity in ROBOT_VARIANTS.values()}
+
+
+def fixed_model_path(robot):
+    return description_model(f"ver2/mujoco/robot/{robot}/scene_fixed.xml", anchors=(__file__,))
 
 
 def attached_robot_model(path=None):
@@ -117,13 +124,14 @@ def attached_robot_model(path=None):
 def require_robot_model(expected, path=None):
     path = ROBOT_IDENTITY_FILE if path is None else Path(path)
     attached = attached_robot_model(path)
-    known = ", ".join(sorted(ROBOT_MODELS))
+    known_names = set(ROBOT_MODELS) | set(ROBOT_VARIANTS.values())
+    known = ", ".join(sorted(known_names))
     if attached is None:
         raise RuntimeError(
             f"No robot identity: write the attached robot's model ({known}) to {path}, e.g. "
             f"`mkdir -p {path.parent} && echo ver2_edu > {path}`. Motors will not be enabled."
         )
-    if attached not in ROBOT_MODELS:
+    if attached not in known_names:
         raise RuntimeError(f"{path} names an unknown robot model {attached!r} (known: {known})")
     if attached != expected:
         raise RuntimeError(
