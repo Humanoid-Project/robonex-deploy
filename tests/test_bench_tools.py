@@ -1,6 +1,7 @@
 import builtins
 import importlib.util
 import json
+import math
 import os
 import sys
 import tempfile
@@ -19,6 +20,7 @@ import bench
 import safety
 import mujoco_to_real
 import real_to_mujoco
+from robonex_common.joints import MOTOR_LIMITS_BY_ID
 from robonex_common.protocol import COMM_STOP, parse_arbitration_id
 
 _spec = importlib.util.spec_from_file_location("joint_probe", DEPLOY / "scripts" / "sysid" / "joint_probe.py")
@@ -208,7 +210,16 @@ def test_placeholder_banner_wording(capsys):
     ids = [15, 16, 17, 18]
     bench.print_banner("ver2_pro", "test", ids, {mid: mid for mid in ids}, "model.xml", interface="virtual")
     out = capsys.readouterr().out
-    assert "PLACEHOLDER : limits of ID 15–18 equal the common placeholder values (±30° head, ±45° arms)" in out
+    placeholders = [
+        mid for mid in ids
+        if any(math.isclose(MOTOR_LIMITS_BY_ID[mid][0], -math.radians(d), abs_tol=1e-5)
+               and math.isclose(MOTOR_LIMITS_BY_ID[mid][1], math.radians(d), abs_tol=1e-5) for d in (30.0, 45.0))
+    ]
+    if placeholders:
+        assert (f"PLACEHOLDER : limits of ID {bench.format_ids(placeholders)} equal the common placeholder values "
+                "(±30° head, ±45° arms)") in out
+    else:
+        assert "PLACEHOLDER" not in out
     assert "unmeasured" not in out
 
 
