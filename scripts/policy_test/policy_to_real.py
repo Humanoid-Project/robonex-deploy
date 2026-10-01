@@ -322,6 +322,7 @@ class ImuSource:
         self._last_seq_time = 0.0
         self._last_imu_frames = None
         self._last_imu_time = 0.0
+        self.last_sample = None
 
     def start(self, calibrate):
         self.driver = n100.ImuDriver(
@@ -378,6 +379,7 @@ class ImuSource:
 
     def read(self, now):
         sample = None if self.driver is None else self.driver.latest()
+        self.last_sample = sample
         if sample is None:
             return (0.0, 0.0, 0.0), (0.0, 0.0, -1.0), None
         if sample.seq != self._last_seq:
@@ -403,6 +405,42 @@ class ImuSource:
         if age > self.settings.imu_stale_timeout:
             return f"IMU sample is stale ({age:.3f} s > {self.settings.imu_stale_timeout:.3f} s)"
         return None
+
+
+TIMING_COLUMNS = ("imu_host_age_ms", "imu_device_dt_ms", "imu_host_dt_ms", "imu_seq_gap", "tick_period_ms")
+
+
+class TimingProbe:
+    def __init__(self):
+        self.previous_tick = None
+        self.previous_seq = None
+        self.previous_device_us = None
+        self.previous_host_ns = None
+
+    def update(self, tick, sample, read_ns):
+        tick_period_ms = None if self.previous_tick is None else (tick - self.previous_tick) * 1000.0
+        self.previous_tick = tick
+        if sample is None:
+            return (None, None, None, None, tick_period_ms)
+        seq = int(sample.seq)
+        device_us = int(sample.device_timestamp_us)
+        host_ns = int(sample.host_timestamp_ns)
+        host_age_ms = (read_ns - host_ns) / 1.0e6
+        device_dt_ms = None if self.previous_device_us is None else (device_us - self.previous_device_us) / 1000.0
+        host_dt_ms = None if self.previous_host_ns is None else (host_ns - self.previous_host_ns) / 1.0e6
+        seq_gap = None if self.previous_seq is None else seq - self.previous_seq - 1
+        self.previous_seq = seq
+        self.previous_device_us = device_us
+        self.previous_host_ns = host_ns
+        return (host_age_ms, device_dt_ms, host_dt_ms, seq_gap, tick_period_ms)
+
+
+def timing_cells(timing):
+    if timing is None:
+        return [""] * len(TIMING_COLUMNS)
+    host_age_ms, device_dt_ms, host_dt_ms, seq_gap, tick_period_ms = timing
+    return [_round(host_age_ms, 3), _round(device_dt_ms, 3), _round(host_dt_ms, 3),
+            "" if seq_gap is None else int(seq_gap), _round(tick_period_ms, 3)]
 
 
 class PolicyRunner:
@@ -820,6 +858,7 @@ def run_read(policy_path, contract, args):
     # instead: otherwise the preview shows a frozen phase and the policy it displays is not
     # the one the robot would run.
     started_at = time.monotonic()
+    timing = TimingProbe() if read_log is not None else None
     try:
         while deadline is None or time.monotonic() < deadline:
             now = time.monotonic()
@@ -827,10 +866,12 @@ def run_read(policy_path, contract, args):
             snapshot = joints.snapshot()
             positions, velocities, missing = runner.joint_state(snapshot)
             angular_velocity, gravity, age = imu.read(now)
+            imu_read_ns = time.monotonic_ns()
             observation = runner.observation(positions, velocities, angular_velocity, gravity)
             raw_action, _, targets = runner.step(observation, commit=True)
             if read_log is not None:
-                read_log.record(now, observation, gravity, angular_velocity, age, positions, missing)
+                read_log.record(now, observation, gravity, angular_velocity, age, positions, missing,
+                                timing=timing.update(now, imu.last_sample, imu_read_ns))
             step += 1
             if (step - 1) % print_every:
                 sleep = period - (time.monotonic() - now)
@@ -967,11 +1008,12 @@ class ReadRecorder:
                   "gyro_x", "gyro_y", "gyro_z", "imu_age_ms", "missing_ids"]
         header += [f"gait_{i}" for i in range(10)]
         header += [f"{n.replace('_joint','')}.pos" for n in contract.joint_order]
+        header += list(TIMING_COLUMNS)
         self.writer.writerow(header)
         self.handle.flush()
         self.started = None
 
-    def record(self, now, observation, gravity, gyro, age, positions, missing):
+    def record(self, now, observation, gravity, gyro, age, positions, missing, timing=None):
         if self.started is None:
             self.started = now
         row = [round(now - self.started, 3)]
@@ -981,6 +1023,7 @@ class ReadRecorder:
         row += ["|".join(str(m) for m in sorted(missing)) if missing else ""]
         row += [round(float(v), 5) for v in observation[165:175]]
         row += [round(float(v), 5) for v in positions]
+        row += timing_cells(timing)
         self.writer.writerow(row)
         self.handle.flush()
 
@@ -1020,6 +1063,7 @@ class TelemetryRecorder:
                 f"{short}.temp", f"{short}.fault", f"{short}.raw_action",
                 f"{short}.target", f"{short}.commanded", f"{short}.rx_age_ms",
             ]
+        header += list(TIMING_COLUMNS)
         header.append("stop_reason")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
@@ -1040,7 +1084,7 @@ class TelemetryRecorder:
 
     def record(self, now, started, dt, inference_ms, ramp, raw_action, targets, commands,
                gravity=None, gyro=None, imu_age=None, velocity_command=None, stop_reason="",
-               send_ms=None):
+               send_ms=None, timing=None):
         wall = time.time()
         row = [
             round(now - started, 4), round(wall, 6), self.step, round(dt * 1000.0, 3),
@@ -1071,6 +1115,7 @@ class TelemetryRecorder:
             ]
             rx = getattr(motor, "last_rx_kernel_time", None)
             row.append(round((wall - rx) * 1000.0, 3) if rx else "")
+        row += timing_cells(timing)
         row.append(stop_reason)
         self.rows.append(row)
         self.step += 1
@@ -1192,6 +1237,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
         if getattr(args, "telemetry", None)
         else None
     )
+    timing = TimingProbe() if telemetry is not None else None
     if telemetry is not None:
         print(f"Telemetry   : {telemetry.path}  ({contract.policy_hz:.0f} Hz per-motor record)")
         print(f"Provenance  : {telemetry.write_sidecar(runner.policy_path, contract, SETTINGS, args).name}")
@@ -1226,6 +1272,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
             if missing:
                 raise stop(f"no feedback for motor IDs {sorted(missing)}")
             angular_velocity, gravity, age = imu.read(now)
+            imu_read_ns = time.monotonic_ns()
             imu_reason = imu.failure_reason(age)
             if imu_reason:
                 raise stop(imu_reason)
@@ -1278,6 +1325,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     gravity=gravity, gyro=angular_velocity, imu_age=age,
                     velocity_command=tuple(float(v) for v in runner.velocity_command),
                     send_ms=send_ms,
+                    timing=timing.update(now, imu.last_sample, imu_read_ns),
                 )
 
             if now - last_status >= 1.0 / SETTINGS.status_hz:
@@ -1633,7 +1681,9 @@ def parse_args(argv=None):
         const="",
         metavar="PATH",
         help="Write a per-policy-step CSV: per-motor feedback age, position, velocity, torque, "
-             "temperature and fault, plus raw action, clipped target and commanded position. "
+             "temperature and fault, plus raw action, clipped target and commanded position, "
+             "and log-only timing columns (IMU host age, device and host sample spacing, "
+             "seq gap, actual tick period) for scripts/analysis/timing_report.py. "
              "Omit PATH for an automatic timestamped file under results/policy_to_real. "
              "An existing file is never overwritten",
     )

@@ -29,7 +29,8 @@ robonex-deploy/
 ├── scripts/
 │   ├── robonex_can.py
 │   ├── analysis/
-│   │   └── scenario_metrics.py
+│   │   ├── scenario_metrics.py
+│   │   └── timing_report.py
 │   ├── sysid/
 │   │   ├── joint_probe.py
 │   │   └── analyze_probe.py
@@ -115,6 +116,31 @@ Per-command-segment metrics for hardware telemetry and Isaac/MuJoCo traces: spee
 python3 scripts/analysis/scenario_metrics.py \
   results/policy_to_real/<stamp>_live_telemetry.csv \
   --output /tmp/metrics.json
+```
+
+<br>
+
+### `timing_report.py`
+
+IMU host age (mean, p50, p95, max), phase drift per window, device-vs-host clock rate, seq gaps, tick period jitter, and per-joint feedback age from a `policy_to_real.py --telemetry` CSV; stop rows are skipped.
+
+| Command | Option | Default | Description |
+| --- | --- | --- | --- |
+| - | `csv` | `Required` | One or more `*_live_telemetry.csv` or `*_read_telemetry.csv` |
+| - | `--d0-ms` | Unknown | Fixed IMU delay before the host stamp (ms); unknown prints the bound as a function of d0 |
+| - | `--budget-ms` | `15.0` | Trained IMU age range upper end (ms); the check is host age max <= budget - d0 |
+| - | `--window` | `5.0` | Phase-drift window (s) |
+| - | `--output` | - | JSON output path |
+
+```bash
+# Example
+python3 scripts/analysis/timing_report.py \
+  results/policy_to_real/<stamp>_read_telemetry.csv
+
+python3 scripts/analysis/timing_report.py \
+  results/policy_to_real/<stamp>_live_telemetry.csv \
+  --d0-ms 3.5 \
+  --output /tmp/timing.json
 ```
 
 <br>
@@ -257,7 +283,25 @@ python3 scripts/policy_test/policy_to_real.py \
   --scenario "0:0,0,0;10:0.1,0,0;20:0.2,0,0" \
   --telemetry \
   --log
+
+# Read-only timing capture, no motor commanded
+python3 scripts/policy_test/policy_to_real.py \
+  --policy policies/<run>/policy.onnx \
+  --read \
+  --duration 60 \
+  --telemetry
 ```
+
+| Output | Description |
+| --- | --- |
+| `imu_age_ms` | Time since the loop last saw a new AHRS seq or raw-IMU frame count (the stale-stop input); about 0 on a healthy stream |
+| `imu_host_age_ms` | Monotonic time right after `imu.read` minus `sample.host_timestamp_ns` (AHRS publish to policy read); excludes the device/wire delay d0 and the raw-gyro hold |
+| `imu_device_dt_ms` | Difference of consecutive ticks' `device_timestamp_us` (AHRS device clock) |
+| `imu_host_dt_ms` | Difference of consecutive ticks' `host_timestamp_ns` |
+| `imu_seq_gap` | Seq difference minus 1 between consecutive ticks; `-1` = the same sample read twice |
+| `tick_period_ms` | Unclamped period between loop ticks (`dt_ms` is the clamped slew dt) |
+| `<joint>.age_ms` | Live only: time since `FeedbackHub.pump` drained the joint's last type 0x02 frame, taken when the row is written (after send); drain-time age, one stamp per pump batch, not acquisition age |
+| `<joint>.rx_age_ms` | Live only: wall time when the row is written minus the socketcan kernel receive timestamp of that frame |
 
 <br>
 
