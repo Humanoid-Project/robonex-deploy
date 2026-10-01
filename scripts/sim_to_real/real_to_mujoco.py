@@ -46,7 +46,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Mirror hand-moved RoboNex mechPos values into fixed-base MuJoCo. "
-            "Only stop messages are sent at startup and shutdown."
+            "Sends only parameter reads (mechPos) and, except with --once, stop frames at startup and shutdown."
         )
     )
     parser.add_argument(
@@ -54,7 +54,7 @@ def parse_args(argv=None):
         dest="motor_id",
         nargs="+",
         metavar="MOTOR",
-        help=selection_help() + ". A motor without a MuJoCo actuator (head, arms) is read and printed only",
+        help=selection_help() + ". A motor without a MuJoCo actuator on the attached variant is read and printed only",
     )
     parser.add_argument("--robot", choices=(*ROBOT_VARIANTS, *ROBOT_VARIANTS.values()),
                         help="Variant check: must match the robot identity file; without that file it sets the variant")

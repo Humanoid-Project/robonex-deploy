@@ -18,10 +18,10 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR / "sim_to_real"))
 
 from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
-from robonex_common.joints import MOTOR_BY_ID, MOTOR_LIMITS_BY_ID, VARIANT_MOTOR_IDS
+from robonex_common.joints import ALL_MOTORS, MOTOR_BY_ID, MOTOR_LIMITS_BY_ID, VARIANT_MOTOR_IDS
 from robonex_can import DEFAULT_INTERFACE, HOST_ID, JOINT_MAP, stop_idle_motors
 from robonex_common.models import robot_model
-from bench import format_ids
+from bench import format_ids, identity_path
 from safety import (
     LEG_PROFILE,
     ROBOT_VARIANTS,
@@ -146,17 +146,21 @@ def run(args):
     print(f"  profile {args.profile}, amplitude {args.amplitude:.3f} rad ({math.degrees(args.amplitude):.1f} deg) "
           f"around the position at enable, {args.duration:.1f} s, {args.rate:.0f} Hz, kp {kp:g} kd {kd:g}")
     print(f"  worst-case PD torque demand {step_torque:.1f} N·m (continuous rating {limit:g} N·m)")
+    variant_ids = VARIANT_MOTOR_IDS[args.robot_model]
+    idle_ids = [joint.motor_id for joint in ALL_MOTORS
+                if joint.motor_id in variant_ids and joint.channel == spec.channel and joint.motor_id != mid]
     print("  The robot must hang so that this joint moves freely; all other motors stay disabled.")
+    print(f"  Stop frame first to the other {args.robot_model} motors on {spec.channel}: {format_ids(idle_ids)}")
     print("  Ctrl-C brakes and stops. Keep the emergency stop within reach.")
-    require_robot_model(args.robot_model)
-    input("Press Enter to enable the motor and start, or Ctrl-C to cancel: ")
 
     buses, motors, hubs, enabled = {}, {}, {}, []
     rows = []
     status = "completed"
     try:
+        require_robot_model(args.robot_model, identity_path())
+        input("Press Enter to enable the motor and start, or Ctrl-C to cancel: ")
         buses, motors, hubs = open_hardware([mid], DEFAULT_INTERFACE, HOST_ID)
-        stop_idle_motors(buses, [mid], HOST_ID)
+        stop_idle_motors(buses, [mid], HOST_ID, variant_ids)
         starts, enabled = enable_with_runtime_feedback(motors, hubs, {mid: kp}, {mid: kd}, limits, enabled_out=enabled)
         center = starts[mid]
         lower, upper = limits[mid]

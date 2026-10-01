@@ -140,7 +140,10 @@ def fixed_model_path(robot):
 
 def require_robot_model(expected, path=None):
     path = ROBOT_IDENTITY_FILE if path is None else Path(path)
-    attached = attached_robot_model(path)
+    try:
+        attached = attached_robot_model(path)
+    except ValueError as error:
+        raise RuntimeError(f"{error}. Motors will not be enabled.") from None
     known_names = set(ROBOT_MODELS) | set(ROBOT_VARIANTS.values())
     known = ", ".join(sorted(known_names))
     if attached is None:

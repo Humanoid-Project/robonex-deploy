@@ -76,7 +76,7 @@ def parse_args(argv=None):
         description="Track fixed-base MuJoCo targets with RoboNex motors."
     )
     parser.add_argument("--motor-id", dest="motor_id", nargs="+", metavar="MOTOR",
-                        help=selection_help() + ". A motor without a MuJoCo actuator (head, arms) is moved to zero and held there")
+                        help=selection_help() + ". A motor without a MuJoCo actuator on the attached variant is moved to zero and held there")
     parser.add_argument("--robot", choices=(*ROBOT_VARIANTS, *ROBOT_VARIANTS.values()),
                         help="Check only: must match the robot identity file, which sets the variant")
     parser.add_argument("--dry-run", action="store_true",

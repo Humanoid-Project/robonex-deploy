@@ -41,6 +41,8 @@ def attached_robot_model(path=None):
         value = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return None
+    except OSError as error:
+        raise ValueError(f"cannot read the robot identity file {path}: {error.strerror or error}") from None
     return value or None
 
 
@@ -240,8 +242,8 @@ def print_banner(variant, source, motor_ids, actuator_ids, model_name, not_in_si
         print(f"Not in sim  : {len(not_simulated)} selected — {format_ids(not_simulated)} ({not_in_sim})")
     placeholders = placeholder_ids(motor_ids)
     if placeholders:
-        print(f"PLACEHOLDER : limits and gains of ID {format_ids(placeholders)} are unmeasured placeholders "
-              "(±30° head, ±45° arms; kp/kd from robonex-common)")
+        print(f"PLACEHOLDER : limits of ID {format_ids(placeholders)} equal the common placeholder values "
+              "(±30° head, ±45° arms); kp/kd from robonex-common")
 
 
 def print_table(headers, rows, indent="  "):
