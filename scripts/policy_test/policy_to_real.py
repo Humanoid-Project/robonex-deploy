@@ -408,6 +408,19 @@ class ImuSource:
 
 
 TIMING_COLUMNS = ("imu_host_age_ms", "imu_device_dt_ms", "imu_host_dt_ms", "imu_seq_gap", "tick_period_ms")
+TIMING_SAMPLE_FIELDS = ("seq", "device_timestamp_us", "host_timestamp_ns")
+
+
+def missing_timing_fields(sample):
+    if sample is None:
+        return list(TIMING_SAMPLE_FIELDS)
+    missing = []
+    for name in TIMING_SAMPLE_FIELDS:
+        try:
+            int(getattr(sample, name))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            missing.append(name)
+    return missing
 
 
 class TimingProbe:
@@ -416,6 +429,20 @@ class TimingProbe:
         self.previous_seq = None
         self.previous_device_us = None
         self.previous_host_ns = None
+        self.error = None
+
+    def safe_update(self, tick, sample, read_ns):
+        try:
+            return self.update(tick, sample, read_ns)
+        except Exception as error:
+            if self.error is None:
+                self.error = f"{type(error).__name__}: {error}"
+            return None
+
+    def warning(self):
+        if self.error is None:
+            return None
+        return f"Warning: timing telemetry failed and its cells are blank from the first failure on ({self.error})"
 
     def update(self, tick, sample, read_ns):
         tick_period_ms = None if self.previous_tick is None else (tick - self.previous_tick) * 1000.0
@@ -871,7 +898,7 @@ def run_read(policy_path, contract, args):
             raw_action, _, targets = runner.step(observation, commit=True)
             if read_log is not None:
                 read_log.record(now, observation, gravity, angular_velocity, age, positions, missing,
-                                timing=timing.update(now, imu.last_sample, imu_read_ns))
+                                timing=timing.safe_update(now, imu.last_sample, imu_read_ns))
             step += 1
             if (step - 1) % print_every:
                 sleep = period - (time.monotonic() - now)
@@ -908,6 +935,8 @@ def run_read(policy_path, contract, args):
         if read_log is not None:
             read_log.close()
             print(f"Recorded to {read_log.path}")
+            if timing.warning():
+                print(timing.warning())
         print("Stopped. No motor was enabled or commanded.")
     return 0
 
@@ -1325,7 +1354,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     gravity=gravity, gyro=angular_velocity, imu_age=age,
                     velocity_command=tuple(float(v) for v in runner.velocity_command),
                     send_ms=send_ms,
-                    timing=timing.update(now, imu.last_sample, imu_read_ns),
+                    timing=timing.safe_update(now, imu.last_sample, imu_read_ns),
                 )
 
             if now - last_status >= 1.0 / SETTINGS.status_hz:
@@ -1402,6 +1431,8 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
     finally:
         if telemetry is not None:
             telemetry.close()
+            if timing.warning():
+                print(timing.warning())
 
 
 def run_deploy(policy_path, contract, args):
@@ -1454,6 +1485,13 @@ def run_deploy(policy_path, contract, args):
             )
         if not imu.start(calibrate=True):
             raise RuntimeError("IMU is not usable; motors will not be enabled:\n  " + "\n  ".join(notes))
+        if getattr(args, "telemetry", None):
+            missing_fields = missing_timing_fields(imu.driver.latest())
+            if missing_fields:
+                raise RuntimeError(
+                    f"IMU sample lacks the timing fields {missing_fields} that --telemetry records; "
+                    "motors will not be enabled. Rebuild the n100 binding or run without --telemetry"
+                )
 
         print("\nThe real motors will move under policy control.")
         print(f"  policy      : {policy_path}")

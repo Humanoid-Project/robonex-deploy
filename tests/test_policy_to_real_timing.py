@@ -62,7 +62,7 @@ def modules(tmp_path_factory):
             check=True, capture_output=True, text=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError) as error:
-        pytest.skip(f"baseline {BASELINE_COMMIT} not readable: {error}")
+        pytest.fail(f"baseline {BASELINE_COMMIT} not readable: {error}")
     base_dir = tmp_path_factory.mktemp("baseline") / "scripts" / "policy_test"
     base_dir.mkdir(parents=True)
     base_path = base_dir / "policy_to_real_baseline.py"
@@ -254,6 +254,10 @@ def run_loop(module, contract, telemetry_path, duration=3.0):
     return control_log, session.observations
 
 
+def command_bytes(commands):
+    return np.asarray(commands, dtype=np.float64).tobytes()
+
+
 def read_csv(path):
     with open(path, newline="") as handle:
         return list(csv.DictReader(handle))
@@ -272,9 +276,10 @@ def test_policy_loop_commands_and_observations_unchanged(modules, tmp_path, caps
     steps = len(new_obs)
     assert steps >= 150 and len(base_obs) == steps
     assert len(base_commands) == len(new_commands) == steps * 12
-    assert base_commands == new_commands
+    assert command_bytes(base_commands) == command_bytes(new_commands)
     for a, b in zip(base_obs, new_obs):
-        assert np.array_equal(a, b)
+        assert a.dtype == b.dtype and a.shape == b.shape
+        assert a.tobytes() == b.tobytes()
     assert any(abs(pos) > 1e-3 for _, pos, *_ in new_commands)
 
     if with_telemetry:
@@ -284,6 +289,13 @@ def test_policy_loop_commands_and_observations_unchanged(modules, tmp_path, caps
         assert set(new_rows[0]) - set(base_rows[0]) == added
         for old_row, new_row in zip(base_rows, new_rows):
             assert {k: new_row[k] for k in old_row} == old_row
+        base_lines, new_lines = base_csv.read_bytes().splitlines(), new_csv.read_bytes().splitlines()
+        assert len(base_lines) == len(new_lines) == steps + 1
+        for old_line, new_line in zip(base_lines, new_lines):
+            old_prefix, old_stop = old_line.rsplit(b",", 1)
+            new_prefix, *timing_cells, new_stop = new_line.rsplit(b",", len(added) + 1)
+            assert len(timing_cells) == len(added)
+            assert (old_prefix, old_stop) == (new_prefix, new_stop)
         ages = [float(r["imu_host_age_ms"]) for r in new_rows]
         assert ages == pytest.approx([6.3] * steps, abs=1e-6)
         assert all(float(r["tick_period_ms"]) == pytest.approx(20.0, abs=1e-6) for r in new_rows[1:])
@@ -424,3 +436,184 @@ def test_timing_report_on_policy_loop_output(modules, timing_report, tmp_path, c
     assert result["imu_seq_gap"]["histogram"] == {"1": len(observations) - 1}
     assert result["tick_period_ms"]["mean"] == pytest.approx(20.0, abs=1e-6)
     assert len(result["joint_fb_age_ms"]) == 12 and len(result["joint_rx_age_ms"]) == 12
+
+
+def test_policy_loop_survives_failing_probe(modules, tmp_path, capsys, monkeypatch):
+    _, new = modules
+    contract = make_contract()
+    clean_commands, clean_obs = run_loop(new, contract, tmp_path / "clean.csv")
+    original = new.TimingProbe.update
+    calls = []
+
+    def failing(self, tick, sample, read_ns):
+        calls.append(tick)
+        if len(calls) > 50:
+            raise AttributeError("device_timestamp_us")
+        return original(self, tick, sample, read_ns)
+
+    monkeypatch.setattr(new.TimingProbe, "update", failing)
+    path = tmp_path / "failing.csv"
+    commands, observations = run_loop(new, contract, path)
+    printed = capsys.readouterr().out
+    assert len(observations) == len(clean_obs) >= 150
+    assert command_bytes(commands) == command_bytes(clean_commands)
+    rows = read_csv(path)
+    assert len(rows) == len(observations)
+    assert all(rows[i]["imu_host_age_ms"] != "" for i in range(50))
+    assert all(all(row[c] == "" for c in new.TIMING_COLUMNS) for row in rows[50:])
+    assert all(row["stop_reason"] == "" for row in rows)
+    assert printed.count("timing telemetry failed") == 1
+
+
+class FieldlessImuDriver(FakeImuDriver):
+    def latest(self):
+        sample = super().latest()
+        del sample.device_timestamp_us
+        del sample.host_timestamp_ns
+        return sample
+
+
+class ReachedEnable(Exception):
+    pass
+
+
+def run_deploy_until_enable(module, monkeypatch, driver_class, telemetry):
+    events = []
+
+    def start(self, calibrate):
+        self.driver = driver_class(FakeClock())
+        self.status = "ready"
+        return True
+
+    def enable(*args, **kwargs):
+        events.append("enable")
+        raise ReachedEnable()
+
+    monkeypatch.setattr(module, "verify_common_source", lambda contract: None)
+    monkeypatch.setattr(module, "require_robot_model", lambda name: None)
+    monkeypatch.setattr(module, "open_hardware", lambda ids, interface, host_id: ({}, {}, {}))
+    monkeypatch.setattr(module, "stop_idle_motors", lambda buses, ids, host_id: [])
+    monkeypatch.setattr(module, "inspect_zero_positions", lambda motors, tolerance, limits: ({}, []))
+    monkeypatch.setattr(module, "roll_pairs_for", lambda profile, ids: [])
+    monkeypatch.setattr(module, "confirm", lambda prompt: events.append("confirm"))
+    monkeypatch.setattr(module, "enable_with_runtime_feedback", enable)
+    monkeypatch.setattr(module, "brake_and_stop", lambda *args: events.append("brake"))
+    monkeypatch.setattr(module, "shutdown_report_lines", lambda report: [])
+    monkeypatch.setattr(module.ImuSource, "start", start)
+    monkeypatch.setattr(module.ImuSource, "stop", lambda self: None)
+    args = SimpleNamespace(vx=0.0, vy=0.0, wz=0.0, scenario=None, scenario_text="", keyboard=False,
+                           duration=1.0, telemetry=telemetry)
+    try:
+        module.run_deploy(Path("policy.onnx"), make_contract(), args)
+    except ReachedEnable:
+        events.append("reached")
+    except RuntimeError as error:
+        events.append(str(error))
+    return events
+
+
+def test_telemetry_capability_refused_before_enable(modules, tmp_path, monkeypatch, capsys):
+    _, new = modules
+    events = run_deploy_until_enable(new, monkeypatch, FieldlessImuDriver, tmp_path / "t.csv")
+    assert "confirm" not in events and "enable" not in events and "reached" not in events
+    assert any("device_timestamp_us" in e and "host_timestamp_ns" in e and "will not be enabled" in e
+               for e in events)
+    assert events[-2] == "brake"
+
+
+def test_telemetry_off_ignores_missing_timing_fields(modules, monkeypatch, capsys):
+    _, new = modules
+    events = run_deploy_until_enable(new, monkeypatch, FieldlessImuDriver, None)
+    assert events == ["confirm", "enable", "brake", "reached"]
+
+
+def test_telemetry_capability_passes_with_full_sample(modules, tmp_path, monkeypatch, capsys):
+    _, new = modules
+    events = run_deploy_until_enable(new, monkeypatch, FakeImuDriver, tmp_path / "t.csv")
+    assert events == ["confirm", "enable", "brake", "reached"]
+
+
+def test_missing_timing_fields(modules):
+    _, new = modules
+    assert new.missing_timing_fields(None) == list(new.TIMING_SAMPLE_FIELDS)
+    full = SimpleNamespace(seq=1, device_timestamp_us=2, host_timestamp_ns=3)
+    assert new.missing_timing_fields(full) == []
+    assert new.missing_timing_fields(SimpleNamespace(seq=1, device_timestamp_us=None,
+                                                     host_timestamp_ns=float("nan"))) == [
+        "device_timestamp_us", "host_timestamp_ns"]
+
+
+def test_timing_report_stop_only_csv(modules, timing_report, tmp_path, capsys):
+    _, new = modules
+    contract = make_contract()
+    from robonex_common.joints import JOINT_BY_MODEL_NAME
+    import safety
+
+    motors = {}
+    for name in contract.joint_order:
+        motor_id = JOINT_BY_MODEL_NAME[name].motor_id
+        motors[motor_id] = FakeMotor(motor_id, 0.0, [], safety.MODE_RUNNING)
+    path = tmp_path / "stop_only_live_telemetry.csv"
+    recorder = new.TelemetryRecorder(path, contract, motors)
+    recorder.record_stop(1000.0, 1000.0, "IMU produced no sample", {m: 0.0 for m in motors})
+    recorder.close()
+    rows = read_csv(path)
+    assert len(rows) == 1 and rows[0]["stop_reason"] == "IMU produced no sample"
+    with pytest.raises(ValueError, match="no non-stop samples"):
+        timing_report.report(path)
+    assert timing_report.main([str(path)]) == 1
+    captured = capsys.readouterr()
+    assert "no non-stop samples" in captured.err
+
+
+@pytest.mark.parametrize("window", [0.0, -1.0, math.nan, math.inf])
+def test_timing_report_rejects_bad_window(timing_report, tmp_path, window, capsys):
+    path = tmp_path / "synthetic_live_telemetry.csv"
+    write_synthetic(path, n=10)
+    with pytest.raises(ValueError, match="window_s"):
+        timing_report.report(path, window_s=window)
+    t = np.arange(10) * 0.02
+    with pytest.raises(ValueError, match="window_s"):
+        timing_report.phase_drift(t, np.ones(10), window)
+    with pytest.raises(SystemExit) as exit_info:
+        timing_report.main([str(path), "--window", str(window)])
+    assert exit_info.value.code == 2
+    assert "--window must be a finite number > 0" in capsys.readouterr().err
+
+
+def test_timing_report_window_cli_does_not_hang(tmp_path):
+    path = tmp_path / "synthetic_live_telemetry.csv"
+    write_synthetic(path, n=10)
+    for window in ("0", "-1"):
+        result = subprocess.run([sys.executable, str(TIMING_REPORT), str(path), "--window", window],
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 2 and "--window" in result.stderr
+
+
+@pytest.mark.parametrize("d0", [-1.0, math.nan, math.inf])
+def test_timing_report_rejects_bad_d0(timing_report, tmp_path, d0, capsys):
+    path = tmp_path / "synthetic_live_telemetry.csv"
+    write_synthetic(path, n=10)
+    with pytest.raises(ValueError, match="d0_ms"):
+        timing_report.report(path, d0_ms=d0)
+    with pytest.raises(SystemExit) as exit_info:
+        timing_report.main([str(path), "--d0-ms", str(d0)])
+    assert exit_info.value.code == 2
+    assert timing_report.report(path, d0_ms=0.0)["budget"].endswith("INSIDE")
+
+
+def test_timing_report_rejects_partial_schema(timing_report, tmp_path, capsys):
+    path = tmp_path / "synthetic_live_telemetry.csv"
+    write_synthetic(path, n=10)
+    with open(path, newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    header = [k for k in rows[0] if k != "tick_period_ms"]
+    partial = tmp_path / "partial_live_telemetry.csv"
+    with open(partial, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=header, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    with pytest.raises(ValueError, match="tick_period_ms"):
+        timing_report.report(partial)
+    assert timing_report.main([str(partial)]) == 1
+    assert "tick_period_ms" in capsys.readouterr().err

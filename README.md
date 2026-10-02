@@ -122,14 +122,14 @@ python3 scripts/analysis/scenario_metrics.py \
 
 ### `timing_report.py`
 
-IMU host age (mean, p50, p95, max), phase drift per window, device-vs-host clock rate, seq gaps, tick period jitter, and per-joint feedback age from a `policy_to_real.py --telemetry` CSV; stop rows are skipped.
+IMU host age (mean, p50, p95, max), host age per window and its least-squares "host age slope" in ms/min (a trend fit over the raw ages, not an unwrapped phase drift), device-vs-host clock rate, seq gaps, tick period jitter, and per-joint feedback age from a `policy_to_real.py --telemetry` CSV; stop rows are skipped, and a file with only stop rows or missing timing columns exits 1. Timing columns only; they do not show that the loop's wall-clock timing matches a run without `--telemetry`.
 
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
 | - | `csv` | `Required` | One or more `*_live_telemetry.csv` or `*_read_telemetry.csv` |
-| - | `--d0-ms` | Unknown | Fixed IMU delay before the host stamp (ms); unknown prints the bound as a function of d0 |
-| - | `--budget-ms` | `15.0` | Trained IMU age range upper end (ms); the check is host age max <= budget - d0 |
-| - | `--window` | `5.0` | Phase-drift window (s) |
+| - | `--d0-ms` | Unknown | Fixed IMU delay before the host stamp (ms, finite, >= 0); unknown prints the bound as a function of d0 |
+| - | `--budget-ms` | `15.0` | Trained IMU age range upper end (ms, finite, > 0); the check is host age max <= budget - d0 |
+| - | `--window` | `5.0` | Host age window (s, finite, > 0) |
 | - | `--output` | - | JSON output path |
 
 ```bash
@@ -269,7 +269,7 @@ python3 scripts/sim_to_real/real_to_mujoco.py --robot max --once --motor-id head
 | - | `--vx` / `--vy` / `--wz` | `0.0` | Constant velocity command inside the trained envelope |
 | - | `--scenario` | - | Command schedule `T:VX,VY,WZ;...` from the start of policy control; starts with a 0,0,0 stand, needs `--duration`, any key cancels it |
 | - | `--keyboard` | Off | Steer the command with w/s, q/e, a/d, SPACE |
-| - | `--telemetry` | Off | Per-step CSV; no path = timestamped file under `results/policy_to_real` |
+| - | `--telemetry` | Off | Per-step CSV; no path = timestamped file under `results/policy_to_real`; live mode refuses before motor enable when the IMU sample lacks `seq`, `device_timestamp_us` or `host_timestamp_ns`, and a timing-column failure mid-run leaves those cells blank and warns at exit |
 | - | `--log` | Off | Save terminal output; no path = timestamped file |
 | - | `--gain-scale` | `1.0` | Fraction of the trained per-joint gains |
 | - | `--max-tilt-deg` | `40` | Trunk tilt stop |
@@ -295,10 +295,10 @@ python3 scripts/policy_test/policy_to_real.py \
 | Output | Description |
 | --- | --- |
 | `imu_age_ms` | Time since the loop last saw a new AHRS seq or raw-IMU frame count (the stale-stop input); about 0 on a healthy stream |
-| `imu_host_age_ms` | Monotonic time right after `imu.read` minus `sample.host_timestamp_ns` (AHRS publish to policy read); excludes the device/wire delay d0 and the raw-gyro hold |
+| `imu_host_age_ms` | Monotonic time right after `imu.read` minus `sample.host_timestamp_ns`: AHRS publish to policy read age, not raw-gyro age; excludes the device/wire delay d0 and the raw-gyro hold |
 | `imu_device_dt_ms` | Difference of consecutive ticks' `device_timestamp_us` (AHRS device clock) |
 | `imu_host_dt_ms` | Difference of consecutive ticks' `host_timestamp_ns` |
-| `imu_seq_gap` | Seq difference minus 1 between consecutive ticks; `-1` = the same sample read twice |
+| `imu_seq_gap` | Seq difference minus 1 between consecutive ticks; seq counts host-accepted AHRS samples, not wire packets, so it is no packet-loss count; `1` is normal (100 Hz publish, 50 Hz read), `-1` = the same sample read twice |
 | `tick_period_ms` | Unclamped period between loop ticks (`dt_ms` is the clamped slew dt) |
 | `<joint>.age_ms` | Live only: time since `FeedbackHub.pump` drained the joint's last type 0x02 frame, taken when the row is written (after send); drain-time age, one stamp per pump batch, not acquisition age |
 | `<joint>.rx_age_ms` | Live only: wall time when the row is written minus the socketcan kernel receive timestamp of that frame |

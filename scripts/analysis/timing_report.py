@@ -3,11 +3,34 @@ import argparse
 import csv
 import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
 
 IMU_BUDGET_MS = 15.0
+TIMING_COLUMNS = ("imu_host_age_ms", "imu_device_dt_ms", "imu_host_dt_ms", "imu_seq_gap", "tick_period_ms")
+
+
+def check_positive(name, value):
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be a finite number > 0, got {value}")
+    return value
+
+
+def check_nonnegative(name, value):
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"{name} must be a finite number >= 0, got {value}")
+    return value
+
+
+def cli_value(check, name):
+    def parse(text):
+        try:
+            return check(name, float(text))
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(str(error)) from None
+    return parse
 
 
 def load(path):
@@ -15,9 +38,12 @@ def load(path):
         rows = list(csv.DictReader(handle))
     if not rows:
         raise ValueError(f"{path} has no rows")
-    if "imu_host_age_ms" not in rows[0]:
-        raise ValueError(f"{path} has no imu_host_age_ms column; record it with the current policy_to_real.py")
+    missing = [key for key in TIMING_COLUMNS if key not in rows[0]]
+    if missing:
+        raise ValueError(f"{path} lacks the timing columns {missing}; record it with the current policy_to_real.py")
     rows = [row for row in rows if not row.get("stop_reason")]
+    if not rows:
+        raise ValueError(f"{path} has no non-stop samples (every row is a safety-stop row)")
     columns = {}
     for key in rows[0]:
         values = []
@@ -47,6 +73,7 @@ def distribution(values):
 
 
 def phase_drift(t, age, window_s):
+    check_positive("window_s", window_s)
     mask = np.isfinite(t) & np.isfinite(age)
     t, age = t[mask], age[mask]
     if t.size < 2:
@@ -113,6 +140,10 @@ def budget_line(age_stats, d0_ms, budget_ms=IMU_BUDGET_MS):
 
 
 def report(path, d0_ms=None, window_s=5.0, budget_ms=IMU_BUDGET_MS):
+    check_positive("window_s", window_s)
+    check_positive("budget_ms", budget_ms)
+    if d0_ms is not None:
+        check_nonnegative("d0_ms", d0_ms)
     columns = load(path)
     t = columns.get("t_s")
     age = columns["imu_host_age_ms"]
@@ -178,20 +209,26 @@ def print_report(result):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="IMU and joint-feedback timing from a policy_to_real telemetry CSV.")
     parser.add_argument("csv", type=Path, nargs="+", help="*_live_telemetry.csv or *_read_telemetry.csv")
-    parser.add_argument("--d0-ms", type=float, default=None,
+    parser.add_argument("--d0-ms", type=cli_value(check_nonnegative, "--d0-ms"), default=None,
                         help="Fixed IMU delay before the host stamp, ms; omit to print the bound as a function of d0")
-    parser.add_argument("--budget-ms", type=float, default=IMU_BUDGET_MS, help="Total IMU age budget, ms")
-    parser.add_argument("--window", type=float, default=5.0, help="Phase-drift window, s")
+    parser.add_argument("--budget-ms", type=cli_value(check_positive, "--budget-ms"), default=IMU_BUDGET_MS, help="Total IMU age budget, ms")
+    parser.add_argument("--window", type=cli_value(check_positive, "--window"), default=5.0, help="Phase-drift window, s")
     parser.add_argument("--output", type=Path, help="JSON output path")
     args = parser.parse_args(argv)
     results = []
+    status = 0
     for path in args.csv:
-        result = report(path, d0_ms=args.d0_ms, window_s=args.window, budget_ms=args.budget_ms)
+        try:
+            result = report(path, d0_ms=args.d0_ms, window_s=args.window, budget_ms=args.budget_ms)
+        except ValueError as error:
+            print(f"Error: {error}", file=sys.stderr)
+            status = 1
+            continue
         print_report(result)
         results.append(result)
     if args.output is not None:
         args.output.write_text(json.dumps(results, indent=2) + "\n")
-    return 0
+    return status
 
 
 if __name__ == "__main__":
