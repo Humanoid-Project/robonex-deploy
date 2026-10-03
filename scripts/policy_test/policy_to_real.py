@@ -8,15 +8,19 @@ import json
 from datetime import datetime, timezone
 import math
 import os
+import platform
 import select
 import shutil
+import signal
+import socket
+import subprocess
 import sys
 import tempfile
 import termios
 import threading
 import time
 import tty
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from importlib import metadata
 from pathlib import Path
 
@@ -64,7 +68,14 @@ from robonex_common.models import robot_model
 from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
 from robonex_common.motors import MOTOR_CONTROL_KD, MOTOR_CONTROL_KP, RATED_TORQUE
 from robonex_common.policy import PolicyContract, python_source_sha256
-from robonex_common.protocol import MECHANICAL_VELOCITY_INDEX
+from robonex_common.protocol import (
+    CURRENT_LIMIT_INDEX,
+    MECHANICAL_VELOCITY_INDEX,
+    RUN_MODE_INDEX,
+    TORQUE_LIMIT_INDEX,
+    VBUS_INDEX,
+    ZERO_STATUS_INDEX,
+)
 from robonex_common.runtime import (
     OBSERVATION_TERM_SIZES,
     ActionPipeline,
@@ -468,6 +479,291 @@ def timing_cells(timing):
     host_age_ms, device_dt_ms, host_dt_ms, seq_gap, tick_period_ms = timing
     return [_round(host_age_ms, 3), _round(device_dt_ms, 3), _round(host_dt_ms, 3),
             "" if seq_gap is None else int(seq_gap), _round(tick_period_ms, 3)]
+
+
+IMU_EXTRA_COLUMNS = ("acc_x", "acc_y", "acc_z", "quat_w", "quat_x", "quat_y", "quat_z", "imu_temp_c")
+STEP_EXTRA_COLUMNS = (
+    "late_ms", "poll_ms", "prev_work_ms", "slew_lag_deg", "runner_clip_total", "target_clip_total",
+    "roll_clip_total", "roll_reprojected_total", "thermal_load_max",
+) + IMU_EXTRA_COLUMNS
+JOINT_EXTRA_FIELDS = ("mode", "action", "slew_vel")
+READ_JOINT_EXTRA_FIELDS = ("vel", "raw_action", "target")
+PHASE_JOINT_FIELDS = ("age_ms", "pos", "vel", "torque", "temp", "fault", "mode", "commanded", "rx_age_ms")
+
+
+def imu_extra_cells(sample):
+    if sample is None:
+        return [""] * len(IMU_EXTRA_COLUMNS)
+    try:
+        acc = sample.linear_acceleration
+        quat = sample.orientation
+        return [_round(acc.x), _round(acc.y), _round(acc.z),
+                _round(quat.w), _round(quat.x), _round(quat.y), _round(quat.z),
+                _round(sample.imu_temperature, 3)]
+    except Exception:
+        return [""] * len(IMU_EXTRA_COLUMNS)
+
+
+def step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, pipeline, thermal, sample):
+    try:
+        loads = getattr(thermal, "load", None) or {}
+        cells = [
+            _round(late_ms, 3), _round(poll_ms, 3), _round(prev_work_ms, 3),
+            _round(math.degrees(commander.slew_lag_step_max), 4),
+            getattr(pipeline, "runner_clip_count", ""),
+            getattr(pipeline, "target_clip_count", ""),
+            getattr(pipeline, "roll_clip_count", ""),
+            getattr(commander, "roll_reprojected_count", ""),
+            _round(max(loads.values()) if loads else None, 4),
+        ]
+    except Exception:
+        cells = [""] * (len(STEP_EXTRA_COLUMNS) - len(IMU_EXTRA_COLUMNS))
+    return cells + imu_extra_cells(sample)
+
+
+def _finite_or_none(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+PREFLIGHT_PARAMETERS = (
+    ("limit_torque_nm", TORQUE_LIMIT_INDEX, "<f"),
+    ("limit_cur_a", CURRENT_LIMIT_INDEX, "<f"),
+    ("vbus_v", VBUS_INDEX, "<f"),
+    ("run_mode", RUN_MODE_INDEX, "<B"),
+    ("zero_sta", ZERO_STATUS_INDEX, "<B"),
+)
+
+
+def read_preflight_parameters(motors, timeout=0.05):
+    values = {}
+    for motor_id in sorted(motors):
+        row = {}
+        for name, index, fmt in PREFLIGHT_PARAMETERS:
+            try:
+                value = motors[motor_id].read_parameter(index, fmt=fmt, timeout=timeout)
+            except Exception:
+                value = None
+            if value is None:
+                row[name] = None
+            elif fmt == "<f":
+                row[name] = _finite_or_none(value)
+            else:
+                row[name] = int(value)
+        values[motor_id] = row
+    return values
+
+
+def preflight_parameter_lines(values):
+    names = [name for name, _, _ in PREFLIGHT_PARAMETERS]
+    lines = ["\nSaved motor parameters (read-only, recorded, not checked):",
+             "  " + f"{'ID':>3}  {'model':<5}  " + "  ".join(f"{name:>15}" for name in names)]
+    for motor_id, row in sorted(values.items()):
+        model = JOINT_BY_ID[motor_id].motor_model if motor_id in JOINT_BY_ID else "?"
+        cells = []
+        for name in names:
+            value = row.get(name)
+            cells.append(f"{'--':>15}" if value is None else
+                         (f"{value:15.3f}" if isinstance(value, float) else f"{value:15d}"))
+        lines.append(f"  {motor_id:>3}  {model:<5}  " + "  ".join(cells))
+    return lines
+
+
+def _read_text(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def git_state(path):
+    try:
+        def git(*command):
+            return subprocess.run(
+                ["git", "-C", str(path), *command], capture_output=True, text=True, timeout=5,
+            ).stdout
+        return {
+            "path": str(path),
+            "head": git("rev-parse", "HEAD").strip() or None,
+            "branch": git("rev-parse", "--abbrev-ref", "HEAD").strip() or None,
+            "dirty_files": git("status", "--porcelain", "--untracked-files=no").splitlines(),
+        }
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"path": str(path), "error": str(error)}
+
+
+def can_statistics(channels):
+    result = {}
+    for channel in channels:
+        base = Path("/sys/class/net") / channel
+        counters = {}
+        try:
+            for entry in sorted((base / "statistics").iterdir()):
+                text = _read_text(entry)
+                if text is not None and text.lstrip("-").isdigit():
+                    counters[entry.name] = int(text)
+        except OSError:
+            pass
+        result[channel] = {
+            "operstate": _read_text(base / "operstate"),
+            "tx_queue_len": _read_text(base / "tx_queue_len"),
+            "statistics": counters,
+        }
+    return result
+
+
+def imu_driver_stats(imu):
+    try:
+        stats = imu.driver.stats()
+    except Exception:
+        return None
+    names = ("ahrs_frames", "bytes_read", "crc16_errors", "crc8_errors", "dropped_bytes",
+             "frame_end_errors", "ground_frames", "imu_frames", "insgps_frames", "samples", "sn_lost")
+    return {name: getattr(stats, name, None) for name in names}
+
+
+def host_snapshot(channels):
+    repos = {"deploy": git_state(THIS_FILE.parents[2])}
+    try:
+        repos["common"] = git_state(Path(robonex_common.__file__).resolve().parents[2])
+    except Exception as error:
+        repos["common"] = {"error": str(error)}
+    try:
+        from robonex_common.paths import DESCRIPTION_REPO_NAMES, resolve_repo
+        repos["description"] = git_state(resolve_repo(DESCRIPTION_REPO_NAMES, anchors=(THIS_FILE,)))
+    except Exception as error:
+        repos["description"] = {"error": str(error)}
+    try:
+        load_average = list(os.getloadavg())
+    except OSError:
+        load_average = None
+    return {
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "python": sys.version.split()[0],
+        "pid": os.getpid(),
+        "argv": list(sys.argv),
+        "cpu_governor": _read_text("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+        "load_average": load_average,
+        "git": repos,
+        "can": can_statistics(channels),
+    }
+
+
+class StepArrays:
+    DTYPES = {"t_s": np.float64, "wall_time": np.float64, "step": np.int64, "commanded": np.float64}
+    MAX_STEPS = 60000
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.data = {}
+        self.error = None
+        self.steps = 0
+
+    def append(self, **values):
+        if self.error is not None:
+            return
+        if self.steps >= self.MAX_STEPS:
+            self.error = f"capacity {self.MAX_STEPS} steps reached; later steps are in the CSV only"
+            return
+        try:
+            converted = {
+                key: np.array(value, dtype=self.DTYPES.get(key, np.float32))
+                for key, value in values.items()
+            }
+            for key, value in converted.items():
+                self.data.setdefault(key, []).append(value)
+            self.steps += 1
+        except Exception as error:
+            self.error = f"{type(error).__name__}: {error}"
+            self.data = {}
+
+    def save(self):
+        if not self.data:
+            return None
+        if self.error is not None and not self.error.startswith("capacity"):
+            return None
+        lengths = {len(values) for values in self.data.values()}
+        if len(lengths) != 1:
+            self.error = f"array lengths differ: {sorted(lengths)}"
+            return None
+        arrays = {key: np.stack(values) for key, values in self.data.items()}
+        with self.path.open("xb") as handle:
+            np.savez(handle, **arrays)
+        self.data = {}
+        return self.path
+
+
+class PhaseRecorder:
+    def __init__(self, path, contract, motors, imu=None):
+        self.path = Path(path)
+        self.order = joint_row_order(contract)
+        self.motors = motors
+        self.imu = imu
+        self.rows = []
+        self.error = None
+        self.started = time.monotonic()
+        header = ["t_s", "wall_time", "phase", "gravity_x", "gravity_y", "gravity_z",
+                  "gyro_x", "gyro_y", "gyro_z", "acc_x", "acc_y", "acc_z"]
+        for name, _ in self.order:
+            short = name.replace("_joint", "")
+            header += [f"{short}.{field_name}" for field_name in PHASE_JOINT_FIELDS]
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with self.path.open("x", newline="") as handle:
+                csv.writer(handle).writerow(header)
+        except FileExistsError:
+            raise SystemExit(f"{self.path} already exists; recordings are never overwritten.")
+
+    def record(self, phase, commands=None):
+        try:
+            now = time.monotonic()
+            wall = time.time()
+            driver = getattr(self.imu, "driver", None)
+            sample = driver.latest() if driver is not None else None
+            row = [round(now - self.started, 4), round(wall, 6), phase]
+            if sample is not None:
+                gravity = sample.projected_gravity
+                gyro = sample.angular_velocity_raw
+                row += [_round(gravity.x), _round(gravity.y), _round(gravity.z),
+                        _round(gyro.x), _round(gyro.y), _round(gyro.z)]
+            else:
+                row += [""] * 6
+            row += imu_extra_cells(sample)[:3]
+            for _, motor_id in self.order:
+                motor = self.motors.get(motor_id)
+                stamp = getattr(motor, "last_feedback_time", None)
+                rx = getattr(motor, "last_rx_kernel_time", None)
+                row += [
+                    round((now - stamp) * 1000.0, 3) if stamp else "",
+                    _round(getattr(motor, "last_position", None)),
+                    _round(getattr(motor, "last_velocity", None)),
+                    _round(getattr(motor, "last_torque", None)),
+                    _round(getattr(motor, "last_temp", None)),
+                    getattr(motor, "last_fault", ""),
+                    getattr(motor, "last_mode_status", ""),
+                    _round(commands.get(motor_id)) if commands else "",
+                    round((wall - rx) * 1000.0, 3) if rx else "",
+                ]
+            self.rows.append(row)
+        except Exception as error:
+            if self.error is None:
+                self.error = f"{type(error).__name__}: {error}"
+
+    def close(self):
+        if not self.rows:
+            return
+        rows, self.rows = self.rows, []
+        try:
+            with self.path.open("a", newline="") as handle:
+                csv.writer(handle).writerows(rows)
+        except Exception as error:
+            if self.error is None:
+                self.error = f"write failed, {len(rows)} rows lost: {error}"
 
 
 class PolicyRunner:
@@ -898,7 +1194,9 @@ def run_read(policy_path, contract, args):
             raw_action, _, targets = runner.step(observation, commit=True)
             if read_log is not None:
                 read_log.record(now, observation, gravity, angular_velocity, age, positions, missing,
-                                timing=timing.safe_update(now, imu.last_sample, imu_read_ns))
+                                timing=timing.safe_update(now, imu.last_sample, imu_read_ns),
+                                velocities=velocities, raw_action=raw_action, targets=targets,
+                                sample=imu.last_sample)
             step += 1
             if (step - 1) % print_every:
                 sleep = period - (time.monotonic() - now)
@@ -935,13 +1233,15 @@ def run_read(policy_path, contract, args):
         if read_log is not None:
             read_log.close()
             print(f"Recorded to {read_log.path}")
+            if read_log.arrays.error:
+                print(f"Warning: arrays not saved ({read_log.arrays.error})")
             if timing.warning():
                 print(timing.warning())
         print("Stopped. No motor was enabled or commanded.")
     return 0
 
 
-def approach_pose(commander, joints, targets, motors, limits, settings, label, faults):
+def approach_pose(commander, joints, targets, motors, limits, settings, label, faults, recorder=None):
     print(f"\nSpeed-limited move to the {label} pose ({settings.approach_max_speed:.2f} rad/s cap).")
     tolerance = settings.approach_tolerance_deg * DEG
     period = 1.0 / 100.0
@@ -969,6 +1269,8 @@ def approach_pose(commander, joints, targets, motors, limits, settings, label, f
             settings.approach_max_accel,
             use_velocity_target=True,
         )
+        if recorder is not None:
+            recorder.record(label, commander.commands)
 
         if now - last_print >= 1.0:
             last_print = now
@@ -1025,24 +1327,34 @@ class ReadRecorder:
     def __init__(self, path, contract):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
+        try:
+            self.handle = self.path.open("x", newline="")
+        except FileExistsError:
             raise SystemExit(
                 f"{self.path} already exists. Recordings of a real robot are not reproducible, "
                 "so this refuses to overwrite one. Pass --telemetry with no path for an "
                 "automatic timestamped file, or name a new one."
             )
-        self.handle = self.path.open("w", newline="")
         self.writer = csv.writer(self.handle)
         header = ["t_s", "gravity_x", "gravity_y", "gravity_z",
                   "gyro_x", "gyro_y", "gyro_z", "imu_age_ms", "missing_ids"]
         header += [f"gait_{i}" for i in range(10)]
         header += [f"{n.replace('_joint','')}.pos" for n in contract.joint_order]
         header += list(TIMING_COLUMNS)
+        for name in contract.joint_order:
+            header += [f"{name.replace('_joint', '')}.{field_name}" for field_name in READ_JOINT_EXTRA_FIELDS]
+        header += list(IMU_EXTRA_COLUMNS)
         self.writer.writerow(header)
         self.handle.flush()
         self.started = None
+        self.size = len(contract.joint_order)
+        self.arrays = StepArrays(self.path.with_name(self.path.stem + "_arrays.npz"))
+        if self.arrays.path.exists():
+            self.handle.close()
+            raise SystemExit(f"{self.arrays.path} already exists; recordings are never overwritten.")
 
-    def record(self, now, observation, gravity, gyro, age, positions, missing, timing=None):
+    def record(self, now, observation, gravity, gyro, age, positions, missing, timing=None,
+               velocities=None, raw_action=None, targets=None, sample=None):
         if self.started is None:
             self.started = now
         row = [round(now - self.started, 3)]
@@ -1053,14 +1365,29 @@ class ReadRecorder:
         row += [round(float(v), 5) for v in observation[165:175]]
         row += [round(float(v), 5) for v in positions]
         row += timing_cells(timing)
+        for index in range(self.size):
+            row += [
+                "" if velocities is None else round(float(velocities[index]), 5),
+                "" if raw_action is None else round(float(raw_action[index]), 5),
+                "" if targets is None else round(float(targets[index]), 5),
+            ]
+        row += imu_extra_cells(sample)
         self.writer.writerow(row)
         self.handle.flush()
+        if raw_action is not None and targets is not None and velocities is not None:
+            self.arrays.append(t_s=now - self.started, obs=observation, pos=positions, vel=velocities,
+                               raw_action=raw_action, targets=targets, gyro=gyro, gravity=gravity)
 
     def close(self):
         try:
             self.handle.close()
         except OSError:
             pass
+        try:
+            self.arrays.save()
+        except Exception as error:
+            if self.arrays.error is None:
+                self.arrays.error = f"save failed: {type(error).__name__}: {error}"
 
 
 class TelemetryRecorder:
@@ -1075,12 +1402,20 @@ class TelemetryRecorder:
     SLACK_S = 0.005
     MAX_ROWS = 500
 
-    def __init__(self, path, contract, motors):
+    def __init__(self, path, contract, motors, hubs=None):
         self.path = Path(path)
         self.rows = []
         self.order = joint_row_order(contract)
         self.motors = motors
+        self.hubs = dict(sorted((hubs or {}).items()))
         self.dropped = 0
+        self.meta = None
+        self.arrays = StepArrays(self.path.with_name(self.path.stem + "_arrays.npz"))
+        self.phases_path = self.path.with_name(self.path.stem + "_phases.csv")
+        self.meta_path = self.path.with_name(self.path.stem + "_meta.json")
+        for reserved in (self.arrays.path, self.phases_path, self.meta_path):
+            if reserved.exists():
+                raise SystemExit(f"{reserved} already exists; recordings are never overwritten.")
         header = ["t_s", "wall_time", "step", "dt_ms", "inference_ms", "send_ms", "ramp",
                   "cmd_vx", "cmd_vy", "cmd_wz",
                   "gravity_x", "gravity_y", "gravity_z",
@@ -1093,15 +1428,21 @@ class TelemetryRecorder:
                 f"{short}.target", f"{short}.commanded", f"{short}.rx_age_ms",
             ]
         header += list(TIMING_COLUMNS)
+        header += list(STEP_EXTRA_COLUMNS)
+        header += [f"rx_frames.{channel}" for channel in self.hubs]
+        for name, motor_id in self.order:
+            short = name.replace("_joint", "")
+            header += [f"{short}.{field_name}" for field_name in JOINT_EXTRA_FIELDS]
         header.append("stop_reason")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
+        try:
+            self.handle = self.path.open("x", newline="")
+        except FileExistsError:
             raise SystemExit(
                 f"{self.path} already exists. Recordings of a real robot are not reproducible, "
                 "so this refuses to overwrite one. Pass --telemetry with no path for an "
                 "automatic timestamped file, or name a new one."
             )
-        self.handle = self.path.open("w", newline="")
         try:
             self.writer = csv.writer(self.handle)
             self.writer.writerow(header)
@@ -1113,7 +1454,8 @@ class TelemetryRecorder:
 
     def record(self, now, started, dt, inference_ms, ramp, raw_action, targets, commands,
                gravity=None, gyro=None, imu_age=None, velocity_command=None, stop_reason="",
-               send_ms=None, timing=None):
+               send_ms=None, timing=None, extra=None, policy_action=None, slew_velocities=None,
+               observation=None, positions=None, velocities=None, allow_flush=True):
         wall = time.time()
         row = [
             round(now - started, 4), round(wall, 6), self.step, round(dt * 1000.0, 3),
@@ -1145,13 +1487,31 @@ class TelemetryRecorder:
             rx = getattr(motor, "last_rx_kernel_time", None)
             row.append(round((wall - rx) * 1000.0, 3) if rx else "")
         row += timing_cells(timing)
+        row += list(extra) if extra is not None else [""] * len(STEP_EXTRA_COLUMNS)
+        row += [getattr(hub, "last_pump_frames", "") for hub in self.hubs.values()]
+        for index, (_, motor_id) in enumerate(self.order):
+            motor = self.motors.get(motor_id)
+            row += [
+                getattr(motor, "last_mode_status", ""),
+                "" if policy_action is None else round(float(policy_action[index]), 5),
+                "" if slew_velocities is None else _round(slew_velocities.get(motor_id)),
+            ]
         row.append(stop_reason)
         self.rows.append(row)
+        if observation is not None:
+            self.arrays.append(
+                t_s=now - started, wall_time=wall, step=self.step, obs=observation,
+                raw_action=raw_action, policy_action=policy_action, targets=targets,
+                commanded=[commands.get(motor_id, float("nan")) for _, motor_id in self.order],
+                pos=positions, vel=velocities,
+                torque=[_float_attr(self.motors.get(motor_id), "last_torque") for _, motor_id in self.order],
+                gyro=gyro, gravity=gravity, velocity_command=velocity_command,
+            )
         self.step += 1
-        if len(self.rows) >= self.MAX_ROWS:
+        if allow_flush and len(self.rows) >= self.MAX_ROWS:
             self.flush()
 
-    def write_sidecar(self, policy_path, contract, settings, args):
+    def write_sidecar(self, policy_path, contract, settings, args, extra=None):
         """Record which policy produced this file, next to it.
 
         The CSV carries no policy identity, so a recording cannot be traced back to the
@@ -1186,9 +1546,31 @@ class TelemetryRecorder:
                 "policy_max_accel": settings.policy_max_accel,
             },
         }
-        path = self.path.with_name(self.path.stem + "_meta.json")
-        path.write_text(json.dumps(meta, indent=2) + "\n")
-        return path
+        meta["files"] = {
+            "telemetry": self.path.name,
+            "arrays": self.arrays.path.name,
+            "phases": self.phases_path.name,
+        }
+        if extra:
+            meta.update(extra)
+        text = json.dumps(meta, indent=2, default=str) + "\n"
+        try:
+            with self.meta_path.open("x") as handle:
+                handle.write(text)
+        except FileExistsError:
+            raise SystemExit(f"{self.meta_path} already exists; recordings are never overwritten.")
+        self.meta = meta
+        return self.meta_path
+
+    def finalize_sidecar(self, end):
+        if self.meta is None:
+            return None
+        self.meta["end"] = end
+        text = json.dumps(self.meta, indent=2, default=str) + "\n"
+        partial = self.meta_path.with_name(self.meta_path.name + ".partial")
+        partial.write_text(text)
+        os.replace(partial, self.meta_path)
+        return self.meta_path
 
     def record_stop(self, now, started, reason, commands, gravity=None, gyro=None, imu_age=None,
                     velocity_command=None):
@@ -1204,9 +1586,8 @@ class TelemetryRecorder:
             now, started, float("nan"), float("nan"), float("nan"),
             [float("nan")] * len(self.order), [float("nan")] * len(self.order), commands,
             gravity=gravity, gyro=gyro, imu_age=imu_age, velocity_command=velocity_command,
-            stop_reason=reason,
+            stop_reason=reason, allow_flush=False,
         )
-        self.flush()
 
     def flush_if_idle(self, slack_s):
         """Write only while the loop is waiting for its next tick.
@@ -1237,6 +1618,19 @@ class TelemetryRecorder:
                 self.handle.close()
             except OSError:
                 pass
+            try:
+                self.arrays.save()
+            except Exception as error:
+                if self.arrays.error is None:
+                    self.arrays.error = f"save failed: {type(error).__name__}: {error}"
+
+
+def _float_attr(obj, name):
+    value = getattr(obj, name, None)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 def _round(value, digits=5):
@@ -1249,7 +1643,7 @@ def _round(value, digits=5):
 
 
 def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, notes, stats,
-                faults, thermal, keyboard=None):
+                faults, thermal, keyboard=None, telemetry=None):
     period = 1.0 / contract.policy_hz
     stats.started = time.monotonic()
     next_tick = time.monotonic()
@@ -1261,13 +1655,12 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
     scenario = getattr(args, "scenario", None)
     commander.reset_stats()
     reproject = roll_reprojector(runner.pipeline, runner.motor_ids)
-    telemetry = (
-        TelemetryRecorder(args.telemetry, contract, motors)
-        if getattr(args, "telemetry", None)
-        else None
-    )
+    owns_telemetry = telemetry is None and bool(getattr(args, "telemetry", None))
+    if owns_telemetry:
+        telemetry = TelemetryRecorder(args.telemetry, contract, motors, hubs=getattr(joints, "hubs", None))
     timing = TimingProbe() if telemetry is not None else None
-    if telemetry is not None:
+    prev_work_ms = None
+    if owns_telemetry:
         print(f"Telemetry   : {telemetry.path}  ({contract.policy_hz:.0f} Hz per-motor record)")
         print(f"Provenance  : {telemetry.write_sidecar(runner.policy_path, contract, SETTINGS, args).name}")
 
@@ -1278,7 +1671,9 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
     try:
         while deadline is None or time.monotonic() < deadline:
             now = time.monotonic()
+            late_ms = (now - next_tick) * 1000.0
             joints.poll()
+            poll_ms = (time.monotonic() - now) * 1000.0 if telemetry is not None else None
             faults.update(motors, now, "policy")
             thermal.update(motors, now - last_tick)
             def stop(reason, gravity=None, gyro=None, imu_age=None):
@@ -1355,6 +1750,10 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     velocity_command=tuple(float(v) for v in runner.velocity_command),
                     send_ms=send_ms,
                     timing=timing.safe_update(now, imu.last_sample, imu_read_ns),
+                    extra=step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, runner.pipeline,
+                                           thermal, imu.last_sample),
+                    policy_action=policy_action, slew_velocities=commander.velocities,
+                    observation=observation, positions=positions, velocities=velocities,
                 )
 
             if now - last_status >= 1.0 / SETTINGS.status_hz:
@@ -1421,6 +1820,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
             next_tick += period
             sleep = next_tick - time.monotonic()
             if telemetry is not None:
+                prev_work_ms = (time.monotonic() - now) * 1000.0
                 telemetry.flush_if_idle(sleep)
                 sleep = next_tick - time.monotonic()
             if sleep > 0.0:
@@ -1429,10 +1829,10 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                 next_tick = time.monotonic()
 
     finally:
-        if telemetry is not None:
+        if owns_telemetry:
             telemetry.close()
-            if timing.warning():
-                print(timing.warning())
+        if timing is not None and timing.warning():
+            print(timing.warning())
 
 
 def run_deploy(policy_path, contract, args):
@@ -1469,6 +1869,11 @@ def run_deploy(policy_path, contract, args):
     thermal = ThermalLoad({
         motor_id: RATED_TORQUE[JOINT_BY_ID[motor_id].motor_model] for motor_id in motor_ids
     })
+    telemetry = None
+    phases = None
+    run_meta = {}
+    end_meta = {}
+    exit_text = "completed"
     try:
         buses, motors, hubs = open_hardware(motor_ids, SETTINGS.interface, SETTINGS.host_id)
         idle = stop_idle_motors(buses, motor_ids, SETTINGS.host_id)
@@ -1483,6 +1888,13 @@ def run_deploy(policy_path, contract, args):
             raise RuntimeError(
                 "Preflight safety check failed; motors will not be enabled:\n  " + "\n  ".join(blocking)
             )
+        preflight_parameters = read_preflight_parameters(motors)
+        for line in preflight_parameter_lines(preflight_parameters):
+            print(line)
+        run_meta["preflight_parameters"] = preflight_parameters
+        run_meta["preflight_mech_pos_rad"] = {
+            motor_id: _finite_or_none(value) for motor_id, value in sorted(measured.items())
+        }
         if not imu.start(calibrate=True):
             raise RuntimeError("IMU is not usable; motors will not be enabled:\n  " + "\n  ".join(notes))
         if getattr(args, "telemetry", None):
@@ -1492,6 +1904,19 @@ def run_deploy(policy_path, contract, args):
                     f"IMU sample lacks the timing fields {missing_fields} that --telemetry records; "
                     "motors will not be enabled. Rebuild the n100 binding or run without --telemetry"
                 )
+            telemetry = TelemetryRecorder(args.telemetry, contract, motors, hubs=hubs)
+            phases = PhaseRecorder(telemetry.phases_path, contract, motors, imu=imu)
+            bias = imu.bias_raw
+            run_meta.update({
+                "host": host_snapshot(sorted(hubs)),
+                "imu_gyro_bias_raw": None if bias is None else [bias.x, bias.y, bias.z],
+                "imu_driver_stats_start": imu_driver_stats(imu),
+                "gains": {motor_id: [ENABLE_KP[motor_id], ENABLE_KD[motor_id]] for motor_id in motor_ids},
+                "settings_all": asdict(SETTINGS),
+            })
+            print(f"Telemetry   : {telemetry.path}  ({contract.policy_hz:.0f} Hz per-motor record)")
+            print(f"Phases      : {telemetry.phases_path.name}  (enable, approach and brake samples)")
+            print(f"Provenance  : {telemetry.write_sidecar(policy_path, contract, SETTINGS, args, run_meta).name}")
 
         print("\nThe real motors will move under policy control.")
         print(f"  policy      : {policy_path}")
@@ -1520,20 +1945,48 @@ def run_deploy(policy_path, contract, args):
             motors, hubs, ENABLE_KP, ENABLE_KD, hard_limits, enabled_out=enabled_ids
         )
 
+        end_meta["enable_start_positions_rad"] = {motor_id: _finite_or_none(v) for motor_id, v in starts.items()}
         joints = RuntimeJointSource(motors, hubs)
         commander = TargetCommander(motors, starts, SETTINGS)
-        approach_pose(commander, joints, home_targets, motors, hard_limits, SETTINGS, "default", faults)
+        if phases is not None:
+            phases.record("enabled", commander.commands)
+        approach_started = time.monotonic()
+        try:
+            approach_pose(commander, joints, home_targets, motors, hard_limits, SETTINGS, "default", faults,
+                          recorder=phases)
+        finally:
+            end_meta["approach"] = {
+                "seconds": time.monotonic() - approach_started,
+                "final_error_deg": {
+                    motor_id: (None if motors[motor_id].last_position is None else
+                               math.degrees(wrap_to_pi(motors[motor_id].last_position) - target))
+                    for motor_id, target in sorted(home_targets.items())
+                },
+            }
         runner.reset()
         policy_loop(
             runner, commander, joints, imu, motors, hard_limits, contract, args, notes, stats,
-            faults, thermal, keyboard
+            faults, thermal, keyboard, telemetry=telemetry
         )
     except KeyboardInterrupt:
+        exit_text = "stop requested (Ctrl-C)"
         print("\nStop requested.")
+    except BaseException as error:
+        exit_text = f"{type(error).__name__}: {error}"
+        raise
     finally:
+        brake_kwargs = {}
+        if phases is not None:
+            def observe_brake():
+                for hub in hubs.values():
+                    hub.pump()
+                phases.record("brake")
+            brake_kwargs["observe"] = observe_brake
         shutdown_report = brake_and_stop(
-            motors, buses, enabled_ids, stop_ids, SETTINGS.brake_time, ENABLE_KD
+            motors, buses, enabled_ids, stop_ids, SETTINGS.brake_time, ENABLE_KD, **brake_kwargs
         )
+        if telemetry is not None:
+            end_meta["imu_driver_stats_end"] = imu_driver_stats(imu)
         imu.stop()
         if stop_ids:
             for line in shutdown_report_lines(shutdown_report):
@@ -1555,7 +2008,84 @@ def run_deploy(policy_path, contract, args):
             )
         if keyboard is not None:
             keyboard.stop()
+        if telemetry is not None:
+            previous = None
+            if threading.current_thread() is threading.main_thread():
+                previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                close_recordings(telemetry, phases, end_meta, exit_text, shutdown_report, stats, commander,
+                                 runner, thermal, faults, sorted(hubs))
+            finally:
+                if previous is not None:
+                    signal.signal(signal.SIGINT, previous)
     return 0
+
+
+def close_recordings(telemetry, phases, end_meta, exit_text, shutdown_report, stats, commander, runner,
+                     thermal, faults, channels):
+    errors = {}
+    for name, action in (("telemetry", telemetry.close), ("phases", phases.close if phases else None)):
+        if action is None:
+            continue
+        try:
+            action()
+        except Exception as error:
+            errors[name] = f"{type(error).__name__}: {error}"
+    try:
+        summarize_run(telemetry, phases, end_meta, exit_text, shutdown_report, stats, commander, runner,
+                      thermal, faults, channels, errors)
+    except Exception as error:
+        end_meta["summary_error"] = f"{type(error).__name__}: {error}"
+    try:
+        path = telemetry.finalize_sidecar(end_meta)
+        print(f"Recorded    : {telemetry.path.name}, {telemetry.arrays.path.name}, "
+              f"{telemetry.phases_path.name}, {path.name if path else '-'}")
+    except Exception as error:
+        print(f"Warning: run summary not written ({type(error).__name__}: {error})")
+    problems = dict(end_meta.get("recording_errors", {}))
+    if "summary_error" in end_meta:
+        problems["summary"] = end_meta["summary_error"]
+    for name, message in problems.items():
+        print(f"Warning: {name} recording problem: {message}")
+
+
+def summarize_run(telemetry, phases, end_meta, exit_text, shutdown_report, stats, commander, runner,
+                  thermal, faults, channels, errors):
+    pipeline = runner.pipeline
+    end_meta.update({
+        "written_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "exit": exit_text,
+        "policy_steps": stats.steps,
+        "policy_seconds": stats.elapsed() if stats.steps else 0.0,
+        "worst_period_ms": stats.period_max * 1000.0,
+        "worst_inference_ms": stats.inference_ms_max,
+        "rows_recorded": telemetry.step,
+        "rows_dropped": telemetry.dropped,
+        "shutdown": {
+            key: ({str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else value)
+            for key, value in (shutdown_report if isinstance(shutdown_report, dict) else {}).items()
+        },
+        "fault_history": faults.history_line(),
+        "thermal": {"line": thermal.worst_line(), "peak": dict(thermal.peak), "load_end": dict(thermal.load)},
+        "pipeline": {
+            "policy_calls": getattr(pipeline, "policy_call_count", None),
+            "runner_clip_count": getattr(pipeline, "runner_clip_count", None),
+            "target_clip_count": getattr(pipeline, "target_clip_count", None),
+            "roll_clip_count": getattr(pipeline, "roll_clip_count", None),
+        },
+        "can_after": can_statistics(channels),
+        "recording_errors": {
+            **errors,
+            **({"arrays": telemetry.arrays.error} if telemetry.arrays.error else {}),
+            **({"phases": phases.error} if phases is not None and phases.error else {}),
+        },
+    })
+    if commander is not None:
+        end_meta["slew"] = {
+            "lag_run_max_deg": math.degrees(commander.slew_lag_run_max),
+            "limited_fraction_by_motor": commander.slew_rate_by_motor(),
+            "roll_reprojected_count": commander.roll_reprojected_count,
+        }
 
 
 class KeyboardCommand:
@@ -1719,11 +2249,13 @@ def parse_args(argv=None):
         const="",
         metavar="PATH",
         help="Write a per-policy-step CSV: per-motor feedback age, position, velocity, torque, "
-             "temperature and fault, plus raw action, clipped target and commanded position, "
-             "and log-only timing columns (IMU host age, device and host sample spacing, "
-             "seq gap, actual tick period) for scripts/analysis/timing_report.py. "
-             "Omit PATH for an automatic timestamped file under results/policy_to_real. "
-             "An existing file is never overwritten",
+             "temperature, fault and mode, raw and fed-back action, clipped target, commanded "
+             "position and slew velocity, IMU vectors, loop timing and log-only IMU timing "
+             "columns for scripts/analysis/timing_report.py; next to it a full-precision "
+             "_arrays.npz (observation and action vectors), a _phases.csv with enable, approach "
+             "and brake samples, and a _meta.json with the saved motor parameters and the run "
+             "summary, all written after the brake. Omit PATH for an automatic timestamped file "
+             "under results/policy_to_real. An existing file is never overwritten",
     )
     parser.add_argument(
         "--vx", type=float, default=0.0, help="Forward velocity command (m/s)"

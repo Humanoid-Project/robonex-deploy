@@ -285,16 +285,18 @@ def test_policy_loop_commands_and_observations_unchanged(modules, tmp_path, caps
     if with_telemetry:
         base_rows, new_rows = read_csv(base_csv), read_csv(new_csv)
         assert len(base_rows) == len(new_rows) == steps
-        added = set(new.TIMING_COLUMNS)
-        assert set(new_rows[0]) - set(base_rows[0]) == added
+        joint_extras = [f"{name.replace('_joint', '')}.{field}" for name in contract.joint_order
+                        for field in new.JOINT_EXTRA_FIELDS]
+        added = list(new.TIMING_COLUMNS) + list(new.STEP_EXTRA_COLUMNS) + joint_extras
+        assert list(new_rows[0]) == list(base_rows[0])[:-1] + added + ["stop_reason"]
         for old_row, new_row in zip(base_rows, new_rows):
             assert {k: new_row[k] for k in old_row} == old_row
         base_lines, new_lines = base_csv.read_bytes().splitlines(), new_csv.read_bytes().splitlines()
         assert len(base_lines) == len(new_lines) == steps + 1
         for old_line, new_line in zip(base_lines, new_lines):
             old_prefix, old_stop = old_line.rsplit(b",", 1)
-            new_prefix, *timing_cells, new_stop = new_line.rsplit(b",", len(added) + 1)
-            assert len(timing_cells) == len(added)
+            new_prefix, *added_cells, new_stop = new_line.rsplit(b",", len(added) + 1)
+            assert len(added_cells) == len(added)
             assert (old_prefix, old_stop) == (new_prefix, new_stop)
         ages = [float(r["imu_host_age_ms"]) for r in new_rows]
         assert ages == pytest.approx([6.3] * steps, abs=1e-6)
@@ -356,7 +358,10 @@ def test_read_recorder_appends_timing_columns(modules, tmp_path):
         paths.append(tmp_path / name)
     base_rows, new_rows = read_csv(paths[0]), read_csv(paths[1])
     assert list(new_rows[0])[: len(base_rows[0])] == list(base_rows[0])
-    assert list(new_rows[0])[len(base_rows[0]):] == list(new.TIMING_COLUMNS)
+    joint_extras = [f"{name.replace('_joint', '')}.{field}" for name in contract.joint_order
+                    for field in new.READ_JOINT_EXTRA_FIELDS]
+    assert list(new_rows[0])[len(base_rows[0]):] == (
+        list(new.TIMING_COLUMNS) + joint_extras + list(new.IMU_EXTRA_COLUMNS))
     assert {k: new_rows[0][k] for k in base_rows[0]} == base_rows[0]
     assert new_rows[0]["imu_host_age_ms"] == "4.2" and new_rows[0]["imu_seq_gap"] == "1"
 
@@ -497,7 +502,7 @@ def run_deploy_until_enable(module, monkeypatch, driver_class, telemetry):
     monkeypatch.setattr(module, "roll_pairs_for", lambda profile, ids: [])
     monkeypatch.setattr(module, "confirm", lambda prompt: events.append("confirm"))
     monkeypatch.setattr(module, "enable_with_runtime_feedback", enable)
-    monkeypatch.setattr(module, "brake_and_stop", lambda *args: events.append("brake"))
+    monkeypatch.setattr(module, "brake_and_stop", lambda *args, **kwargs: events.append("brake"))
     monkeypatch.setattr(module, "shutdown_report_lines", lambda report: [])
     monkeypatch.setattr(module.ImuSource, "start", start)
     monkeypatch.setattr(module.ImuSource, "stop", lambda self: None)

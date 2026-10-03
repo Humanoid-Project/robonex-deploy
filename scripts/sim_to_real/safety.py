@@ -263,15 +263,24 @@ def open_hardware(motor_ids, interface, host_id):
     return buses, motors, hubs
 
 class TimestampedFeedbackHub(FeedbackHub):
+    last_pump_frames = 0
+    total_frames = 0
+
     def pump(self, max_frames=512):
         now = time.monotonic()
-        for _ in range(max_frames):
-            msg = self.bus.recv(timeout=0.0)
-            if msg is None:
-                return
-            motor = self.route(msg, now)
-            if motor is not None and getattr(motor, "last_feedback_time", None) == now:
-                motor.last_rx_kernel_time = msg.timestamp
+        received = 0
+        try:
+            for _ in range(max_frames):
+                msg = self.bus.recv(timeout=0.0)
+                if msg is None:
+                    return
+                received += 1
+                motor = self.route(msg, now)
+                if motor is not None and getattr(motor, "last_feedback_time", None) == now:
+                    motor.last_rx_kernel_time = msg.timestamp
+        finally:
+            self.last_pump_frames = received
+            self.total_frames += received
 
 
 def gain_for(gains, motor_id):
@@ -492,21 +501,31 @@ def tilt_reason(gravity, max_tilt_deg):
     return None
 
 
-def brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd):
+def brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd, observe=None):
     previous = None
     if threading.current_thread() is threading.main_thread():
         previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
-        return _brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd)
+        return _brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd, observe)
     finally:
         if previous is not None:
             signal.signal(signal.SIGINT, previous)
 
 
-def _brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd):
+def _call_observer(observe, errors):
+    if observe is None:
+        return
+    try:
+        observe()
+    except Exception as error:
+        errors.append(f"{type(error).__name__}: {error}")
+
+
+def _brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd, observe=None):
     damping_errors = {}
     stop_errors = {}
     stop_sent = []
+    observe_errors = []
     enabled = [mid for mid in sorted(set(enabled_ids)) if mid in motors]
     if enabled and duration > 0.0:
         deadline = time.monotonic() + duration
@@ -523,6 +542,7 @@ def _brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd):
                         damping_errors[mid] = error
 
                 time.sleep(0.01)
+                _call_observer(observe, observe_errors)
         except KeyboardInterrupt:
             pass
 
@@ -541,12 +561,15 @@ def _brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd):
             bus.shutdown()
         except Exception:
             pass
-    return {
+    report = {
         "damped": enabled,
         "damping_errors": damping_errors,
         "stop_sent": stop_sent,
         "stop_errors": stop_errors,
     }
+    if observe is not None:
+        report["observe_errors"] = observe_errors
+    return report
 
 
 def shutdown_report_lines(report):

@@ -269,7 +269,7 @@ python3 scripts/sim_to_real/real_to_mujoco.py --robot max --once --motor-id head
 | - | `--vx` / `--vy` / `--wz` | `0.0` | Constant velocity command inside the trained envelope |
 | - | `--scenario` | - | Command schedule `T:VX,VY,WZ;...` from the start of policy control; starts with a 0,0,0 stand, needs `--duration`, any key cancels it |
 | - | `--keyboard` | Off | Steer the command with w/s, q/e, a/d, SPACE |
-| - | `--telemetry` | Off | Per-step CSV; no path = timestamped file under `results/policy_to_real`; live mode refuses before motor enable when the IMU sample lacks `seq`, `device_timestamp_us` or `host_timestamp_ns`, and a timing-column failure mid-run leaves those cells blank and warns at exit |
+| - | `--telemetry` | Off | Per-step CSV plus `_arrays.npz` and, live only, `_phases.csv` and `_meta.json`; no path = timestamped file under `results/policy_to_real`; live mode refuses before motor enable when any of these files exists or the IMU sample lacks `seq`, `device_timestamp_us` or `host_timestamp_ns`, and a timing-column failure mid-run leaves those cells blank and warns at exit |
 | - | `--log` | Off | Save terminal output; no path = timestamped file |
 | - | `--gain-scale` | `1.0` | Fraction of the trained per-joint gains |
 | - | `--max-tilt-deg` | `40` | Trunk tilt stop |
@@ -302,6 +302,13 @@ python3 scripts/policy_test/policy_to_real.py \
 | `tick_period_ms` | Unclamped period between loop ticks (`dt_ms` is the clamped slew dt) |
 | `<joint>.age_ms` | Live only: time since `FeedbackHub.pump` drained the joint's last type 0x02 frame, taken when the row is written (after send); drain-time age, one stamp per pump batch, not acquisition age |
 | `<joint>.rx_age_ms` | Live only: wall time when the row is written minus the socketcan kernel receive timestamp of that frame |
+| `late_ms`, `poll_ms`, `prev_work_ms` | Live only: tick start minus its schedule, feedback drain time, previous tick's work time before sleep |
+| `rx_frames.<channel>` | Live only: CAN frames of any type drained from that bus this tick |
+| `acc_*`, `quat_*`, `imu_temp_c` | AHRS linear acceleration, orientation and IMU temperature of the sample read this tick |
+| `<joint>.mode`, `.action`, `.slew_vel` | Live only: motor mode status, runner-clipped action fed back to the policy, slew-limiter velocity |
+| `*_arrays.npz` | Per-step `obs` (235), `raw_action`, `policy_action`, `targets`, `pos`, `vel`, `torque`, `gyro`, `gravity`, `velocity_command` (float32), `commanded`, `t_s`, `wall_time` (float64), `step`; first 60000 steps; written after the brake. Read mode: `obs`, `pos`, `vel`, `raw_action`, `targets`, `gyro`, `gravity` |
+| `*_phases.csv` | Live only: per-joint feedback at enable, every approach tick and every brake cycle (100 Hz) |
+| `*_meta.json` | Policy identity, settings, saved motor parameters (`limit_torque`, `limit_cur`, `vbus`, `run_mode`, `zero_sta`), git state, CAN and IMU counters; `end` holds the exit reason, approach errors, shutdown report and run statistics |
 
 <br>
 
