@@ -202,7 +202,7 @@ The variant comes from `~/.config/robonex/robot_model`; CAN channels from `~/.co
 | `left_arm` | `15`–`18` shoulder_pitch/roll/yaw, elbow | rs02 | `can2` | - | ✓ | ✓ |
 | `right_arm` | `20`–`23` shoulder_pitch/roll/yaw, elbow | rs02 | `can3` | - | ✓ | ✓ |
 
-PLACEHOLDER until measured: head limits ±30° with kp 20 / kd 1, arm limits ±45° with kp 40 / kd 2. Motors without a MuJoCo actuator (head `13` on edu and pro) show `not in sim`.
+Head limit ±73° and shoulder pitch (15, 20) ±100° (user, 2026-10-01). PLACEHOLDER until measured: head kp 20 / kd 1, other arm limits ±45°, arm kp 40 / kd 2. Motors without a MuJoCo actuator (head `13` on edu and pro) show `not in sim`.
 
 ### `mujoco_to_real.py`
 
