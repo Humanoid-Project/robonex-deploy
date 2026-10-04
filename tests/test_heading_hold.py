@@ -137,7 +137,7 @@ def test_parse_args(ptr, tmp_path):
             ptr.parse_args(["--policy", str(policy)] + bad)
 
 
-def run_loop(module, telemetry_path, heading_hold, duration=4.0):
+def run_loop(module, telemetry_path, heading_hold, duration=4.0, wz=0.0):
     import safety
     from robonex_common.joints import JOINT_BY_ID, JOINT_BY_MODEL_NAME
     from robonex_common.models import robot_model
@@ -169,7 +169,7 @@ def run_loop(module, telemetry_path, heading_hold, duration=4.0):
         commander = module.TargetCommander(motors, starts, module.SETTINGS)
         limits = {mid: robot_model("ver2_edu").joint_limits_by_id()[mid] for mid in motor_ids}
         thermal = module.ThermalLoad({mid: RATED_TORQUE[JOINT_BY_ID[mid].motor_model] for mid in motor_ids})
-        args = SimpleNamespace(duration=duration, telemetry=telemetry_path, vx=0.2, vy=0.0, wz=0.0, keyboard=False,
+        args = SimpleNamespace(duration=duration, telemetry=telemetry_path, vx=0.2, vy=0.0, wz=wz, keyboard=False,
                                heading_hold=heading_hold, heading_kp=1.0, heading_ki=0.1, heading_source="gyro")
         runner.policy_path = Path("policy.onnx")
         runner.velocity_command[:] = (args.vx, args.vy, args.wz)
@@ -196,7 +196,48 @@ def test_policy_loop_feeds_heading_wz_only_to_the_policy(ptr, tmp_path, capsys):
     assert np.max(np.abs(seen[:, 2])) > 0.0
     assert np.max(np.abs(seen[:, 2])) <= ptr.HeadingHold.OUTPUT_LIMIT
     assert all(float(r["cmd_wz"]) == 0.0 for r in rows)
+    policy_wz = np.array([float(r["policy_wz"]) for r in rows])
+    assert np.all(policy_wz == pytest.approx(seen[: len(rows), 2], abs=1e-5))
     assert tuple(final) == (0.2, 0.0, 0.0)
+
+
+def test_policy_wz_logs_the_operator_turn_while_released(ptr, tmp_path, capsys):
+    path = tmp_path / "turn.csv"
+    _, seen, final = run_loop(ptr, path, True, wz=0.1)
+    rows = read_csv(path)
+    hold_end = ptr.SETTINGS.ramp_seconds + ptr.SETTINGS.command_hold_seconds
+    late = [r for r in rows if float(r["t_s"]) > hold_end + 0.05]
+    assert late and all(r["heading_engaged"] == "0" for r in late)
+    assert all(float(r["heading_wz"]) == 0.0 for r in late)
+    assert all(float(r["policy_wz"]) == pytest.approx(0.1, abs=1e-6) for r in late)
+    assert float(final[2]) == pytest.approx(0.1, abs=1e-6)
+
+
+def test_keyboard_opposite_turns_return_to_exact_zero(ptr, monkeypatch):
+    keys = iter([b"a", b"d", b"aad", b"d"])
+    pending = []
+
+    def fake_select(r, w, x, timeout):
+        if not pending:
+            try:
+                pending.append(next(keys))
+            except StopIteration:
+                return ([], [], [])
+        return (r, [], [])
+
+    def fake_read(fd, n):
+        return pending.pop(0)
+
+    monkeypatch.setattr(ptr.select, "select", fake_select)
+    monkeypatch.setattr(ptr.os, "read", fake_read)
+    keyboard = ptr.KeyboardCommand(ptr.COMMAND_LIMITS)
+    keyboard.active, keyboard.fd = True, 0
+    command = np.array([0.2, 0.0, 0.0], dtype=np.float32)
+    keyboard.poll(command)
+    assert float(command[2]) == 0.0
+    hold = ptr.HeadingHold(1.0, 0.1, "gyro")
+    hold.update(0.0, (0.0, 0.0, 0.0), LEVEL, None, command, True)
+    assert hold.engaged and hold.integral == 0.0 and hold.wz == 0.0
 
 
 def test_policy_loop_without_heading_hold_is_unchanged(ptr, tmp_path, capsys):

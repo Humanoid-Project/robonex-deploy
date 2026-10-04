@@ -484,7 +484,7 @@ def timing_cells(timing):
 IMU_EXTRA_COLUMNS = ("acc_x", "acc_y", "acc_z", "quat_w", "quat_x", "quat_y", "quat_z", "imu_temp_c")
 HEADING_COLUMNS = (
     "heading_gyro_deg", "heading_quat_deg", "heading_target_deg", "heading_error_deg",
-    "heading_integral", "heading_wz", "heading_engaged",
+    "heading_integral", "heading_wz", "heading_engaged", "policy_wz",
 )
 LOOP_EXTRA_COLUMNS = (
     "late_ms", "poll_ms", "prev_work_ms", "slew_lag_deg", "runner_clip_total", "target_clip_total",
@@ -1677,6 +1677,7 @@ class HeadingHold:
         self.wz = 0.0
         self.engaged = False
         self.last_now = None
+        self.policy_wz = None
 
     @staticmethod
     def quat_yaw(sample):
@@ -1735,7 +1736,7 @@ class HeadingHold:
         def deg(value):
             return "" if value is None else _round(math.degrees(value), 4)
         return [deg(self.heading_gyro), deg(self.heading_quat), deg(self.target), deg(self.error),
-                _round(self.integral, 5), _round(self.wz, 5), int(self.engaged)]
+                _round(self.integral, 5), _round(self.wz, 5), int(self.engaged), _round(self.policy_wz, 5)]
 
     def status_line(self):
         if not self.engaged:
@@ -1813,11 +1814,13 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
             if heading is not None:
                 heading_wz = heading.update(now, angular_velocity, gravity, imu.last_sample,
                                             requested_command, active=not holding)
-            if holding:
-                runner.velocity_command[:] = 0.0
-            elif heading is not None and heading.engaged:
-                runner.velocity_command[2] = heading_wz
             try:
+                if holding:
+                    runner.velocity_command[:] = 0.0
+                elif heading is not None and heading.engaged:
+                    runner.velocity_command[2] = heading_wz
+                if heading is not None:
+                    heading.policy_wz = float(runner.velocity_command[2])
                 observation = runner.observation(positions, velocities, angular_velocity, gravity)
                 raw_action, policy_action, targets = runner.step(observation, commit=False)
             except ValueError as error:
@@ -2257,7 +2260,8 @@ class KeyboardCommand:
                 elif key in self.KEYS:
                     axis, delta = self.KEYS[key]
                     low, high = self.limits[axis]
-                    command[axis] = max(low, min(high, float(command[axis]) + delta))
+                    value = max(low, min(high, float(command[axis]) + delta))
+                    command[axis] = 0.0 if abs(value) < 1e-6 else value
         return note
 
     def legend(self):

@@ -308,7 +308,7 @@ python3 scripts/policy_test/policy_to_real.py \
 
 | Output | Description |
 | --- | --- |
-| `heading_*` | Heading hold: gyro and AHRS heading, target, error (deg), integral and loop wz (rad/s), engaged; blank without `--heading-hold` |
+| `heading_*`, `policy_wz` | Heading hold: gyro and AHRS heading, target, error (deg), integral and controller correction (rad/s, 0 when released), engaged, and the yaw-rate command the policy saw; blank without `--heading-hold` |
 | `imu_age_ms` | Time since the loop last saw a new AHRS seq or raw-IMU frame count (the stale-stop input); about 0 on a healthy stream |
 | `imu_host_age_ms` | Monotonic time right after `imu.read` minus `sample.host_timestamp_ns`: AHRS publish to policy read age, not raw-gyro age; excludes the device/wire delay d0 and the raw-gyro hold |
 | `imu_device_dt_ms` | Difference of consecutive ticks' `device_timestamp_us` (AHRS device clock) |
