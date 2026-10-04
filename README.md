@@ -267,7 +267,6 @@ python3 scripts/sim_to_real/real_to_mujoco.py --robot max --once --motor-id head
 | - | `--read` | Off | Read-only preview; no motor is commanded |
 | - | `--duration` | Until Ctrl-C | Stop after this many seconds |
 | - | `--vx` / `--vy` / `--wz` | `0.0` | Constant velocity command inside the trained envelope |
-| - | `--scenario` | - | Command schedule `T:VX,VY,WZ;...` from the start of policy control; starts with a 0,0,0 stand, needs `--duration`, any key cancels it |
 | - | `--keyboard` | Off | Steer the command with w/s, q/e, a/d, SPACE |
 | - | `--telemetry` | Off | Per-step CSV plus `_arrays.npz` and, live only, `_phases.csv` and `_meta.json`; no path = timestamped file under `results/policy_to_real`; live mode refuses before motor enable when any of these files exists or the IMU sample lacks `seq`, `device_timestamp_us` or `host_timestamp_ns`, and a timing-column failure mid-run leaves those cells blank and warns at exit |
 | - | `--log` | Off | Save terminal output; no path = timestamped file |
@@ -279,8 +278,9 @@ python3 scripts/sim_to_real/real_to_mujoco.py --robot max --once --motor-id head
 # Example
 python3 scripts/policy_test/policy_to_real.py \
   --policy policies/<run>/policy.onnx \
-  --duration 32 \
-  --scenario "0:0,0,0;10:0.1,0,0;20:0.2,0,0" \
+  --duration 60 \
+  --keyboard \
+  --approach-tolerance-deg 5 \
   --telemetry \
   --log
 

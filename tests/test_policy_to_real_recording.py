@@ -128,7 +128,7 @@ def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False):
 
         monkeypatch.setattr(module.PolicyRunner, "step", failing_step)
     path = tmp_path / "live.csv"
-    args = SimpleNamespace(vx=0.0, vy=0.0, wz=0.0, scenario=None, scenario_text="", keyboard=False,
+    args = SimpleNamespace(vx=0.0, vy=0.0, wz=0.0, keyboard=False,
                            duration=2.0, telemetry=path)
     error = None
     try:

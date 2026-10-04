@@ -1533,8 +1533,7 @@ class TelemetryRecorder:
                 Path(__file__).resolve().parents[2], ("scripts",)
             ),
             "command": {"vx": args.vx, "vy": args.vy, "wz": args.wz,
-                        "keyboard": bool(getattr(args, "keyboard", False)),
-                        "scenario": getattr(args, "scenario_text", None)},
+                        "keyboard": bool(getattr(args, "keyboard", False))},
             "settings": {
                 "gain_scale": settings.gain_scale,
                 "max_error_deg": settings.max_error_deg,
@@ -1652,7 +1651,6 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
     ramp_started = next_tick
     home = {motor_id: wrap_to_pi(commander.commands[motor_id]) for motor_id in motors}
     deadline = None if args.duration is None else next_tick + args.duration
-    scenario = getattr(args, "scenario", None)
     commander.reset_stats()
     reproject = roll_reprojector(runner.pipeline, runner.motor_ids)
     owns_telemetry = telemetry is None and bool(getattr(args, "telemetry", None))
@@ -1703,9 +1701,6 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
             tilt = tilt_reason(gravity, SETTINGS.max_tilt_deg)
             if tilt:
                 raise stop(tilt, gravity=gravity, gyro=angular_velocity, imu_age=age)
-
-            if scenario:
-                runner.velocity_command[:] = scenario_command(scenario, now - stats.started)
 
             requested_command = runner.velocity_command.copy()
             if now - ramp_started < SETTINGS.ramp_seconds + SETTINGS.command_hold_seconds:
@@ -1803,14 +1798,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                 sys.stdout.flush()
 
             if keyboard is not None:
-                consumed = keyboard.consumed
                 note = keyboard.poll(runner.velocity_command)
-                if scenario and (note or keyboard.consumed != consumed):
-                    scenario = None
-                    runner.velocity_command[:] = (0.0, 0.0, 0.0)
-                    note = "scenario cancelled by keyboard input; command zeroed (stand)"
-                    if keyboard.steer and not keyboard.lost:
-                        note += "; keys steer from now"
                 if note:
                     print(f"  [command] {note}   "
                           f"vx {runner.velocity_command[0]:+.2f} "
@@ -1841,8 +1829,6 @@ def run_deploy(policy_path, contract, args):
     require_robot_model(contract.robot_model)
     runner = PolicyRunner(policy_path, contract)
     runner.velocity_command[:] = (args.vx, args.vy, args.wz)
-    if args.scenario:
-        runner.velocity_command[:] = args.scenario[0][1]
     imu = ImuSource(SETTINGS, notes)
 
     motor_ids = [JOINT_BY_MODEL_NAME[name].motor_id for name in contract.joint_order]
@@ -1864,8 +1850,6 @@ def run_deploy(policy_path, contract, args):
     keyboard = None
     if args.keyboard:
         keyboard = KeyboardCommand(COMMAND_LIMITS)
-    elif args.scenario:
-        keyboard = KeyboardCommand(COMMAND_LIMITS, steer=False)
     thermal = ThermalLoad({
         motor_id: RATED_TORQUE[JOINT_BY_ID[motor_id].motor_model] for motor_id in motor_ids
     })
@@ -1929,16 +1913,12 @@ def run_deploy(policy_path, contract, args):
             )
         print(f"  motor IDs   : {sorted(motor_ids)}")
         print(f"  duration    : {'until Ctrl-C' if args.duration is None else f'{args.duration:.1f} s'}")
-        if args.scenario:
-            print(f"  scenario    : {args.scenario_text}  (any key cancels it)")
         print(f"  tilt stop   : {SETTINGS.max_tilt_deg:g} deg from vertical")
         print("  The robot must hang on the stand or be held; this tool cannot catch a fall.")
         print("  Keep the emergency stop within reach.")
         confirm("Press Enter to enable the motors and start, or Ctrl-C to cancel: ")
         if keyboard is not None and keyboard.start():
             print(f"  {keyboard.legend()}")
-        if args.scenario and (keyboard is None or not keyboard.active):
-            raise RuntimeError("--scenario needs a working key reader to be cancellable; motors were not enabled")
 
         stop_ids = list(motor_ids)
         starts, enabled_ids = enable_with_runtime_feedback(
@@ -2107,10 +2087,8 @@ class KeyboardCommand:
         "a": (2, +0.05), "d": (2, -0.05),
     }
 
-    def __init__(self, limits, steer=True):
+    def __init__(self, limits):
         self.limits = limits
-        self.steer = steer
-        self.consumed = 0
         self.escape_state = 0
         self.fd = None
         self.saved = None
@@ -2145,9 +2123,6 @@ class KeyboardCommand:
                 self.lost = True
                 command[:] = (0.0, 0.0, 0.0)
                 return "stdin closed; command zeroed and keyboard disabled"
-            self.consumed += len(data)
-            if not self.steer:
-                continue
             for byte in data:
                 if self.escape_state == 2:
                     if 0x40 <= byte <= 0x7E:
@@ -2174,8 +2149,6 @@ class KeyboardCommand:
     def legend(self):
         if not self.active:
             return "keyboard: off"
-        if not self.steer:
-            return "any key: cancel the scenario and stand   Ctrl-C stop"
         return "keys: w/s forward  q/e strafe  a/d turn  SPACE zero  Ctrl-C stop"
 
 
@@ -2185,23 +2158,6 @@ class KeyboardCommand:
 # ranges: it widens both ways from (0.1, 0.1) toward limit_ranges, and S30, S33 and S34
 # all hit the full -0.2..0.5 on x by iteration ~160, spending 84% of training there.
 COMMAND_LIMITS = ((-0.2, 0.5), (-0.2, 0.2), (-0.2, 0.2))
-
-
-def parse_scenario(text):
-    schedule = []
-    for part in text.split(";"):
-        start, values = part.split(":")
-        command = tuple(float(v) for v in values.split(","))
-        if len(command) != 3 or not math.isfinite(float(start)):
-            raise ValueError(f"segment {part!r} needs T:VX,VY,WZ")
-        schedule.append((float(start), command))
-    if schedule[0][0] != 0.0 or any(b[0] <= a[0] for a, b in zip(schedule, schedule[1:])):
-        raise ValueError("segments must start at 0 and have increasing times")
-    return schedule
-
-
-def scenario_command(schedule, elapsed):
-    return [command for start, command in schedule if start <= elapsed][-1]
 
 
 def parse_args(argv=None):
@@ -2267,13 +2223,6 @@ def parse_args(argv=None):
         "--wz", type=float, default=0.0, help="Yaw rate command (rad/s)"
     )
     parser.add_argument(
-        "--scenario",
-        metavar="T:VX,VY,WZ;...",
-        help="Fixed command schedule in seconds from the start of policy control, e.g. "
-             "0:0,0,0;10:0.1,0,0;20:0.2,0,0. Must start with a stand that outlasts the ramp-in, "
-             "needs --duration, and any keyboard input cancels it",
-    )
-    parser.add_argument(
         "--gain-scale",
         type=float,
         default=Settings.gain_scale,
@@ -2310,27 +2259,6 @@ def parse_args(argv=None):
                 f"{name}={value} is outside the trained envelope {limit}; the policy has never "
                 "seen that command and its response is undefined"
             )
-    args.scenario_text = args.scenario
-    if args.scenario is not None:
-        try:
-            args.scenario = parse_scenario(args.scenario)
-        except ValueError as error:
-            parser.error(f"--scenario: {error}")
-        if args.read:
-            parser.error("--scenario applies to live control only")
-        if not sys.stdin.isatty():
-            parser.error("--scenario needs an interactive terminal so that a key press can cancel it")
-        if args.duration is None or args.duration < args.scenario[-1][0]:
-            parser.error("--scenario needs --duration covering its last segment")
-        if any(args.scenario[0][1]) or (len(args.scenario) > 1 and args.scenario[1][0] < Settings.ramp_seconds):
-            parser.error(f"--scenario must start with 0,0,0 held at least {Settings.ramp_seconds:g} s (the ramp-in)")
-        for start, command in args.scenario:
-            for axis, (value, limit) in enumerate(zip(command, COMMAND_LIMITS)):
-                if not math.isfinite(value) or not limit[0] <= value <= limit[1]:
-                    parser.error(
-                        f"--scenario segment at {start:g} s: {'vx vy wz'.split()[axis]}={value} is outside "
-                        f"the trained envelope {limit}"
-                    )
     if args.telemetry == "":
         stamp = time.strftime("%Y%m%d_%H%M%S")
         kind = "read" if args.read else "live"

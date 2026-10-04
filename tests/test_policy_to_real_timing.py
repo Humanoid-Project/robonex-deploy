@@ -243,10 +243,10 @@ def run_loop(module, contract, telemetry_path, duration=3.0):
         limits = {mid: robot_model("ver2_edu").joint_limits_by_id()[mid] for mid in motor_ids}
         thermal = module.ThermalLoad({mid: RATED_TORQUE[JOINT_BY_ID[mid].motor_model] for mid in motor_ids})
         args = SimpleNamespace(
-            duration=duration, telemetry=telemetry_path, vx=0.0, vy=0.0, wz=0.0, keyboard=False,
-            scenario=[(0.0, (0.0, 0.0, 0.0)), (1.6, (0.2, 0.0, 0.1))], scenario_text="test",
+            duration=duration, telemetry=telemetry_path, vx=0.2, vy=0.0, wz=0.1, keyboard=False,
         )
         runner.policy_path = Path("policy.onnx")
+        runner.velocity_command[:] = (args.vx, args.vy, args.wz)
         module.policy_loop(runner, commander, joints, imu, motors, limits, contract, args, [],
                            module.LoopStats(), module.FaultMonitor(), thermal, None)
     finally:
@@ -506,7 +506,7 @@ def run_deploy_until_enable(module, monkeypatch, driver_class, telemetry):
     monkeypatch.setattr(module, "shutdown_report_lines", lambda report: [])
     monkeypatch.setattr(module.ImuSource, "start", start)
     monkeypatch.setattr(module.ImuSource, "stop", lambda self: None)
-    args = SimpleNamespace(vx=0.0, vy=0.0, wz=0.0, scenario=None, scenario_text="", keyboard=False,
+    args = SimpleNamespace(vx=0.0, vy=0.0, wz=0.0, keyboard=False,
                            duration=1.0, telemetry=telemetry)
     try:
         module.run_deploy(Path("policy.onnx"), make_contract(), args)
