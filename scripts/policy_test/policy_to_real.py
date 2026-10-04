@@ -482,10 +482,15 @@ def timing_cells(timing):
 
 
 IMU_EXTRA_COLUMNS = ("acc_x", "acc_y", "acc_z", "quat_w", "quat_x", "quat_y", "quat_z", "imu_temp_c")
-STEP_EXTRA_COLUMNS = (
+HEADING_COLUMNS = (
+    "heading_gyro_deg", "heading_quat_deg", "heading_target_deg", "heading_error_deg",
+    "heading_integral", "heading_wz", "heading_engaged",
+)
+LOOP_EXTRA_COLUMNS = (
     "late_ms", "poll_ms", "prev_work_ms", "slew_lag_deg", "runner_clip_total", "target_clip_total",
     "roll_clip_total", "roll_reprojected_total", "thermal_load_max",
-) + IMU_EXTRA_COLUMNS
+)
+STEP_EXTRA_COLUMNS = LOOP_EXTRA_COLUMNS + IMU_EXTRA_COLUMNS + HEADING_COLUMNS
 JOINT_EXTRA_FIELDS = ("mode", "action", "slew_vel")
 READ_JOINT_EXTRA_FIELDS = ("vel", "raw_action", "target")
 PHASE_JOINT_FIELDS = ("age_ms", "pos", "vel", "torque", "temp", "fault", "mode", "commanded", "rx_age_ms")
@@ -504,7 +509,16 @@ def imu_extra_cells(sample):
         return [""] * len(IMU_EXTRA_COLUMNS)
 
 
-def step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, pipeline, thermal, sample):
+def heading_cells(heading):
+    if heading is None:
+        return [""] * len(HEADING_COLUMNS)
+    try:
+        return heading.cells()
+    except Exception:
+        return [""] * len(HEADING_COLUMNS)
+
+
+def step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, pipeline, thermal, sample, heading=None):
     try:
         loads = getattr(thermal, "load", None) or {}
         cells = [
@@ -517,8 +531,8 @@ def step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, pipeline, therma
             _round(max(loads.values()) if loads else None, 4),
         ]
     except Exception:
-        cells = [""] * (len(STEP_EXTRA_COLUMNS) - len(IMU_EXTRA_COLUMNS))
-    return cells + imu_extra_cells(sample)
+        cells = [""] * len(LOOP_EXTRA_COLUMNS)
+    return cells + imu_extra_cells(sample) + heading_cells(heading)
 
 
 def _finite_or_none(value):
@@ -1534,6 +1548,11 @@ class TelemetryRecorder:
             ),
             "command": {"vx": args.vx, "vy": args.vy, "wz": args.wz,
                         "keyboard": bool(getattr(args, "keyboard", False))},
+            "heading_hold": (
+                {"kp": args.heading_kp, "ki": args.heading_ki, "source": args.heading_source,
+                 "integral_limit": HeadingHold.INTEGRAL_LIMIT, "output_limit": HeadingHold.OUTPUT_LIMIT}
+                if getattr(args, "heading_hold", False) else None
+            ),
             "settings": {
                 "gain_scale": settings.gain_scale,
                 "max_error_deg": settings.max_error_deg,
@@ -1641,6 +1660,90 @@ def _round(value, digits=5):
         return ""
 
 
+class HeadingHold:
+    INTEGRAL_LIMIT = 0.1
+    OUTPUT_LIMIT = 0.2
+    MAX_DT = 0.1
+
+    def __init__(self, kp, ki, source):
+        self.kp = float(kp)
+        self.ki = float(ki)
+        self.source = source
+        self.heading_gyro = 0.0
+        self.heading_quat = None
+        self.target = None
+        self.error = None
+        self.integral = 0.0
+        self.wz = 0.0
+        self.engaged = False
+        self.last_now = None
+
+    @staticmethod
+    def quat_yaw(sample):
+        if sample is None:
+            return None
+        try:
+            q = sample.orientation
+            w, x, y, z = float(q.w), float(q.x), float(q.y), float(q.z)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not all(math.isfinite(v) for v in (w, x, y, z)) or w * w + x * x + y * y + z * z < 1e-6:
+            return None
+        return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+    @staticmethod
+    def world_yaw_rate(gyro, gravity):
+        norm = math.sqrt(sum(float(g) * float(g) for g in gravity))
+        if not math.isfinite(norm) or norm < 1e-6:
+            return float(gyro[2])
+        return -sum(float(w) * float(g) for w, g in zip(gyro, gravity)) / norm
+
+    def release(self):
+        self.engaged = False
+        self.target = None
+        self.error = None
+        self.integral = 0.0
+        self.wz = 0.0
+
+    def update(self, now, gyro, gravity, sample, command, active):
+        dt = 0.0 if self.last_now is None else min(max(now - self.last_now, 0.0), self.MAX_DT)
+        self.last_now = now
+        rate = self.world_yaw_rate(gyro, gravity)
+        if math.isfinite(rate):
+            self.heading_gyro = wrap_to_pi(self.heading_gyro + rate * dt)
+        self.heading_quat = self.quat_yaw(sample)
+        heading = self.heading_quat if self.source == "quat" else self.heading_gyro
+        planar = math.hypot(float(command[0]), float(command[1]))
+        if (not active or heading is None or not math.isfinite(heading)
+                or float(command[2]) != 0.0 or planar <= GAIT_COMMAND_DEADBAND):
+            self.release()
+            return 0.0
+        if not self.engaged:
+            self.engaged = True
+            self.target = heading
+            self.integral = 0.0
+            dt = 0.0
+        self.error = wrap_to_pi(self.target - heading)
+        integral = clamp(self.integral + self.ki * self.error * dt, -self.INTEGRAL_LIMIT, self.INTEGRAL_LIMIT)
+        demand = self.kp * self.error + integral
+        if abs(demand) <= self.OUTPUT_LIMIT or demand * self.error < 0.0:
+            self.integral = integral
+        self.wz = clamp(self.kp * self.error + self.integral, -self.OUTPUT_LIMIT, self.OUTPUT_LIMIT)
+        return self.wz
+
+    def cells(self):
+        def deg(value):
+            return "" if value is None else _round(math.degrees(value), 4)
+        return [deg(self.heading_gyro), deg(self.heading_quat), deg(self.target), deg(self.error),
+                _round(self.integral, 5), _round(self.wz, 5), int(self.engaged)]
+
+    def status_line(self):
+        if not self.engaged:
+            return f"heading hold ({self.source}): released"
+        return (f"heading hold ({self.source}): error {math.degrees(self.error):+6.2f} deg   "
+                f"wz {self.wz:+.3f} rad/s   integral {self.integral:+.3f}")
+
+
 def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, notes, stats,
                 faults, thermal, keyboard=None, telemetry=None):
     period = 1.0 / contract.policy_hz
@@ -1658,6 +1761,9 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
         telemetry = TelemetryRecorder(args.telemetry, contract, motors, hubs=getattr(joints, "hubs", None))
     timing = TimingProbe() if telemetry is not None else None
     prev_work_ms = None
+    heading = None
+    if getattr(args, "heading_hold", False):
+        heading = HeadingHold(args.heading_kp, args.heading_ki, args.heading_source)
     if owns_telemetry:
         print(f"Telemetry   : {telemetry.path}  ({contract.policy_hz:.0f} Hz per-motor record)")
         print(f"Provenance  : {telemetry.write_sidecar(runner.policy_path, contract, SETTINGS, args).name}")
@@ -1703,8 +1809,14 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                 raise stop(tilt, gravity=gravity, gyro=angular_velocity, imu_age=age)
 
             requested_command = runner.velocity_command.copy()
-            if now - ramp_started < SETTINGS.ramp_seconds + SETTINGS.command_hold_seconds:
+            holding = now - ramp_started < SETTINGS.ramp_seconds + SETTINGS.command_hold_seconds
+            if heading is not None:
+                heading_wz = heading.update(now, angular_velocity, gravity, imu.last_sample,
+                                            requested_command, active=not holding)
+            if holding:
                 runner.velocity_command[:] = 0.0
+            elif heading is not None and heading.engaged:
+                runner.velocity_command[2] = heading_wz
             try:
                 observation = runner.observation(positions, velocities, angular_velocity, gravity)
                 raw_action, policy_action, targets = runner.step(observation, commit=False)
@@ -1746,7 +1858,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     send_ms=send_ms,
                     timing=timing.safe_update(now, imu.last_sample, imu_read_ns),
                     extra=step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, runner.pipeline,
-                                           thermal, imu.last_sample),
+                                           thermal, imu.last_sample, heading),
                     policy_action=policy_action, slew_velocities=commander.velocities,
                     observation=observation, positions=positions, velocities=velocities,
                 )
@@ -1788,6 +1900,8 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                         f"vy {runner.velocity_command[1]:+.2f}  "
                         f"wz {runner.velocity_command[2]:+.2f}    {keyboard.legend()}"
                     )
+                if heading is not None:
+                    lines.append(heading.status_line())
                 lines.append(thermal.worst_line())
                 lines.append(faults.current_line(motors))
                 lines.append(faults.history_line())
@@ -2223,6 +2337,27 @@ def parse_args(argv=None):
         "--wz", type=float, default=0.0, help="Yaw rate command (rad/s)"
     )
     parser.add_argument(
+        "--heading-hold",
+        action="store_true",
+        help="Hold the heading captured when walking starts by adding a yaw-rate command the "
+             "policy sees (PI, output within +/-0.2 rad/s). Engages only while the operator's wz "
+             "is 0 and vx/vy is above the gait deadband; turning or zeroing releases it and the "
+             "next straight command captures a new heading. Off by default",
+    )
+    parser.add_argument(
+        "--heading-kp", type=float, default=1.0, metavar="K",
+        help="Heading-hold proportional gain, (rad/s) per rad of heading error (0-2)",
+    )
+    parser.add_argument(
+        "--heading-ki", type=float, default=0.1, metavar="K",
+        help="Heading-hold integral gain, (rad/s) per rad*s; the integral is limited to +/-0.1 rad/s (0-0.5)",
+    )
+    parser.add_argument(
+        "--heading-source", choices=("gyro", "quat"), default="gyro",
+        help="Heading the loop holds: the bias-calibrated raw gyro integrated about the world vertical "
+             "(gyro), or the N100 AHRS quaternion yaw (quat). Both are recorded either way",
+    )
+    parser.add_argument(
         "--gain-scale",
         type=float,
         default=Settings.gain_scale,
@@ -2247,6 +2382,12 @@ def parse_args(argv=None):
         parser.error("--duration must be finite and positive")
     if not math.isfinite(args.gain_scale) or not 0.0 < args.gain_scale <= 1.0:
         parser.error("--gain-scale must be in (0, 1]")
+    if not math.isfinite(args.heading_kp) or not 0.0 <= args.heading_kp <= 2.0:
+        parser.error("--heading-kp must be in [0, 2]; 4 and above jittered at the step rhythm in simulation")
+    if not math.isfinite(args.heading_ki) or not 0.0 <= args.heading_ki <= 0.5:
+        parser.error("--heading-ki must be in [0, 0.5]")
+    if args.heading_hold and args.read:
+        parser.error("--heading-hold has no effect in --read mode")
     for name, value, limit in (
         ("--vx", args.vx, COMMAND_LIMITS[0]),
         ("--vy", args.vy, COMMAND_LIMITS[1]),

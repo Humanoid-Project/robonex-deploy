@@ -268,6 +268,9 @@ python3 scripts/sim_to_real/real_to_mujoco.py --robot max --once --motor-id head
 | - | `--duration` | Until Ctrl-C | Stop after this many seconds |
 | - | `--vx` / `--vy` / `--wz` | `0.0` | Constant velocity command inside the trained envelope |
 | - | `--keyboard` | Off | Steer the command with w/s, q/e, a/d, SPACE |
+| - | `--heading-hold` | Off | PI heading hold on the yaw-rate command the policy sees (±0.2 rad/s); engages with wz 0 and vx/vy above the gait deadband |
+| - | `--heading-kp` / `--heading-ki` | `1.0` / `0.1` | Heading-hold gains (kp 0–2, ki 0–0.5; integral ±0.1 rad/s) |
+| - | `--heading-source` | `gyro` | Held heading: integrated bias-calibrated gyro (`gyro`) or N100 AHRS yaw (`quat`); both are recorded |
 | - | `--telemetry` | Off | Per-step CSV plus `_arrays.npz` and, live only, `_phases.csv` and `_meta.json`; no path = timestamped file under `results/policy_to_real`; live mode refuses before motor enable when any of these files exists or the IMU sample lacks `seq`, `device_timestamp_us` or `host_timestamp_ns`, and a timing-column failure mid-run leaves those cells blank and warns at exit |
 | - | `--log` | Off | Save terminal output; no path = timestamped file |
 | - | `--gain-scale` | `1.0` | Fraction of the trained per-joint gains |
@@ -284,6 +287,17 @@ python3 scripts/policy_test/policy_to_real.py \
   --telemetry \
   --log
 
+# Straight walk with heading hold
+python3 scripts/policy_test/policy_to_real.py \
+  --policy policies/<run>/policy.onnx \
+  --duration 30 \
+  --vx 0.1 \
+  --keyboard \
+  --heading-hold \
+  --approach-tolerance-deg 5 \
+  --telemetry \
+  --log
+
 # Read-only timing capture, no motor commanded
 python3 scripts/policy_test/policy_to_real.py \
   --policy policies/<run>/policy.onnx \
@@ -294,6 +308,7 @@ python3 scripts/policy_test/policy_to_real.py \
 
 | Output | Description |
 | --- | --- |
+| `heading_*` | Heading hold: gyro and AHRS heading, target, error (deg), integral and loop wz (rad/s), engaged; blank without `--heading-hold` |
 | `imu_age_ms` | Time since the loop last saw a new AHRS seq or raw-IMU frame count (the stale-stop input); about 0 on a healthy stream |
 | `imu_host_age_ms` | Monotonic time right after `imu.read` minus `sample.host_timestamp_ns`: AHRS publish to policy read age, not raw-gyro age; excludes the device/wire delay d0 and the raw-gyro hold |
 | `imu_device_dt_ms` | Difference of consecutive ticks' `device_timestamp_us` (AHRS device clock) |
