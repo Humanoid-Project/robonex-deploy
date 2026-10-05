@@ -287,6 +287,7 @@ python3 scripts/sim_to_real/real_to_mujoco.py --robot max --once --motor-id head
 | - | `--telemetry` | Off | Per-step CSV plus `_arrays.npz` and, live only, `_phases.csv` and `_meta.json`; no path = timestamped file under `results/policy_to_real`; live mode refuses before motor enable when any of these files exists or the IMU sample lacks `seq`, `device_timestamp_us` or `host_timestamp_ns`, and a timing-column failure mid-run leaves those cells blank and warns at exit |
 | - | `--log` | Off | Save terminal output; no path = timestamped file |
 | - | `--gain-scale` | `1.0` | Fraction of the trained per-joint gains |
+| - | `--ankle-gain-scale` | `1.0` | Extra factor 1–2 on the four ankle motors' kp and kd (diagnostic; trained at 1.0) |
 | - | `--max-tilt-deg` | `40` | Trunk tilt stop |
 | - | `--approach-tolerance-deg` | `1.0` | Default-pose tolerance before policy control |
 

@@ -127,7 +127,7 @@ class TeeStream:
         return getattr(self.terminal, name)
 
 
-def resolve_gains(scale):
+def resolve_gains(scale, ankle_scale=1.0):
     """Per-motor (kp, kd) from the shared per-joint table, scaled.
 
     The policy is trained against CONTROL_GAINS_BY_JOINT (hip 100/2, knee 150/4,
@@ -138,8 +138,9 @@ def resolve_gains(scale):
     kd_by_motor = {}
     for name, spec in JOINT_BY_MODEL_NAME.items():
         kp, kd = CONTROL_GAINS_BY_JOINT.get(name, (MOTOR_CONTROL_KP, MOTOR_CONTROL_KD))
-        kp_by_motor[spec.motor_id] = kp * scale
-        kd_by_motor[spec.motor_id] = kd * scale
+        factor = scale * (ankle_scale if "ankle" in name else 1.0)
+        kp_by_motor[spec.motor_id] = kp * factor
+        kd_by_motor[spec.motor_id] = kd * factor
     return kp_by_motor, kd_by_motor
 
 
@@ -154,6 +155,7 @@ class Settings:
     # only the fallback for a joint the table does not cover. Ramp this up from a low
     # value on the stand before running at 1.0.
     gain_scale: float = 1.0
+    ankle_gain_scale: float = 1.0
 
     read_poll_timeout: float = 0.02
     read_print_hz: float = 10.0
@@ -887,7 +889,7 @@ class TargetCommander:
         }
         self.commands = dict(start_positions)
         self.velocities = {motor_id: 0.0 for motor_id in motors}
-        self.kp_by_motor, self.kd_by_motor = resolve_gains(settings.gain_scale)
+        self.kp_by_motor, self.kd_by_motor = resolve_gains(settings.gain_scale, settings.ankle_gain_scale)
         self.slew_limited_count = 0
         self.command_count = 0
         self.slew_limited_by_motor = {motor_id: 0 for motor_id in motors}
@@ -1556,6 +1558,7 @@ class TelemetryRecorder:
             ),
             "settings": {
                 "gain_scale": settings.gain_scale,
+                "ankle_gain_scale": settings.ankle_gain_scale,
                 "max_error_deg": settings.max_error_deg,
                 "max_tilt_deg": settings.max_tilt_deg,
                 "max_temp": settings.max_temp,
@@ -1940,6 +1943,8 @@ def run_deploy(policy_path, contract, args):
         print(f"  task        : {contract.task}")
         print(f"  rate        : {contract.policy_hz:.0f} Hz")
         print(f"  gain scale  : {SETTINGS.gain_scale:g}  (1.0 = the gains the policy was trained at)")
+        if SETTINGS.ankle_gain_scale != 1.0:
+            print(f"  ankle gains : x{SETTINGS.ankle_gain_scale:g} on the four ankle motors (the policy was trained at x1)")
         for name, spec in JOINT_BY_MODEL_NAME.items():
             print(
                 f"      {name:22s} kp {ENABLE_KP[spec.motor_id]:6.1f}  kd {ENABLE_KD[spec.motor_id]:5.2f}"
@@ -2288,6 +2293,16 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--ankle-gain-scale",
+        type=float,
+        default=Settings.ankle_gain_scale,
+        metavar="F",
+        help=(
+            "Extra factor (1-2) on the ankle kp and kd only, on top of --gain-scale. The policy was "
+            "trained at 1.0; a diagnostic for the ankle holding error, start at 1.5 on a stand"
+        ),
+    )
+    parser.add_argument(
         "--log",
         nargs="?",
         const="",
@@ -2302,6 +2317,8 @@ def parse_args(argv=None):
         parser.error("--duration must be finite and positive")
     if not math.isfinite(args.gain_scale) or not 0.0 < args.gain_scale <= 1.0:
         parser.error("--gain-scale must be in (0, 1]")
+    if not math.isfinite(args.ankle_gain_scale) or not 1.0 <= args.ankle_gain_scale <= 2.0:
+        parser.error("--ankle-gain-scale must be in [1, 2]")
     if not math.isfinite(args.heading_kp) or not 0.0 <= args.heading_kp <= 2.0:
         parser.error("--heading-kp must be in [0, 2]; 4 and above jittered at the step rhythm in simulation")
     if not math.isfinite(args.heading_ki) or not 0.0 <= args.heading_ki <= 0.5:
@@ -2357,7 +2374,7 @@ def run(args):
 def main(argv=None):
     args = parse_args(argv)
     global SETTINGS, ENABLE_KP, ENABLE_KD
-    SETTINGS = replace(SETTINGS, gain_scale=args.gain_scale)
+    SETTINGS = replace(SETTINGS, gain_scale=args.gain_scale, ankle_gain_scale=args.ankle_gain_scale)
     if args.max_tilt_deg is not None:
         if not 5.0 <= args.max_tilt_deg <= 90.0:
             raise SystemExit("--max-tilt-deg must be between 5 and 90 degrees")
@@ -2374,7 +2391,7 @@ def main(argv=None):
             f"Approach tolerance widened to {args.approach_tolerance_deg:g} deg "
             f"(default {Settings().approach_tolerance_deg:g})"
         )
-    ENABLE_KP, ENABLE_KD = resolve_gains(SETTINGS.gain_scale)
+    ENABLE_KP, ENABLE_KD = resolve_gains(SETTINGS.gain_scale, SETTINGS.ankle_gain_scale)
     if args.log is None:
         return run(args)
     try:

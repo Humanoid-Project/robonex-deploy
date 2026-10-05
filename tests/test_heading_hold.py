@@ -245,3 +245,19 @@ def test_policy_loop_without_heading_hold_is_unchanged(ptr, tmp_path, capsys):
     assert np.all(off_seen[:, 2] == 0.0)
     rows = read_csv(tmp_path / "off.csv")
     assert all(r["heading_engaged"] == "" for r in rows)
+
+
+def test_ankle_gain_scale(ptr, tmp_path):
+    kp, kd = ptr.resolve_gains(1.0, 1.5)
+    base_kp, base_kd = ptr.resolve_gains(1.0)
+    for name, spec in ptr.JOINT_BY_MODEL_NAME.items():
+        factor = 1.5 if "ankle" in name else 1.0
+        assert kp[spec.motor_id] == pytest.approx(base_kp[spec.motor_id] * factor)
+        assert kd[spec.motor_id] == pytest.approx(base_kd[spec.motor_id] * factor)
+    policy = tmp_path / "policy.onnx"
+    policy.write_bytes(b"")
+    assert ptr.parse_args(["--policy", str(policy)]).ankle_gain_scale == 1.0
+    assert ptr.parse_args(["--policy", str(policy), "--ankle-gain-scale", "1.5"]).ankle_gain_scale == 1.5
+    for bad in ("0.5", "2.5", "nan"):
+        with pytest.raises(SystemExit):
+            ptr.parse_args(["--policy", str(policy), "--ankle-gain-scale", bad])
