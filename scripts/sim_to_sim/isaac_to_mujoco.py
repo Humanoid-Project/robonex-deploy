@@ -746,11 +746,6 @@ def parse_args():
             None,
         )
         actual_description_commit = git_commit(description_root)
-        if actual_description_commit != args.contract.description_commit:
-            parser.error(
-                f"robonex-description commit mismatch: manifest={args.contract.description_commit}, "
-                f"checkout={actual_description_commit}"
-            )
         actual_description_sha256 = mujoco_bundle_sha256(
             description_root, args.contract.description_model
         )
@@ -759,13 +754,13 @@ def parse_args():
                 f"robonex-description model bundle mismatch: manifest={args.contract.description_sha256}, "
                 f"checkout={actual_description_sha256}"
             )
+        if actual_description_commit != args.contract.description_commit:
+            print(
+                f"Note: robonex-description commit {actual_description_commit[:7]} differs from the manifest's "
+                f"{args.contract.description_commit[:7]}, but the MuJoCo model bundle is identical"
+            )
         common_root = resolve_repo("robonex-common", "ROBONEX_COMMON_ROOT")
         actual_common_commit = git_commit(common_root)
-        if actual_common_commit != args.contract.common_commit:
-            parser.error(
-                f"robonex-common commit mismatch: manifest={args.contract.common_commit}, "
-                f"checkout={actual_common_commit}"
-            )
         with tempfile.TemporaryDirectory() as tmp:
             shutil.copytree(
                 Path(robonex_common.__file__).parent,
@@ -777,6 +772,11 @@ def parse_args():
             parser.error(
                 f"imported robonex-common source mismatch: manifest={args.contract.common_sha256}, "
                 f"imported={actual_common_sha256} ({Path(robonex_common.__file__).parent})"
+            )
+        if actual_common_commit != args.contract.common_commit:
+            print(
+                f"Note: robonex-common commit {actual_common_commit[:7]} differs from the manifest's "
+                f"{args.contract.common_commit[:7]}, but the imported source is identical"
             )
         args.model = description_model(args.contract.description_model, description_root)
     except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as error:
