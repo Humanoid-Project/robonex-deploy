@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -36,6 +37,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import robonex_common
 from robonex_common.paths import DESCRIPTION_REPO_NAMES, description_model, git_commit, resolve_repo
 from sim_to_real.safety import AxisLimiter
+sys.path.insert(0, str(ROOT / "scripts" / "sim_to_real"))
+from heading_hold import HeadingHold
+from robonex_common.joints import JOINT_BY_MODEL_NAME
 
 SLEW_MAX_SPEED = 6.0
 SLEW_MAX_ACCEL = 120.0
@@ -421,26 +425,58 @@ COMMAND_KEYS = {
 COMMAND_LIMITS = ((-0.2, 0.5), (-0.2, 0.2), (-0.2, 0.2))
 
 
-def make_key_callback(adapter):
+JOINT_FRICTION_MODELS = ("rs02", "rs03")
+
+
+def apply_joint_friction(model, adapter, levels):
+    applied = {}
+    for name, dof in zip(adapter.joint_names, adapter.dof_addresses):
+        motor = JOINT_BY_MODEL_NAME[name].motor_model
+        model.dof_frictionloss[dof] = levels[motor]
+        applied[name] = float(levels[motor])
+    return applied
+
+
+def base_imu(model, data, adapter):
+    velocity = np.zeros(6, dtype=np.float64)
+    mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_XBODY, adapter.base_body_id, velocity, 1)
+    rotation_world_from_base = data.xmat[adapter.base_body_id].reshape(3, 3)
+    gravity = rotation_world_from_base.T @ adapter.gravity_world
+    return tuple(float(v) for v in velocity[:3]), tuple(float(v) for v in gravity)
+
+
+def base_orientation_sample(data, adapter):
+    w, x, y, z = (float(v) for v in data.xquat[adapter.base_body_id])
+    orientation = type("Orientation", (), {"w": w, "x": x, "y": y, "z": z})()
+    return type("Sample", (), {"orientation": orientation})()
+
+
+def make_key_callback(adapter, lock=None):
     """Drive the velocity command from the viewer keyboard.
 
     GLFW reports uppercase codes for letter keys, so match on those.
     """
+    lock = lock if lock is not None else threading.Lock()
 
     def on_key(keycode):
+        with lock:
+            handled = _apply_key(keycode)
+        if handled:
+            vx, vy, wz = adapter.velocity_command
+            print(f"command  vx={vx:+.2f} m/s  vy={vy:+.2f} m/s  wz={wz:+.2f} rad/s", flush=True)
+
+    def _apply_key(keycode):
         if keycode == ord(" "):
             adapter.velocity_command[:] = 0.0
         elif keycode in COMMAND_KEYS:
             delta = COMMAND_KEYS[keycode]
             for index, step in enumerate(delta):
                 low, high = COMMAND_LIMITS[index]
-                adapter.velocity_command[index] = float(
-                    min(high, max(low, adapter.velocity_command[index] + step))
-                )
+                value = float(min(high, max(low, adapter.velocity_command[index] + step)))
+                adapter.velocity_command[index] = 0.0 if abs(value) < 1e-6 else value
         else:
-            return
-        vx, vy, wz = adapter.velocity_command
-        print(f"command  vx={vx:+.2f} m/s  vy={vy:+.2f} m/s  wz={wz:+.2f} rad/s", flush=True)
+            return False
+        return True
 
     return on_key
 
@@ -495,7 +531,14 @@ def trace_row(model, data, adapter, commanded, step, policy_period, minimum_heig
     return row
 
 
-def simulate(model, data, adapter, args, viewer_handle):
+def simulate(model, data, adapter, args, viewer_handle, command_lock=None):
+    command_lock = command_lock if command_lock is not None else threading.Lock()
+    heading = None
+    if getattr(args, "heading_hold", False):
+        heading = HeadingHold(args.heading_kp, args.heading_ki, args.heading_source)
+    next_heading_print = 0.0
+    if getattr(args, "joint_friction", None) is not None:
+        apply_joint_friction(model, adapter, dict(zip(JOINT_FRICTION_MODELS, args.joint_friction)))
     reset_simulation(model, data, adapter)
     diagnostics = Diagnostics(model, adapter)
     policy_period = 1.0 / args.policy_hz
@@ -558,7 +601,21 @@ def simulate(model, data, adapter, args, viewer_handle):
             if schedule is not None:
                 adapter.velocity_command[:] = command_at(schedule, data.time)
             try:
-                _, action, targets = adapter.apply(data, args.max_raw_action)
+                with command_lock:
+                    requested = adapter.velocity_command.copy()
+                    if heading is not None:
+                        gyro, gravity = base_imu(model, data, adapter)
+                        heading_wz = heading.update(data.time, gyro, gravity, base_orientation_sample(data, adapter),
+                                                    requested, active=data.time >= args.heading_start_s)
+                        if heading.engaged:
+                            adapter.velocity_command[2] = heading_wz
+                    try:
+                        _, action, targets = adapter.apply(data, args.max_raw_action)
+                    finally:
+                        adapter.velocity_command[:] = requested
+                if heading is not None and not args.headless and data.time >= next_heading_print:
+                    next_heading_print = data.time + 1.0
+                    print(heading.status_line(), flush=True)
                 if limiters is not None:
                     for index, limiter in enumerate(limiters):
                         position, _ = limiter.step(float(targets[index]), policy_period, SLEW_MAX_SPEED, SLEW_MAX_ACCEL)
@@ -645,12 +702,28 @@ def parse_args():
                         help="Pass targets through the deploy slew limiter (policy_to_real defaults)")
     parser.add_argument("--match-isaac", action="store_true",
                         help="Robot-robot collisions off and passive-joint damping 0, as in the Isaac training model")
+    parser.add_argument("--heading-hold", action="store_true",
+                        help="PI heading hold on the yaw-rate command the policy sees, as policy_to_real "
+                             "--heading-hold; engages with wz 0 and vx/vy above the gait deadband")
+    parser.add_argument("--heading-kp", type=float, default=1.0, help="Heading-hold proportional gain (0-2)")
+    parser.add_argument("--heading-ki", type=float, default=0.1, help="Heading-hold integral gain (0-0.5)")
+    parser.add_argument("--heading-source", choices=("gyro", "quat"), default="gyro",
+                        help="Integrated base gyro about the world vertical, or the base orientation yaw")
+    parser.add_argument("--heading-start-s", type=float, default=1.5,
+                        help="Simulated time before the heading hold may engage (deploy ramp + hold)")
+    parser.add_argument("--joint-friction", type=float, nargs=2, metavar=("RS02", "RS03"),
+                        help="Coulomb friction (N*m) on the 12 motor joints by motor model, e.g. 0.14 0.47 "
+                             "(the measured deploy plant)")
     parser.add_argument("--hip-yaw-kp", type=float, help="Override the hip-yaw position gain (diagnostic)")
     parser.add_argument("--hip-yaw-backlash", type=float,
                         help="Total free play in rad inside the hip-yaw PD, no torque within it (diagnostic)")
     args = parser.parse_args()
     if args.headless and args.duration is None:
         parser.error("--headless requires --duration")
+    if not 0.0 <= args.heading_kp <= 2.0 or not 0.0 <= args.heading_ki <= 0.5:
+        parser.error("--heading-kp must be in [0, 2] and --heading-ki in [0, 0.5]")
+    if args.joint_friction is not None and any(not math.isfinite(v) or v < 0.0 for v in args.joint_friction):
+        parser.error("--joint-friction needs two finite non-negative values")
     args.minimum_height = 0.6
     args.max_raw_action = 20.0
     args.max_constraint_error = 0.05
@@ -735,10 +808,11 @@ def main():
         print("keys: W/S forward  A/D turn  Q/E strafe  SPACE stop", flush=True)
         vx0, vy0, wz0 = adapter.velocity_command
         print(f"command  vx={vx0:+.2f} m/s  vy={vy0:+.2f} m/s  wz={wz0:+.2f} rad/s", flush=True)
+        command_lock = threading.Lock()
         with mujoco.viewer.launch_passive(
-            model, data, key_callback=make_key_callback(adapter)
+            model, data, key_callback=make_key_callback(adapter, command_lock)
         ) as viewer_handle:
-            result = simulate(model, data, adapter, args, viewer_handle)
+            result = simulate(model, data, adapter, args, viewer_handle, command_lock)
     text = json.dumps(result, ensure_ascii=False, indent=2)
     print(text)
     if args.output is not None:

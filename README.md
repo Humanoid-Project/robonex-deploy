@@ -65,6 +65,11 @@ robonex-deploy/
 | - | `--scenario` | - | Command schedule `T:VX,VY,WZ;...` in seconds; replaces `--vx/--vy/--wz` |
 | - | `--trace` | - | Per-policy-step CSV trace for `scenario_metrics.py` |
 | - | `--slew-limit` | Off | Pass targets through the deploy slew limiter (6 rad/s, 120 rad/s²) |
+| - | `--heading-hold` | Off | PI heading hold on the policy's yaw-rate command, as `policy_to_real.py --heading-hold` |
+| - | `--heading-kp` / `--heading-ki` | `1.0` / `0.1` | Heading-hold gains |
+| - | `--heading-source` | `gyro` | Integrated base gyro (`gyro`) or base orientation yaw (`quat`) |
+| - | `--heading-start-s` | `1.5` | Simulated time before the heading hold may engage |
+| - | `--joint-friction` | Model value | Coulomb friction on the 12 motor joints by model, RS02 then RS03 (N·m) |
 | - | `--match-isaac` | Off | Robot-robot collisions off and passive-joint damping 0, as in the Isaac model |
 | - | `--hip-yaw-kp` | Model value | Hip-yaw position gain override (diagnostic) |
 | - | `--hip-yaw-backlash` | - | Hip-yaw free play in rad, no torque inside it (diagnostic) |
@@ -76,6 +81,14 @@ source .venv/bin/activate
 
 python3 scripts/sim_to_sim/isaac_to_mujoco.py \
   --policy policies/<run>/policy.onnx
+
+# Keyboard walk with the deploy heading hold and measured joint friction
+python3 scripts/sim_to_sim/isaac_to_mujoco.py \
+  --policy policies/<run>/policy.onnx \
+  --vx 0.0 \
+  --slew-limit \
+  --joint-friction 0.14 0.47 \
+  --heading-hold
 
 # Reproducible check without a viewer
 python3 scripts/sim_to_sim/isaac_to_mujoco.py \
