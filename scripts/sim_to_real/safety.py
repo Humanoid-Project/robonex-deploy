@@ -134,8 +134,12 @@ def verify_model_limits(model, actuator_ids, motor_ids):
 LEG_PROFILE = {identity: "ver2_edu" for identity in ROBOT_VARIANTS.values()}
 
 
+MODEL_VERSION = {"edu": "ver2-2", "pro": "ver2", "max": "ver2"}
+
+
 def fixed_model_path(robot):
-    return description_model(f"ver2/mujoco/robot/{robot}/scene_fixed.xml", anchors=(__file__,))
+    version = MODEL_VERSION.get(robot, "ver2")
+    return description_model(f"{version}/mujoco/robot/{robot}/scene_fixed.xml", anchors=(__file__,))
 
 
 def require_robot_model(expected, path=None):
