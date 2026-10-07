@@ -373,3 +373,9 @@ python3 scripts/policy_test/print_policy_values.py \
 python3 scripts/policy_test/print_policy_action.py \
   --policy policies/<run>/policy.onnx
 ```
+
+<br>
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). Copyright 2026 RoboNex. See [NOTICE](NOTICE).
