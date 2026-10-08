@@ -1117,25 +1117,36 @@ def verify_common_source(contract):
     )
 
 
-def format_joint_table(contract, positions, velocities, raw_action, targets, commands):
+def format_joint_table(contract, positions, velocities, commands, motors=None):
     lines = [
-        f"  {'ID':>3}  {'joint':<20}  {'pos':>9}  {'rel':>9}  {'vel':>10}  "
-        f"{'raw':>8}  {'target':>9}  {'command':>9}"
+        f"  {'ID':>3}  {'joint':<20}  {'pos':>9}  {'cmd':>9}  {'err':>8}  {'vel':>8}  "
+        f"{'torque N·m':>16}  {'temp':>6}"
     ]
     lines.append("  " + "-" * 92)
     for index, (name, motor_id) in enumerate(joint_row_order(contract)):
-        offset = contract.action_offsets[index]
-        command_text = (
-            f"{math.degrees(commands[motor_id]):+8.2f}d" if commands is not None else f"{'--':>9}"
+        command = None if commands is None else commands.get(motor_id)
+        command_text = f"{math.degrees(command):+8.2f}d" if command is not None else f"{'--':>9}"
+        error_text = (
+            f"{math.degrees(positions[index] - command):+7.2f}d" if command is not None else f"{'--':>8}"
         )
+        motor = None if motors is None else motors.get(motor_id)
+        torque = getattr(motor, "last_torque", None)
+        temp = getattr(motor, "last_temp", None)
+        if torque is None:
+            torque_text = f"{'--':>16}"
+        else:
+            t_max = getattr(getattr(motor, "spec", None), "t_max", 0.0)
+            percent = abs(torque) / t_max * 100.0 if t_max else 0.0
+            torque_text = f"{torque:+7.2f} ({percent:3.0f}%)"
+        temp_text = f"{'--':>6}" if temp is None else f"{temp:5.1f}C"
         lines.append(
             f"  {motor_id:>3}  {name:<20}  "
             f"{math.degrees(positions[index]):+8.2f}d  "
-            f"{math.degrees(positions[index] - offset):+8.2f}d  "
-            f"{velocities[index]:+9.3f}  "
-            f"{raw_action[index]:+8.3f}  "
-            f"{math.degrees(targets[index]):+8.2f}d  "
-            f"{command_text}"
+            f"{command_text}  "
+            f"{error_text}  "
+            f"{velocities[index]:+8.3f}  "
+            f"{torque_text:>16}  "
+            f"{temp_text}"
         )
     return lines
 
@@ -1223,7 +1234,7 @@ def run_read(policy_path, contract, args):
 
             lines = [CLEAR_SCREEN]
             lines.append(f"Policy preview (read-only)   {joints.rate_text()}   (Ctrl-C to stop)\n")
-            lines.extend(format_joint_table(contract, positions, velocities, raw_action, targets, None))
+            lines.extend(format_joint_table(contract, positions, velocities, None))
             if missing:
                 lines.append(f"  no response: {sorted(missing)} (reported as 0.0)")
             lines.append("")
@@ -1793,9 +1804,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     f"elapsed {stats.elapsed():6.2f} s   (Ctrl-C to stop)\n"
                 )
                 lines.extend(
-                    format_joint_table(
-                        contract, positions, velocities, raw_action, targets, commander.commands
-                    )
+                    format_joint_table(contract, positions, velocities, commander.commands, motors)
                 )
                 lines.append("")
                 lines.extend(format_imu(imu, angular_velocity, gravity, age))

@@ -622,3 +622,27 @@ def test_timing_report_rejects_partial_schema(timing_report, tmp_path, capsys):
         timing_report.report(partial)
     assert timing_report.main([str(partial)]) == 1
     assert "tick_period_ms" in capsys.readouterr().err
+
+
+def test_joint_table_shows_command_error_torque_and_temperature(modules):
+    ptr = modules[1]
+    contract = make_contract()
+    order = ptr.joint_row_order(contract)
+    positions = np.zeros(12)
+    velocities = np.zeros(12)
+    knee_index = next(i for i, (name, _) in enumerate(order) if name == "l_knee_pitch_joint")
+    knee_id = order[knee_index][1]
+    positions[knee_index] = math.radians(-20.0)
+    commands = {motor_id: 0.0 for _, motor_id in order}
+    commands[knee_id] = math.radians(-18.5)
+    motors = {motor_id: SimpleNamespace(spec=SimpleNamespace(t_max=60.0), last_torque=0.0, last_temp=30.0)
+              for _, motor_id in order}
+    motors[knee_id] = SimpleNamespace(spec=SimpleNamespace(t_max=60.0), last_torque=-12.0, last_temp=41.5)
+    lines = ptr.format_joint_table(contract, positions, velocities, commands, motors)
+    assert "torque" in lines[0] and "temp" in lines[0] and "raw" not in lines[0]
+    row = next(line for line in lines[2:] if "l_knee_pitch" in line)
+    assert "-20.00d" in row and "-18.50d" in row and "-1.50d" in row
+    assert "-12.00 ( 20%)" in row and "41.5C" in row
+    preview = ptr.format_joint_table(contract, positions, velocities, None)
+    row = next(line for line in preview[2:] if "l_knee_pitch" in line)
+    assert row.count("--") == 4
