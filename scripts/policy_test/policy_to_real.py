@@ -169,7 +169,7 @@ class Settings:
     # value on the stand before running at 1.0.
     gain_scale: float = 1.0
     ankle_gain_scale: float = 1.0
-    hold_head: bool = True
+    hold_head: bool = False
 
     read_poll_timeout: float = 0.02
     read_print_hz: float = 10.0
@@ -1960,7 +1960,7 @@ def run_deploy(policy_path, contract, args):
             if any(line.startswith(f"ID {motor_id} ") for line in blocking for motor_id in hold_ids):
                 blocking.append(
                     f"held head motor(s) {sorted(hold_ids)}: move the head by hand into its range, "
-                    "or run with --no-head-hold to leave it unpowered"
+                    "or run without --zero-head to leave it unpowered"
                 )
             raise RuntimeError(
                 "Preflight safety check failed; motors will not be enabled:\n  " + "\n  ".join(blocking)
@@ -2015,7 +2015,7 @@ def run_deploy(policy_path, contract, args):
                 )
         print(f"  motor IDs   : {sorted(motor_ids)}")
         if hold_ids:
-            print(f"  held at 0   : {sorted(hold_ids)}  (--no-head-hold leaves them unpowered)")
+            print(f"  held at 0   : {sorted(hold_ids)}  (--zero-head)")
         print(f"  duration    : {'until Ctrl-C' if args.duration is None else f'{args.duration:.1f} s'}")
         print(f"  tilt stop   : {SETTINGS.max_tilt_deg:g} deg from vertical")
         print("  The robot must hang on the stand or be held; this tool cannot catch a fall.")
@@ -2359,12 +2359,12 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
-        "--no-head-hold",
+        "--zero-head",
         action="store_true",
         help=(
-            "Do not power the neck motor (ID 13): it is not opened, and no frame is sent to it when its bus is "
-            "not otherwise open. Default: it is enabled with fixed gains (kp 20, kd 1, not scaled by "
-            "--gain-scale), moved slowly to 0 rad and held there for the whole run (not a policy joint)"
+            "Also enable the neck motor (ID 13) with fixed gains (kp 20, kd 1, not scaled by --gain-scale), move it "
+            "slowly to 0 rad with the legs and hold it there for the whole run (not a policy joint; limit +-74 deg). "
+            "Default: the neck is not opened and no frame is sent to it"
         ),
     )
     parser.add_argument(
@@ -2450,7 +2450,7 @@ def main(argv=None):
     args = parse_args(argv)
     global SETTINGS, ENABLE_KP, ENABLE_KD
     SETTINGS = replace(SETTINGS, gain_scale=args.gain_scale, ankle_gain_scale=args.ankle_gain_scale,
-                       hold_head=not args.no_head_hold)
+                       hold_head=args.zero_head)
     if args.max_tilt_deg is not None:
         if not 5.0 <= args.max_tilt_deg <= 90.0:
             raise SystemExit("--max-tilt-deg must be between 5 and 90 degrees")

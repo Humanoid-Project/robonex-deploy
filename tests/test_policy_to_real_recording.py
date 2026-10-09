@@ -71,7 +71,7 @@ def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False):
     motor_ids = [JOINT_BY_MODEL_NAME[name].motor_id for name in contract.joint_order]
     offsets = {JOINT_BY_MODEL_NAME[name].motor_id: float(contract.action_offsets[i])
                for i, name in enumerate(contract.joint_order)}
-    held_ids = module.held_motor_ids(contract.robot_model)
+    held_ids = module.held_motor_ids(contract.robot_model) if module.SETTINGS.hold_head else []
     starts = {mid: offsets[mid] + 0.05 for mid in motor_ids}
     starts.update({mid: 0.05 for mid in held_ids})
     motors = {mid: BrakeMotor(mid, starts[mid], control_log, safety.MODE_RUNNING) for mid in motor_ids + held_ids}
@@ -372,7 +372,9 @@ def test_step_arrays_capacity(modules, tmp_path, monkeypatch):
 
 
 def test_full_deploy_holds_the_neck_at_zero_and_brakes_it(modules, monkeypatch, tmp_path):
+    from dataclasses import replace
     _, policy_module = modules
+    monkeypatch.setattr(policy_module, "SETTINGS", replace(policy_module.SETTINGS, hold_head=True))
     run = run_full_deploy(policy_module, monkeypatch, tmp_path)
     assert run.error is None
     assert 13 in run.opened[0]

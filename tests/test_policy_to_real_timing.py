@@ -661,12 +661,13 @@ def test_head_is_held_at_zero_with_its_own_gains(modules):
     assert len(lines) == 1 and "neck_pitch_joint" in lines[0] and "+1.50d" in lines[0] and "(held)" in lines[0]
 
 
-def test_no_head_hold_flag(modules, tmp_path):
+def test_zero_head_flag(modules, tmp_path):
     ptr = modules[1]
     policy = tmp_path / "policy.onnx"
     policy.write_bytes(b"")
-    assert ptr.parse_args(["--policy", str(policy), "--no-head-hold"]).no_head_hold is True
-    assert ptr.parse_args(["--policy", str(policy)]).no_head_hold is False
+    assert ptr.parse_args(["--policy", str(policy), "--zero-head"]).zero_head is True
+    assert ptr.parse_args(["--policy", str(policy)]).zero_head is False
+    assert ptr.Settings().hold_head is False
 
 
 def test_neck_hold_limit_is_74_degrees(modules):
