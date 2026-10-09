@@ -63,7 +63,7 @@ from robonex_can import (
 )
 import robonex_common
 from robonex_common.imu import DEFAULT_IMU_BAUDRATE, DEFAULT_IMU_PORT, MOUNT_ROLL_DEG
-from robonex_common.joints import CHANNEL_MOTOR_IDS, JOINT_BY_MODEL_NAME, JOINT_BY_ID
+from robonex_common.joints import ALL_MOTORS, CHANNEL_MOTOR_IDS, JOINT_BY_MODEL_NAME, JOINT_BY_ID, MOTOR_BY_ID
 from robonex_common.models import robot_model
 from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
 from robonex_common.motors import MOTOR_CONTROL_KD, MOTOR_CONTROL_KP, RATED_TORQUE
@@ -127,6 +127,14 @@ class TeeStream:
         return getattr(self.terminal, name)
 
 
+HOLD_MOTORS = tuple(motor for motor in ALL_MOTORS if motor.model_name == "neck_pitch_joint")
+
+
+def held_motor_ids(robot_model_name):
+    present = set(robot_model(robot_model_name).motor_ids)
+    return [spec.motor_id for spec in HOLD_MOTORS if spec.motor_id in present]
+
+
 def resolve_gains(scale, ankle_scale=1.0):
     """Per-motor (kp, kd) from the shared per-joint table, scaled.
 
@@ -141,6 +149,10 @@ def resolve_gains(scale, ankle_scale=1.0):
         factor = scale * (ankle_scale if "ankle" in name else 1.0)
         kp_by_motor[spec.motor_id] = kp * factor
         kd_by_motor[spec.motor_id] = kd * factor
+    for spec in HOLD_MOTORS:
+        kp, kd = CONTROL_GAINS_BY_JOINT.get(spec.model_name, (MOTOR_CONTROL_KP, MOTOR_CONTROL_KD))
+        kp_by_motor[spec.motor_id] = kp
+        kd_by_motor[spec.motor_id] = kd
     return kp_by_motor, kd_by_motor
 
 
@@ -156,6 +168,7 @@ class Settings:
     # value on the stand before running at 1.0.
     gain_scale: float = 1.0
     ankle_gain_scale: float = 1.0
+    hold_head: bool = True
 
     read_poll_timeout: float = 0.02
     read_print_hz: float = 10.0
@@ -579,7 +592,7 @@ def preflight_parameter_lines(values):
     lines = ["\nSaved motor parameters (read-only, recorded, not checked):",
              "  " + f"{'ID':>3}  {'model':<5}  " + "  ".join(f"{name:>15}" for name in names)]
     for motor_id, row in sorted(values.items()):
-        model = JOINT_BY_ID[motor_id].motor_model if motor_id in JOINT_BY_ID else "?"
+        model = MOTOR_BY_ID[motor_id].motor_model if motor_id in MOTOR_BY_ID else "?"
         cells = []
         for name in names:
             value = row.get(name)
@@ -1147,6 +1160,27 @@ def format_joint_table(contract, positions, velocities, commands, motors=None):
             f"{velocities[index]:+8.3f}  "
             f"{torque_text:>16}  "
             f"{temp_text}"
+        )
+    return lines
+
+
+def format_held_lines(contract, motors, commands):
+    policy_ids = {motor_id for _, motor_id in joint_row_order(contract)}
+    lines = []
+    for motor_id in sorted(motors):
+        if motor_id in policy_ids:
+            continue
+        motor = motors[motor_id]
+        position = motor.last_position
+        command = commands.get(motor_id)
+        if position is None or command is None:
+            lines.append(f"  {motor_id:>3}  {MOTOR_BY_ID[motor_id].model_name:<20}  held at 0  (no feedback)")
+            continue
+        lines.append(
+            f"  {motor_id:>3}  {MOTOR_BY_ID[motor_id].model_name:<20}  "
+            f"{math.degrees(position):+8.2f}d  {math.degrees(command):+8.2f}d  "
+            f"{math.degrees(position - command):+7.2f}d  {motor.last_velocity:+8.3f}  "
+            f"{motor.last_torque:+7.2f}        {motor.last_temp:5.1f}C  (held)"
         )
     return lines
 
@@ -1806,6 +1840,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                 lines.extend(
                     format_joint_table(contract, positions, velocities, commander.commands, motors)
                 )
+                lines.extend(format_held_lines(contract, motors, commander.commands))
                 lines.append("")
                 lines.extend(format_imu(imu, angular_velocity, gravity, age))
                 lines.append("")
@@ -1883,6 +1918,12 @@ def run_deploy(policy_path, contract, args):
         JOINT_BY_MODEL_NAME[name].motor_id: float(contract.action_offsets[index])
         for index, name in enumerate(contract.joint_order)
     }
+    hold_ids = held_motor_ids(contract.robot_model) if SETTINGS.hold_head else []
+    for spec in HOLD_MOTORS:
+        if spec.motor_id in hold_ids:
+            hard_limits[spec.motor_id] = (spec.lower, spec.upper)
+            home_targets[spec.motor_id] = 0.0
+    control_ids = motor_ids + hold_ids
 
     buses = {}
     motors = {}
@@ -1896,7 +1937,7 @@ def run_deploy(policy_path, contract, args):
     if args.keyboard:
         keyboard = KeyboardCommand(COMMAND_LIMITS)
     thermal = ThermalLoad({
-        motor_id: RATED_TORQUE[JOINT_BY_ID[motor_id].motor_model] for motor_id in motor_ids
+        motor_id: RATED_TORQUE[MOTOR_BY_ID[motor_id].motor_model] for motor_id in control_ids
     })
     telemetry = None
     phases = None
@@ -1904,8 +1945,8 @@ def run_deploy(policy_path, contract, args):
     end_meta = {}
     exit_text = "completed"
     try:
-        buses, motors, hubs = open_hardware(motor_ids, SETTINGS.interface, SETTINGS.host_id)
-        idle = stop_idle_motors(buses, motor_ids, SETTINGS.host_id)
+        buses, motors, hubs = open_hardware(control_ids, SETTINGS.interface, SETTINGS.host_id)
+        idle = stop_idle_motors(buses, control_ids, SETTINGS.host_id)
         if idle:
             print(f"Stop sent to the non-policy motors on the open buses: {idle}")
         measured, blocking = inspect_zero_positions(motors, SETTINGS.approach_tolerance_deg * DEG, hard_limits)
@@ -1914,6 +1955,11 @@ def run_deploy(policy_path, contract, args):
         if roll_pairs:
             blocking += start_roll_blocks(measured, roll_pairs, profile.foot_roll, math.radians(1.0))
         if blocking:
+            if any(line.startswith(f"ID {motor_id} ") for line in blocking for motor_id in hold_ids):
+                blocking.append(
+                    f"held head motor(s) {sorted(hold_ids)}: move the head by hand into its range, "
+                    "or run with --no-head-hold to leave it unpowered"
+                )
             raise RuntimeError(
                 "Preflight safety check failed; motors will not be enabled:\n  " + "\n  ".join(blocking)
             )
@@ -1940,7 +1986,8 @@ def run_deploy(policy_path, contract, args):
                 "host": host_snapshot(sorted(hubs)),
                 "imu_gyro_bias_raw": None if bias is None else [bias.x, bias.y, bias.z],
                 "imu_driver_stats_start": imu_driver_stats(imu),
-                "gains": {motor_id: [ENABLE_KP[motor_id], ENABLE_KD[motor_id]] for motor_id in motor_ids},
+                "gains": {motor_id: [ENABLE_KP[motor_id], ENABLE_KD[motor_id]] for motor_id in control_ids},
+                "held_at_zero": list(hold_ids),
                 "settings_all": asdict(SETTINGS),
             })
             print(f"Telemetry   : {telemetry.path}  ({contract.policy_hz:.0f} Hz per-motor record)")
@@ -1958,7 +2005,15 @@ def run_deploy(policy_path, contract, args):
             print(
                 f"      {name:22s} kp {ENABLE_KP[spec.motor_id]:6.1f}  kd {ENABLE_KD[spec.motor_id]:5.2f}"
             )
+        for spec in HOLD_MOTORS:
+            if spec.motor_id in hold_ids:
+                print(
+                    f"      {spec.model_name:22s} kp {ENABLE_KP[spec.motor_id]:6.1f}  kd {ENABLE_KD[spec.motor_id]:5.2f}"
+                    "  (held at 0 rad, not a policy joint)"
+                )
         print(f"  motor IDs   : {sorted(motor_ids)}")
+        if hold_ids:
+            print(f"  held at 0   : {sorted(hold_ids)}  (--no-head-hold leaves them unpowered)")
         print(f"  duration    : {'until Ctrl-C' if args.duration is None else f'{args.duration:.1f} s'}")
         print(f"  tilt stop   : {SETTINGS.max_tilt_deg:g} deg from vertical")
         print("  The robot must hang on the stand or be held; this tool cannot catch a fall.")
@@ -1967,7 +2022,7 @@ def run_deploy(policy_path, contract, args):
         if keyboard is not None and keyboard.start():
             print(f"  {keyboard.legend()}")
 
-        stop_ids = list(motor_ids)
+        stop_ids = list(control_ids)
         starts, enabled_ids = enable_with_runtime_feedback(
             motors, hubs, ENABLE_KP, ENABLE_KD, hard_limits, enabled_out=enabled_ids
         )
@@ -2302,6 +2357,15 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--no-head-hold",
+        action="store_true",
+        help=(
+            "Do not power the neck motor (ID 13): it is not opened, and no frame is sent to it when its bus is "
+            "not otherwise open. Default: it is enabled with fixed gains (kp 20, kd 1, not scaled by "
+            "--gain-scale), moved slowly to 0 rad and held there for the whole run (not a policy joint)"
+        ),
+    )
+    parser.add_argument(
         "--ankle-gain-scale",
         type=float,
         default=Settings.ankle_gain_scale,
@@ -2383,7 +2447,8 @@ def run(args):
 def main(argv=None):
     args = parse_args(argv)
     global SETTINGS, ENABLE_KP, ENABLE_KD
-    SETTINGS = replace(SETTINGS, gain_scale=args.gain_scale, ankle_gain_scale=args.ankle_gain_scale)
+    SETTINGS = replace(SETTINGS, gain_scale=args.gain_scale, ankle_gain_scale=args.ankle_gain_scale,
+                       hold_head=not args.no_head_hold)
     if args.max_tilt_deg is not None:
         if not 5.0 <= args.max_tilt_deg <= 90.0:
             raise SystemExit("--max-tilt-deg must be between 5 and 90 degrees")

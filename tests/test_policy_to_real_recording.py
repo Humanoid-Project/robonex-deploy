@@ -71,8 +71,10 @@ def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False):
     motor_ids = [JOINT_BY_MODEL_NAME[name].motor_id for name in contract.joint_order]
     offsets = {JOINT_BY_MODEL_NAME[name].motor_id: float(contract.action_offsets[i])
                for i, name in enumerate(contract.joint_order)}
+    held_ids = module.held_motor_ids(contract.robot_model)
     starts = {mid: offsets[mid] + 0.05 for mid in motor_ids}
-    motors = {mid: BrakeMotor(mid, starts[mid], control_log, safety.MODE_RUNNING) for mid in motor_ids}
+    starts.update({mid: 0.05 for mid in held_ids})
+    motors = {mid: BrakeMotor(mid, starts[mid], control_log, safety.MODE_RUNNING) for mid in motor_ids + held_ids}
     motors[motor_ids[0]].parameters = {0x700B: 17.0, 0x7018: 23.0, 0x701C: 48.2, 0x7005: 0, 0x7029: 1}
     motors[motor_ids[1]].parameters = {0x700B: OSError("bus")}
     joints = FakeJoints(motors, clock)
@@ -105,7 +107,13 @@ def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False):
 
     monkeypatch.setattr(module, "verify_common_source", lambda contract: None)
     monkeypatch.setattr(module, "require_robot_model", lambda name: None)
-    monkeypatch.setattr(module, "open_hardware", lambda ids, interface, host_id: ({}, motors, hubs))
+    opened = []
+
+    def open_hardware(ids, interface, host_id):
+        opened.append(list(ids))
+        return {}, {mid: motors[mid] for mid in ids}, hubs
+
+    monkeypatch.setattr(module, "open_hardware", open_hardware)
     monkeypatch.setattr(module, "stop_idle_motors", lambda buses, ids, host_id: [])
     monkeypatch.setattr(module, "inspect_zero_positions",
                         lambda motors_, tolerance, limits: ({mid: starts[mid] for mid in motors_}, []))
@@ -136,7 +144,8 @@ def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False):
     except RuntimeError as caught:
         error = caught
     return SimpleNamespace(path=path, events=events, motors=motors, hubs=hubs, error=error,
-                           observations=FakeSession.instances[-1].observations, contract=contract)
+                           observations=FakeSession.instances[-1].observations, contract=contract,
+                           control_log=control_log, opened=opened)
 
 
 def load_meta(path):
@@ -154,7 +163,7 @@ def test_full_deploy_records_every_phase_and_closes_after_brake(modules, monkeyp
 
     rows = read_csv(run.path)
     assert len(rows) == len(run.observations) >= 90
-    assert all(row["rx_frames.can0"] == "12" for row in rows)
+    assert all(row["rx_frames.can0"] == str(len(run.motors)) for row in rows)
     assert all(row["acc_z"] == "9.8" and row["imu_temp_c"] == "31.5" for row in rows)
     assert all(row["late_ms"] != "" and row["poll_ms"] != "" for row in rows)
     assert rows[0]["prev_work_ms"] == "" and all(row["prev_work_ms"] != "" for row in rows[1:])
@@ -360,3 +369,27 @@ def test_step_arrays_capacity(modules, tmp_path, monkeypatch):
     data = np.load(tmp_path / "a.npz")
     assert data["step"].dtype == np.int64 and data["step"].tolist() == [0, 1, 2]
     assert data["t_s"].dtype == np.float64 and data["obs"].dtype == np.float32
+
+
+def test_full_deploy_holds_the_neck_at_zero_and_brakes_it(modules, monkeypatch, tmp_path):
+    _, policy_module = modules
+    run = run_full_deploy(policy_module, monkeypatch, tmp_path)
+    assert run.error is None
+    assert 13 in run.opened[0]
+    head = [frame for frame in run.control_log if frame[0] == 13]
+    held = [frame for frame in head if frame[3] > 0.0]
+    assert held and held[0][1] == pytest.approx(0.05, abs=1e-3)
+    assert all(abs(b[1] - a[1]) <= 0.003 for a, b in zip(held, held[1:]))
+    assert held[-1][1] == 0.0 and (held[-1][3], held[-1][4]) == (20.0, 1.0)
+    assert any(frame[3] == 0.0 for frame in head)
+    assert run.motors[13].stopped
+
+
+def test_no_head_hold_leaves_the_neck_closed(modules, monkeypatch, tmp_path):
+    _, policy_module = modules
+    from dataclasses import replace
+    monkeypatch.setattr(policy_module, "SETTINGS", replace(policy_module.SETTINGS, hold_head=False))
+    run = run_full_deploy(policy_module, monkeypatch, tmp_path)
+    assert run.error is None
+    assert 13 not in run.opened[0]
+    assert not [frame for frame in run.control_log if frame[0] == 13]

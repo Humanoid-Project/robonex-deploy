@@ -646,3 +646,24 @@ def test_joint_table_shows_command_error_torque_and_temperature(modules):
     preview = ptr.format_joint_table(contract, positions, velocities, None)
     row = next(line for line in preview[2:] if "l_knee_pitch" in line)
     assert row.count("--") == 4
+
+
+def test_head_is_held_at_zero_with_its_own_gains(modules):
+    ptr = modules[1]
+    held = ptr.held_motor_ids("ver2_edu")
+    assert held == [13]
+    kp, kd = ptr.resolve_gains(1.0, 1.5)
+    assert (kp[13], kd[13]) == (20.0, 1.0)
+    assert kp[5] == 60.0 and kp[2] == 100.0
+    contract = make_contract()
+    motors = {13: SimpleNamespace(last_position=math.radians(1.5), last_velocity=0.0, last_torque=0.4, last_temp=31.0)}
+    lines = ptr.format_held_lines(contract, motors, {13: 0.0})
+    assert len(lines) == 1 and "neck_pitch_joint" in lines[0] and "+1.50d" in lines[0] and "(held)" in lines[0]
+
+
+def test_no_head_hold_flag(modules, tmp_path):
+    ptr = modules[1]
+    policy = tmp_path / "policy.onnx"
+    policy.write_bytes(b"")
+    assert ptr.parse_args(["--policy", str(policy), "--no-head-hold"]).no_head_hold is True
+    assert ptr.parse_args(["--policy", str(policy)]).no_head_hold is False
