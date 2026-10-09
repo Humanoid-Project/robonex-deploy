@@ -499,6 +499,82 @@ def command_at(schedule, t):
     return [command for start, command in schedule if start <= t + 1.0e-9][-1]
 
 
+def strafe_sample(model, data, adapter):
+    velocity = np.zeros(6)
+    mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_XBODY,
+                            adapter.base_body_id, velocity, 0)
+    yaw = quaternion_to_rpy(data.xquat[adapter.base_body_id])[2]
+    c, s = math.cos(yaw), math.sin(yaw)
+    separation = data.xpos[adapter.left_foot_body_id] - data.xpos[adapter.right_foot_body_id]
+    feet = {adapter.left_foot_body_id, adapter.right_foot_body_id}
+    contact = any(
+        {int(model.geom_bodyid[item.geom1]), int(model.geom_bodyid[item.geom2])} == feet
+        and item.dist <= 0.0 for item in data.contact[:data.ncon]
+    )
+    return (c * velocity[3] + s * velocity[4], -s * velocity[3] + c * velocity[4],
+            yaw, -s * separation[0] + c * separation[1], int(contact))
+
+
+class StrafeMetrics:
+    def __init__(self, settle_s):
+        self.settle_s = settle_s
+        self.segments = []
+        self.current = None
+
+    def command(self, command, t):
+        command = tuple(float(v) for v in command)
+        if self.current is not None and command == self.current["command"]:
+            return
+        self.finish(t, "command_change")
+        self.current = {"command": command, "start_s": float(t), "last_s": float(t),
+                        "samples": [], "blocks": [], "block_s": 0.0, "block_sum": 0.0}
+
+    def sample(self, t, values):
+        row = self.current
+        if row is None or t <= row["last_s"] + 1e-10:
+            return
+        dt = t - max(row["last_s"], row["start_s"] + self.settle_s)
+        row["last_s"] = float(t)
+        if dt <= 1e-10:
+            return
+        vx, vy, yaw, separation, contact = values
+        error = vy - row["command"][1]
+        row["samples"].append((dt, vx, vy, abs(error), separation, contact))
+        remaining = dt
+        while remaining > 1e-10:
+            part = min(remaining, 0.8 - row["block_s"])
+            row["block_sum"] += error * part
+            row["block_s"] += part
+            remaining -= part
+            if row["block_s"] >= 0.8 - 1e-10:
+                row["blocks"].append(abs(row["block_sum"] / 0.8))
+                row["block_s"] = 0.0
+                row["block_sum"] = 0.0
+
+    def finish(self, t, reason):
+        row = self.current
+        if row is None:
+            return
+        samples = row["samples"]
+        duration = sum(v[0] for v in samples)
+        mean = lambda index: sum(v[0] * v[index] for v in samples) / duration if duration else None
+        blocks = row["blocks"]
+        self.segments.append({
+            "command": list(row["command"]), "start_s": row["start_s"], "end_s": float(t),
+            "completed_duration_s": float(t) - row["start_s"], "stop_reason": reason,
+            "settle_s": self.settle_s, "measured_duration_s": duration,
+            "sample_count": len(samples), "got_vx": mean(1), "got_vy": mean(2), "err_vy": mean(3),
+            "err_vy_block_mae": float(np.mean(blocks)) if blocks else None,
+            "err_vy_block_p95": float(np.percentile(blocks, 95)) if blocks else None,
+            "block_duration_s": 0.8, "block_count": len(blocks),
+            "discarded_block_duration_s": row["block_s"],
+            "min_foot_sep_y": min(v[4] for v in samples) if samples else None,
+            "crossing_fraction": sum(v[0] for v in samples if v[4] <= 0.0) / duration if duration else None,
+            "foot_foot_contact_count": sum(v[5] for v in samples),
+        })
+        self.current = None
+
+
 def trace_header(adapter):
     header = ["t_s", "step", "dt_ms", "ramp", "cmd_vx", "cmd_vy", "cmd_wz",
               "gravity_x", "gravity_y", "gravity_z", "gyro_x", "gyro_y", "gyro_z",
@@ -506,6 +582,7 @@ def trace_header(adapter):
     for name in adapter.joint_names:
         short = name[:-6] if name.endswith("_joint") else name
         header += [f"{short}.pos", f"{short}.vel", f"{short}.torque", f"{short}.target"]
+    header += ["root_vy_yaw", "yaw", "foot_sep_y", "foot_foot_contact"]
     return header
 
 
@@ -528,6 +605,8 @@ def trace_row(model, data, adapter, commanded, step, policy_period, minimum_heig
                 round(float(data.qvel[adapter.dof_addresses[index]]), 6),
                 round(float(data.actuator_force[adapter.actuator_ids[index]]), 5),
                 round(float(commanded[index]), 6)]
+    _, vy, yaw, separation, contact = strafe_sample(model, data, adapter)
+    row += [float(vy), float(yaw), float(separation), contact]
     return row
 
 
@@ -541,6 +620,7 @@ def simulate(model, data, adapter, args, viewer_handle, command_lock=None):
         apply_joint_friction(model, adapter, dict(zip(JOINT_FRICTION_MODELS, args.joint_friction)))
     reset_simulation(model, data, adapter)
     diagnostics = Diagnostics(model, adapter)
+    strafe = StrafeMetrics(getattr(args, "metrics_settle_s", 1.0))
     policy_period = 1.0 / args.policy_hz
     schedule = parse_scenario(args.scenario) if getattr(args, "scenario", None) else None
     trace = [] if getattr(args, "trace", None) else None
@@ -595,6 +675,7 @@ def simulate(model, data, adapter, args, viewer_handle, command_lock=None):
             break
         if data.time + 1.0e-12 >= next_policy_time:
             mujoco.mj_forward(model, data)
+            strafe.sample(float(data.time), strafe_sample(model, data, adapter))
             if trace is not None and diagnostics.policy_steps:
                 trace.append(trace_row(model, data, adapter, commanded, diagnostics.policy_steps - 1, policy_period,
                                        args.minimum_height))
@@ -628,6 +709,7 @@ def simulate(model, data, adapter, args, viewer_handle, command_lock=None):
                 status = "policy_error"
                 reason = str(error)
                 break
+            strafe.command(requested, float(data.time))
             diagnostics.record_policy(action, targets)
             next_policy_time += policy_period
         for index, actuator_id, kp, kd in backlash_joints:
@@ -674,7 +756,7 @@ def simulate(model, data, adapter, args, viewer_handle, command_lock=None):
             writer = csv.writer(handle)
             writer.writerow(trace_header(adapter))
             writer.writerows(trace)
-    return diagnostics.result(
+    result = diagnostics.result(
         data,
         status,
         reason,
@@ -682,6 +764,15 @@ def simulate(model, data, adapter, args, viewer_handle, command_lock=None):
         args.model,
         args.policy,
     )
+    if state_is_finite(data):
+        mujoco.mj_forward(model, data)
+        strafe.sample(float(data.time), strafe_sample(model, data, adapter))
+    strafe.finish(float(data.time), reason)
+    result["command_segments"] = strafe.segments
+    result["strafe_metrics"] = {"frame": "yaw", "sampling": "policy_endpoints_duration_weighted",
+                               "foot_foot_contact_count_unit": "sample_endpoints",
+                               "match_isaac": bool(getattr(args, "match_isaac", False))}
+    return result
 
 
 def parse_args():
@@ -698,6 +789,8 @@ def parse_args():
                         help="Command schedule T:VX,VY,WZ;... in seconds, e.g. 0:0,0,0;10:0.1,0,0;20:0.2,0,0 "
                         "(replaces --vx/--vy/--wz)")
     parser.add_argument("--trace", type=Path, help="Optional per-policy-step CSV trace (scenario_metrics.py input)")
+    parser.add_argument("--metrics-settle-s", type=float, default=1.0,
+                        help="Excluded initial seconds of each constant-command metrics segment")
     parser.add_argument("--slew-limit", action="store_true",
                         help="Pass targets through the deploy slew limiter (policy_to_real defaults)")
     parser.add_argument("--match-isaac", action="store_true",
@@ -718,6 +811,8 @@ def parse_args():
     parser.add_argument("--hip-yaw-backlash", type=float,
                         help="Total free play in rad inside the hip-yaw PD, no torque within it (diagnostic)")
     args = parser.parse_args()
+    if not math.isfinite(args.metrics_settle_s) or args.metrics_settle_s < 0.0:
+        parser.error("--metrics-settle-s must be finite and non-negative")
     if args.headless and args.duration is None:
         parser.error("--headless requires --duration")
     if not 0.0 <= args.heading_kp <= 2.0 or not 0.0 <= args.heading_ki <= 0.5:
