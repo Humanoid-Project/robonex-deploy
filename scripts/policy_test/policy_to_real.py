@@ -128,6 +128,7 @@ class TeeStream:
 
 
 HOLD_MOTORS = tuple(motor for motor in ALL_MOTORS if motor.model_name == "neck_pitch_joint")
+HOLD_LIMITS_RAD = {"neck_pitch_joint": math.radians(74.0)}
 
 
 def held_motor_ids(robot_model_name):
@@ -1921,7 +1922,8 @@ def run_deploy(policy_path, contract, args):
     hold_ids = held_motor_ids(contract.robot_model) if SETTINGS.hold_head else []
     for spec in HOLD_MOTORS:
         if spec.motor_id in hold_ids:
-            hard_limits[spec.motor_id] = (spec.lower, spec.upper)
+            limit = HOLD_LIMITS_RAD.get(spec.model_name)
+            hard_limits[spec.motor_id] = (spec.lower, spec.upper) if limit is None else (-limit, limit)
             home_targets[spec.motor_id] = 0.0
     control_ids = motor_ids + hold_ids
 

@@ -667,3 +667,8 @@ def test_no_head_hold_flag(modules, tmp_path):
     policy.write_bytes(b"")
     assert ptr.parse_args(["--policy", str(policy), "--no-head-hold"]).no_head_hold is True
     assert ptr.parse_args(["--policy", str(policy)]).no_head_hold is False
+
+
+def test_neck_hold_limit_is_74_degrees(modules):
+    ptr = modules[1]
+    assert ptr.HOLD_LIMITS_RAD["neck_pitch_joint"] == pytest.approx(math.radians(74.0))
