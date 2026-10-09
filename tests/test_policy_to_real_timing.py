@@ -686,3 +686,13 @@ def test_neck_keys_step_five_degrees_within_sixty(modules):
     for _ in range(40):
         keyboard.nudge_head("k")
     assert keyboard.head_target == pytest.approx(math.radians(-60.0))
+
+
+def test_gyro_bias_guard(modules):
+    ptr = modules[1]
+    ok = SimpleNamespace(x=0.003, y=-0.0137, z=0.004)
+    bad = SimpleNamespace(x=0.0002, y=0.0003, z=0.0774)
+    assert ptr.gyro_bias_reason(ok, ptr.Settings().max_gyro_bias) is None
+    reason = ptr.gyro_bias_reason(bad, ptr.Settings().max_gyro_bias)
+    assert reason and "0.0774" in reason and "still" in reason
+    assert ptr.gyro_bias_reason(SimpleNamespace(x=float("nan"), y=0.0, z=0.0), 0.03)

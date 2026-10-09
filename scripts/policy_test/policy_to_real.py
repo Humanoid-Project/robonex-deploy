@@ -197,6 +197,7 @@ class Settings:
     command_hold_seconds: float = 0.5
 
     imu_calibration_seconds: float = 2.0
+    max_gyro_bias: float = 0.03
     brake_time: float = 0.20
 
 
@@ -397,6 +398,11 @@ class ImuSource:
                 f"  raw gyro bias  x {self.bias_raw.x:+.6f}  y {self.bias_raw.y:+.6f}  "
                 f"z {self.bias_raw.z:+.6f}  [rad/s]"
             )
+            reason = gyro_bias_reason(self.bias_raw, self.settings.max_gyro_bias)
+            if reason:
+                self.status = "gyro bias rejected"
+                self.notes.append(f"[IMU] {reason}")
+                return False
         self.status = "ready"
         self._last_seq = None
         self._last_seq_time = time.monotonic()
@@ -440,6 +446,19 @@ class ImuSource:
 
 TIMING_COLUMNS = ("imu_host_age_ms", "imu_device_dt_ms", "imu_host_dt_ms", "imu_seq_gap", "tick_period_ms")
 TIMING_SAMPLE_FIELDS = ("seq", "device_timestamp_us", "host_timestamp_ns")
+
+
+def gyro_bias_reason(bias, limit):
+    values = (bias.x, bias.y, bias.z)
+    if not all(math.isfinite(v) for v in values):
+        return "calibrated gyro bias is not finite"
+    worst = max(abs(v) for v in values)
+    if worst > limit:
+        return (
+            f"calibrated gyro bias {worst:.4f} rad/s exceeds {limit:.3f} rad/s (normal runs stay below 0.014): "
+            "the robot probably moved during the calibration; keep it completely still and start again"
+        )
+    return None
 
 
 def missing_timing_fields(sample):
