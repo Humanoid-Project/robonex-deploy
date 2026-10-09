@@ -673,3 +673,16 @@ def test_zero_head_flag(modules, tmp_path):
 def test_neck_hold_limit_is_74_degrees(modules):
     ptr = modules[1]
     assert ptr.HOLD_LIMITS_RAD["neck_pitch_joint"] == pytest.approx(math.radians(74.0))
+
+
+def test_neck_keys_step_five_degrees_within_sixty(modules):
+    ptr = modules[1]
+    keyboard = ptr.KeyboardCommand(ptr.COMMAND_LIMITS)
+    keyboard.head_target = 0.0
+    assert keyboard.nudge_head("l") == "neck target +5 deg"
+    for _ in range(20):
+        keyboard.nudge_head("l")
+    assert keyboard.head_target == pytest.approx(math.radians(60.0))
+    for _ in range(40):
+        keyboard.nudge_head("k")
+    assert keyboard.head_target == pytest.approx(math.radians(-60.0))

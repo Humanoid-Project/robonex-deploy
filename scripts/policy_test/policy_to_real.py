@@ -129,6 +129,9 @@ class TeeStream:
 
 HOLD_MOTORS = tuple(motor for motor in ALL_MOTORS if motor.model_name == "neck_pitch_joint")
 HOLD_LIMITS_RAD = {"neck_pitch_joint": math.radians(74.0)}
+HEAD_KEY_LIMIT_RAD = math.radians(60.0)
+HEAD_KEY_MAX_SPEED = 0.5
+HEAD_KEY_MAX_ACCEL = 1.0
 
 
 def held_motor_ids(robot_model_name):
@@ -1801,6 +1804,16 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
 
             dt = clamp(now - last_tick, period * 0.25, period * 2.0)
             last_tick = now
+            if keyboard is not None and keyboard.head_target is not None:
+                for motor_id in motors:
+                    if motor_id in commanded:
+                        continue
+                    limiter = commander.limiters[motor_id]
+                    position, velocity = limiter.step(
+                        keyboard.head_target, dt, HEAD_KEY_MAX_SPEED, HEAD_KEY_MAX_ACCEL
+                    )
+                    commander.commands[motor_id] = position
+                    commander.velocities[motor_id] = velocity
             send_started = time.monotonic()
             commander.send(
                 commanded,
@@ -2021,6 +2034,8 @@ def run_deploy(policy_path, contract, args):
         print("  The robot must hang on the stand or be held; this tool cannot catch a fall.")
         print("  Keep the emergency stop within reach.")
         confirm("Press Enter to enable the motors and start, or Ctrl-C to cancel: ")
+        if keyboard is not None and hold_ids:
+            keyboard.head_target = 0.0
         if keyboard is not None and keyboard.start():
             print(f"  {keyboard.legend()}")
 
@@ -2198,6 +2213,7 @@ class KeyboardCommand:
         self.saved = None
         self.active = False
         self.lost = False
+        self.head_target = None
 
     def start(self):
         if not sys.stdin.isatty():
@@ -2241,7 +2257,9 @@ class KeyboardCommand:
                     self.escape_state = 1
                     continue
                 key = chr(byte).lower()
-                if key == " ":
+                if key in ("k", "l") and self.head_target is not None:
+                    note = self.nudge_head(key)
+                elif key == " ":
                     command[:] = (0.0, 0.0, 0.0)
                     note = "command zeroed"
                 elif key in self.KEYS:
@@ -2251,10 +2269,16 @@ class KeyboardCommand:
                     command[axis] = 0.0 if abs(value) < 1e-6 else value
         return note
 
+    def nudge_head(self, key):
+        step = math.radians(5.0) * (1.0 if key == "l" else -1.0)
+        self.head_target = clamp(self.head_target + step, -HEAD_KEY_LIMIT_RAD, HEAD_KEY_LIMIT_RAD)
+        return f"neck target {math.degrees(self.head_target):+.0f} deg"
+
     def legend(self):
         if not self.active:
             return "keyboard: off"
-        return "keys: w/s forward  q/e strafe  a/d turn  SPACE zero  Ctrl-C stop"
+        neck = "  k/l neck -/+5 deg" if self.head_target is not None else ""
+        return f"keys: w/s forward  q/e strafe  a/d turn{neck}  SPACE zero  Ctrl-C stop"
 
 
 # The policy is only trained inside this envelope; a command outside it is out of
