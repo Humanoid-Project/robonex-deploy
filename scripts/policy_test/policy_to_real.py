@@ -102,6 +102,7 @@ from safety import (
     wrap_to_pi,
 )
 from heading_hold import HeadingHold
+from gravity_bc import GravityBC
 
 DEG = math.pi / 180.0
 CLEAR_SCREEN = "\033[2J\033[3J\033[H"
@@ -532,6 +533,9 @@ STEP_EXTRA_COLUMNS = LOOP_EXTRA_COLUMNS + IMU_EXTRA_COLUMNS + HEADING_COLUMNS
 JOINT_EXTRA_FIELDS = ("mode", "action", "slew_vel")
 READ_JOINT_EXTRA_FIELDS = ("vel", "raw_action", "target")
 PHASE_JOINT_FIELDS = ("age_ms", "pos", "vel", "torque", "temp", "fault", "mode", "commanded", "rx_age_ms")
+GRAVITY_BC_COLUMNS = (
+    "gravity_bc_x", "gravity_bc_y", "gravity_bc_z", "gravity_bc_droll_deg", "gravity_bc_dpitch_deg", "gravity_bc_ready",
+)
 
 
 def imu_extra_cells(sample):
@@ -545,6 +549,21 @@ def imu_extra_cells(sample):
                 _round(sample.imu_temperature, 3)]
     except Exception:
         return [""] * len(IMU_EXTRA_COLUMNS)
+
+
+def gravity_bc_cells(gravity_bc):
+    if gravity_bc is None:
+        return [""] * len(GRAVITY_BC_COLUMNS)
+    try:
+        return gravity_bc.cells()
+    except Exception:
+        return [""] * len(GRAVITY_BC_COLUMNS)
+
+
+def gravity_bc_arrays(gravity_bc):
+    if gravity_bc is None or gravity_bc.corrected is None:
+        return {"gravity_bc": [float("nan")] * 3, "gravity_bc_delta_deg": [float("nan")] * 2}
+    return {"gravity_bc": gravity_bc.corrected, "gravity_bc_delta_deg": gravity_bc.delta_deg()}
 
 
 def heading_cells(heading):
@@ -1215,14 +1234,17 @@ def format_held_lines(contract, motors, commands):
     return lines
 
 
-def format_imu(imu, angular_velocity, gravity, age):
+def format_imu(imu, angular_velocity, gravity, age, gravity_bc=None):
     age_text = "--" if age is None else f"{age * 1000.0:.1f} ms"
-    return [
+    lines = [
         f"IMU [{imu.status}]  port {DEFAULT_IMU_PORT}  sample age {age_text}",
         f"  raw angular velocity x {angular_velocity[0]:+8.4f}  y {angular_velocity[1]:+8.4f}  "
         f"z {angular_velocity[2]:+8.4f}  [rad/s]",
         f"  projected gravity    x {gravity[0]:+8.4f}  y {gravity[1]:+8.4f}  z {gravity[2]:+8.4f}",
     ]
+    if gravity_bc is not None:
+        lines.append(gravity_bc.status_line())
+    return lines
 
 
 def format_pipeline(runner):
@@ -1251,6 +1273,7 @@ def run_read(policy_path, contract, args):
     runner.velocity_command[:] = (args.vx, args.vy, args.wz)
     joints = ReadOnlyJointSource(SETTINGS, notes)
     imu = ImuSource(SETTINGS, notes)
+    gravity_bc = GravityBC() if getattr(args, "gravity_bc", False) else None
 
     print(f"Policy      : {policy_path}")
     print(f"Task        : {contract.task}   {contract.policy_hz:.0f} Hz")
@@ -1262,7 +1285,7 @@ def run_read(policy_path, contract, args):
     imu.start(calibrate=True)
     read_log = None
     if args.telemetry:
-        read_log = ReadRecorder(args.telemetry, contract)
+        read_log = ReadRecorder(args.telemetry, contract, gravity_bc=gravity_bc is not None)
         print(f"Recording   : {read_log.path}")
     period = 1.0 / contract.policy_hz
     print_every = max(1, round(contract.policy_hz / SETTINGS.read_print_hz))
@@ -1282,13 +1305,16 @@ def run_read(policy_path, contract, args):
             positions, velocities, missing = runner.joint_state(snapshot)
             angular_velocity, gravity, age = imu.read(now)
             imu_read_ns = time.monotonic_ns()
-            observation = runner.observation(positions, velocities, angular_velocity, gravity)
+            policy_gravity = gravity
+            if gravity_bc is not None:
+                policy_gravity = gravity_bc.update(gravity, GravityBC.sample_force(imu.last_sample))
+            observation = runner.observation(positions, velocities, angular_velocity, policy_gravity)
             raw_action, _, targets = runner.step(observation, commit=True)
             if read_log is not None:
                 read_log.record(now, observation, gravity, angular_velocity, age, positions, missing,
                                 timing=timing.safe_update(now, imu.last_sample, imu_read_ns),
                                 velocities=velocities, raw_action=raw_action, targets=targets,
-                                sample=imu.last_sample)
+                                sample=imu.last_sample, gravity_bc=gravity_bc)
             step += 1
             if (step - 1) % print_every:
                 sleep = period - (time.monotonic() - now)
@@ -1302,7 +1328,7 @@ def run_read(policy_path, contract, args):
             if missing:
                 lines.append(f"  no response: {sorted(missing)} (reported as 0.0)")
             lines.append("")
-            lines.extend(format_imu(imu, angular_velocity, gravity, age))
+            lines.extend(format_imu(imu, angular_velocity, gravity, age, gravity_bc))
             lines.append(f"\nObservation vector ({observation.size})")
             lines.append("  " + "  ".join(f"{value:+.3f}" for value in observation))
             lines.append("")
@@ -1421,8 +1447,9 @@ class ReadRecorder:
     the IMU vectors, and which motors went silent.
     """
 
-    def __init__(self, path, contract):
+    def __init__(self, path, contract, gravity_bc=False):
         self.path = Path(path)
+        self.gravity_bc = bool(gravity_bc)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self.handle = self.path.open("x", newline="")
@@ -1441,6 +1468,8 @@ class ReadRecorder:
         for name in contract.joint_order:
             header += [f"{name.replace('_joint', '')}.{field_name}" for field_name in READ_JOINT_EXTRA_FIELDS]
         header += list(IMU_EXTRA_COLUMNS)
+        if self.gravity_bc:
+            header += list(GRAVITY_BC_COLUMNS)
         self.writer.writerow(header)
         self.handle.flush()
         self.started = None
@@ -1451,7 +1480,7 @@ class ReadRecorder:
             raise SystemExit(f"{self.arrays.path} already exists; recordings are never overwritten.")
 
     def record(self, now, observation, gravity, gyro, age, positions, missing, timing=None,
-               velocities=None, raw_action=None, targets=None, sample=None):
+               velocities=None, raw_action=None, targets=None, sample=None, gravity_bc=None):
         if self.started is None:
             self.started = now
         row = [round(now - self.started, 3)]
@@ -1469,11 +1498,14 @@ class ReadRecorder:
                 "" if targets is None else round(float(targets[index]), 5),
             ]
         row += imu_extra_cells(sample)
+        if self.gravity_bc:
+            row += gravity_bc_cells(gravity_bc)
         self.writer.writerow(row)
         self.handle.flush()
         if raw_action is not None and targets is not None and velocities is not None:
+            extra = gravity_bc_arrays(gravity_bc) if self.gravity_bc else {}
             self.arrays.append(t_s=now - self.started, obs=observation, pos=positions, vel=velocities,
-                               raw_action=raw_action, targets=targets, gyro=gyro, gravity=gravity)
+                               raw_action=raw_action, targets=targets, gyro=gyro, gravity=gravity, **extra)
 
     def close(self):
         try:
@@ -1499,8 +1531,9 @@ class TelemetryRecorder:
     SLACK_S = 0.005
     MAX_ROWS = 500
 
-    def __init__(self, path, contract, motors, hubs=None):
+    def __init__(self, path, contract, motors, hubs=None, gravity_bc=False):
         self.path = Path(path)
+        self.gravity_bc = bool(gravity_bc)
         self.rows = []
         self.order = joint_row_order(contract)
         self.motors = motors
@@ -1530,6 +1563,8 @@ class TelemetryRecorder:
         for name, motor_id in self.order:
             short = name.replace("_joint", "")
             header += [f"{short}.{field_name}" for field_name in JOINT_EXTRA_FIELDS]
+        if self.gravity_bc:
+            header += list(GRAVITY_BC_COLUMNS)
         header.append("stop_reason")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -1552,7 +1587,7 @@ class TelemetryRecorder:
     def record(self, now, started, dt, inference_ms, ramp, raw_action, targets, commands,
                gravity=None, gyro=None, imu_age=None, velocity_command=None, stop_reason="",
                send_ms=None, timing=None, extra=None, policy_action=None, slew_velocities=None,
-               observation=None, positions=None, velocities=None, allow_flush=True):
+               observation=None, positions=None, velocities=None, allow_flush=True, gravity_bc=None):
         wall = time.time()
         row = [
             round(now - started, 4), round(wall, 6), self.step, round(dt * 1000.0, 3),
@@ -1593,16 +1628,19 @@ class TelemetryRecorder:
                 "" if policy_action is None else round(float(policy_action[index]), 5),
                 "" if slew_velocities is None else _round(slew_velocities.get(motor_id)),
             ]
+        if self.gravity_bc:
+            row += gravity_bc_cells(gravity_bc)
         row.append(stop_reason)
         self.rows.append(row)
         if observation is not None:
+            extra = gravity_bc_arrays(gravity_bc) if self.gravity_bc else {}
             self.arrays.append(
                 t_s=now - started, wall_time=wall, step=self.step, obs=observation,
                 raw_action=raw_action, policy_action=policy_action, targets=targets,
                 commanded=[commands.get(motor_id, float("nan")) for _, motor_id in self.order],
                 pos=positions, vel=velocities,
                 torque=[_float_attr(self.motors.get(motor_id), "last_torque") for _, motor_id in self.order],
-                gyro=gyro, gravity=gravity, velocity_command=velocity_command,
+                gyro=gyro, gravity=gravity, velocity_command=velocity_command, **extra,
             )
         self.step += 1
         if allow_flush and len(self.rows) >= self.MAX_ROWS:
@@ -1648,6 +1686,8 @@ class TelemetryRecorder:
                 "policy_max_accel": settings.policy_max_accel,
             },
         }
+        if getattr(args, "gravity_bc", False):
+            meta["gravity_bc"] = GravityBC.config()
         meta["files"] = {
             "telemetry": self.path.name,
             "arrays": self.arrays.path.name,
@@ -1758,12 +1798,14 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
     reproject = roll_reprojector(runner.pipeline, runner.motor_ids)
     owns_telemetry = telemetry is None and bool(getattr(args, "telemetry", None))
     if owns_telemetry:
-        telemetry = TelemetryRecorder(args.telemetry, contract, motors, hubs=getattr(joints, "hubs", None))
+        telemetry = TelemetryRecorder(args.telemetry, contract, motors, hubs=getattr(joints, "hubs", None),
+                                      gravity_bc=getattr(args, "gravity_bc", False))
     timing = TimingProbe() if telemetry is not None else None
     prev_work_ms = None
     heading = None
     if getattr(args, "heading_hold", False):
         heading = HeadingHold(args.heading_kp, args.heading_ki, args.heading_source)
+    gravity_bc = GravityBC() if getattr(args, "gravity_bc", False) else None
     if owns_telemetry:
         print(f"Telemetry   : {telemetry.path}  ({contract.policy_hz:.0f} Hz per-motor record)")
         print(f"Provenance  : {telemetry.write_sidecar(runner.policy_path, contract, SETTINGS, args).name}")
@@ -1808,6 +1850,10 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
             if tilt:
                 raise stop(tilt, gravity=gravity, gyro=angular_velocity, imu_age=age)
 
+            policy_gravity = gravity
+            if gravity_bc is not None:
+                policy_gravity = gravity_bc.update(gravity, GravityBC.sample_force(imu.last_sample))
+
             requested_command = runner.velocity_command.copy()
             holding = now - ramp_started < SETTINGS.ramp_seconds + SETTINGS.command_hold_seconds
             if heading is not None:
@@ -1820,7 +1866,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     runner.velocity_command[2] = heading_wz
                 if heading is not None:
                     heading.policy_wz = float(runner.velocity_command[2])
-                observation = runner.observation(positions, velocities, angular_velocity, gravity)
+                observation = runner.observation(positions, velocities, angular_velocity, policy_gravity)
                 raw_action, policy_action, targets = runner.step(observation, commit=False)
             except ValueError as error:
                 raise RuntimeError(f"Safety stop: {error}") from error
@@ -1862,7 +1908,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     extra=step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, runner.pipeline,
                                            thermal, imu.last_sample, heading, holding),
                     policy_action=policy_action, slew_velocities=commander.velocities,
-                    observation=observation, positions=positions, velocities=velocities,
+                    observation=observation, positions=positions, velocities=velocities, gravity_bc=gravity_bc,
                 )
 
             if now - last_status >= 1.0 / SETTINGS.status_hz:
@@ -1877,7 +1923,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                 )
                 lines.extend(format_held_lines(contract, motors, commander.commands))
                 lines.append("")
-                lines.extend(format_imu(imu, angular_velocity, gravity, age))
+                lines.extend(format_imu(imu, angular_velocity, gravity, age, gravity_bc))
                 lines.append("")
                 lines.append(format_pipeline(runner))
                 worst_lag_id = commander.worst_slew_lag_motor()
@@ -2015,7 +2061,8 @@ def run_deploy(policy_path, contract, args):
                     f"IMU sample lacks the timing fields {missing_fields} that --telemetry records; "
                     "motors will not be enabled. Rebuild the n100 binding or run without --telemetry"
                 )
-            telemetry = TelemetryRecorder(args.telemetry, contract, motors, hubs=hubs)
+            telemetry = TelemetryRecorder(args.telemetry, contract, motors, hubs=hubs,
+                                          gravity_bc=getattr(args, "gravity_bc", False))
             phases = PhaseRecorder(telemetry.phases_path, contract, motors, imu=imu)
             bias = imu.bias_raw
             run_meta.update({
@@ -2383,6 +2430,15 @@ def parse_args(argv=None):
              "(gyro), or the N100 AHRS quaternion yaw (quat). Both are recorded either way",
     )
     parser.add_argument(
+        "--gravity-bc",
+        action="store_true",
+        help="Feed the policy the AHRS projected gravity rotated by a slow bias correction: the error between the "
+             "trailing 40-tick (0.8 s) means of the AHRS gravity and of the accelerometer direction, low-passed "
+             "with a 1 s time constant, at most 8 deg per axis, 0 until the window is full. The gyro, the tilt "
+             "stop and the heading hold keep the raw AHRS values; telemetry adds the corrected gravity and the "
+             "correction. Off by default",
+    )
+    parser.add_argument(
         "--gain-scale",
         type=float,
         default=Settings.gain_scale,
@@ -2464,12 +2520,26 @@ def parse_args(argv=None):
     return args
 
 
+def gravity_bc_reason(contract):
+    if not any(term.split(":")[0] == "projected_gravity" for term in contract.observation_terms):
+        return "--gravity-bc needs a policy that observes projected_gravity"
+    if not math.isclose(contract.policy_hz, 1.0 / GravityBC.DT_S):
+        return (f"--gravity-bc is tuned for {1.0 / GravityBC.DT_S:.0f} Hz ({GravityBC.WINDOW} ticks = one 0.8 s "
+                f"stride); this policy runs at {contract.policy_hz:g} Hz")
+    return None
+
+
 def run(args):
     try:
         contract = resolve_contract(args.policy)
     except (FileNotFoundError, ValueError) as error:
         print(f"Policy error: {error}")
         return 1
+    if getattr(args, "gravity_bc", False):
+        reason = gravity_bc_reason(contract)
+        if reason:
+            print(f"Policy error: {reason}")
+            return 1
     try:
         if args.read:
             return run_read(args.policy, contract, args)

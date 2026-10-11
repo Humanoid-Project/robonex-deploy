@@ -284,6 +284,7 @@ python3 scripts/sim_to_real/real_to_mujoco.py --robot max --once --motor-id head
 | - | `--heading-hold` | Off | PI heading hold on the yaw-rate command the policy sees (±0.2 rad/s); engages with wz 0 and vx/vy above the gait deadband |
 | - | `--heading-kp` / `--heading-ki` | `1.0` / `0.1` | Heading-hold gains (kp 0–2, ki 0–0.5; integral ±0.1 rad/s) |
 | - | `--heading-source` | `gyro` | Held heading: integrated bias-calibrated gyro (`gyro`) or N100 AHRS yaw (`quat`); both are recorded |
+| - | `--gravity-bc` | Off | Policy gravity = AHRS projected gravity rotated by a slow bias correction (40-tick boxcar of AHRS gravity vs accelerometer direction, 1 s low-pass, ≤ 8° per axis, 0 until the window is full); gyro, tilt stop and heading hold keep the raw AHRS; live and `--read`; refused for a policy without `projected_gravity` or not at 50 Hz |
 | - | `--telemetry` | Off | Per-step CSV plus `_arrays.npz` and, live only, `_phases.csv` and `_meta.json`; no path = timestamped file under `results/policy_to_real`; live mode refuses before motor enable when any of these files exists or the IMU sample lacks `seq`, `device_timestamp_us` or `host_timestamp_ns`, and a timing-column failure mid-run leaves those cells blank and warns at exit |
 | - | `--log` | Off | Save terminal output; no path = timestamped file |
 | - | `--gain-scale` | `1.0` | Fraction of the trained per-joint gains |
@@ -318,11 +319,21 @@ python3 scripts/policy_test/policy_to_real.py \
   --read \
   --duration 60 \
   --telemetry
+
+# Read-only gravity bias-correction capture, no motor commanded
+python3 scripts/policy_test/policy_to_real.py \
+  --policy policies/<run>/policy.onnx \
+  --read \
+  --gravity-bc \
+  --duration 120 \
+  --telemetry \
+  --log
 ```
 
 | Output | Description |
 | --- | --- |
 | `heading_*`, `policy_wz` | Heading hold: gyro and AHRS heading, target, error (deg), integral and controller correction (rad/s, 0 when released), engaged, and the yaw-rate command the policy saw; blank without `--heading-hold` |
+| `gravity_bc_*` | `--gravity-bc` only, before `stop_reason` (read mode: last): corrected gravity the policy saw (`_x/_y/_z`), correction about base x and y (`_droll_deg`, `_dpitch_deg`), window full (`_ready`); `gravity_*` stay the raw AHRS gravity; arrays add `gravity_bc` and `gravity_bc_delta_deg`, `_meta.json` adds `gravity_bc` |
 | `imu_age_ms` | Time since the loop last saw a new AHRS seq or raw-IMU frame count (the stale-stop input); about 0 on a healthy stream |
 | `imu_host_age_ms` | Monotonic time right after `imu.read` minus `sample.host_timestamp_ns`: AHRS publish to policy read age, not raw-gyro age; excludes the device/wire delay d0 and the raw-gyro hold |
 | `imu_device_dt_ms` | Difference of consecutive ticks' `device_timestamp_us` (AHRS device clock) |
