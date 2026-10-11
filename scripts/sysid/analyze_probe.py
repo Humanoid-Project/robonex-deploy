@@ -10,6 +10,8 @@ import numpy as np
 def load(path):
     with open(path, newline="") as handle:
         rows = list(csv.DictReader(handle))
+    if not rows:
+        raise SystemExit(f"{path}: no samples")
     columns = {}
     for key in rows[0]:
         values = []
@@ -85,7 +87,7 @@ def chirp_response(c, meta, frequencies):
     f0, f1, duration = float(meta["f0"]), float(meta["f1"]), float(meta["duration"])
     k = np.log(f1 / f0) / duration
     dt = float(np.median(np.diff(wall)))
-    out = []
+    out, responses = [], []
     for f in frequencies:
         if not f0 < f < f1:
             continue
@@ -102,9 +104,11 @@ def chirp_response(c, meta, frequencies):
         xs, ys = np.sum(x * ref), np.sum(y * ref)
         if abs(xs) < 1e-12:
             continue
-        h = ys / xs
-        out.append({"hz": f, "gain": float(abs(h)), "phase_deg": float(np.degrees(np.angle(h))),
-                    "delay_ms_equiv": float(-np.angle(h) / (2 * np.pi * f) * 1000.0)})
+        responses.append((f, ys / xs))
+    phases = np.unwrap([np.angle(h) for _, h in responses])
+    for (f, h), phase in zip(responses, phases):
+        out.append({"hz": f, "gain": float(abs(h)), "phase_deg": float(np.degrees(phase)),
+                    "delay_ms_equiv": float(-phase / (2 * np.pi * f) * 1000.0)})
     return out
 
 

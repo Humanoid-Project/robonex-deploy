@@ -750,12 +750,6 @@ def simulate(model, data, adapter, args, viewer_handle, command_lock=None):
             if sleep_seconds > 0.0:
                 time.sleep(sleep_seconds)
     wall_seconds = time.perf_counter() - wall_start
-    if trace is not None:
-        args.trace.parent.mkdir(parents=True, exist_ok=True)
-        with open(args.trace, "w", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(trace_header(adapter))
-            writer.writerows(trace)
     result = diagnostics.result(
         data,
         status,
@@ -767,6 +761,15 @@ def simulate(model, data, adapter, args, viewer_handle, command_lock=None):
     if state_is_finite(data):
         mujoco.mj_forward(model, data)
         strafe.sample(float(data.time), strafe_sample(model, data, adapter))
+        if trace is not None and diagnostics.policy_steps and (not trace or trace[-1][1] != diagnostics.policy_steps - 1):
+            trace.append(trace_row(model, data, adapter, commanded, diagnostics.policy_steps - 1, policy_period,
+                                   args.minimum_height))
+    if trace is not None:
+        args.trace.parent.mkdir(parents=True, exist_ok=True)
+        with open(args.trace, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(trace_header(adapter))
+            writer.writerows(trace)
     strafe.finish(float(data.time), reason)
     result["command_segments"] = strafe.segments
     result["strafe_metrics"] = {"frame": "yaw", "sampling": "policy_endpoints_duration_weighted",

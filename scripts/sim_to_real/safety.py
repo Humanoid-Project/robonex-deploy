@@ -5,7 +5,7 @@ per-script speed/accel caps stay in the scripts themselves.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import math
 import signal
@@ -22,9 +22,9 @@ from robonex_common.models import ROBOT_MODELS
 from robonex_common.paths import description_model
 
 try:
-    from bench import LEG_MOTOR_IDS, ROBOT_IDENTITY_FILE, ROBOT_VARIANTS, attached_robot_model
+    from bench import LEG_MOTOR_IDS, ROBOT_VARIANTS, attached_robot_model, identity_path
 except ModuleNotFoundError:
-    from .bench import LEG_MOTOR_IDS, ROBOT_IDENTITY_FILE, ROBOT_VARIANTS, attached_robot_model
+    from .bench import LEG_MOTOR_IDS, ROBOT_VARIANTS, attached_robot_model, identity_path
 from robonex_can import (
     FeedbackHub,
     JOINT_LIMITS_RAD,
@@ -143,7 +143,7 @@ def fixed_model_path(robot):
 
 
 def require_robot_model(expected, path=None):
-    path = ROBOT_IDENTITY_FILE if path is None else Path(path)
+    path = identity_path() if path is None else Path(path)
     try:
         attached = attached_robot_model(path)
     except ValueError as error:
@@ -209,6 +209,15 @@ def clip_roll_targets(targets, pairs, limits, roll):
             sign * out[upper_id], sign * out[lower_id], upper_range, lower_range, roll.coeffs, roll.limit
         )
         out[upper_id], out[lower_id] = sign * float(upper), sign * float(lower)
+    return out
+
+
+def hold_roll_band(commands, previous, pairs, limits, roll):
+    out = dict(commands)
+    for upper_id, lower_id, sign in pairs:
+        current = abs(foot_roll(sign * previous[upper_id], sign * previous[lower_id], roll.coeffs))
+        band = replace(roll, limit=max(roll.limit, current))
+        out = clip_roll_targets(out, [(upper_id, lower_id, sign)], limits, band)
     return out
 
 

@@ -142,6 +142,21 @@ def test_append_only_compatibility(mj, tmp_path):
     old, old_fields, old_rows = rollout(baseline, tmp_path, "old", duration=1)
     new, fields, rows = rollout(mj, tmp_path, "new", duration=1)
     assert fields[:len(old_fields)] == old_fields
-    assert [{key: row[key] for key in old_fields} for row in rows] == old_rows
+    assert len(rows) - len(old_rows) in (0, 1)
+    assert [{key: row[key] for key in old_fields} for row in rows[:len(old_rows)]] == old_rows
     assert {key: new[key] for key in old if key != "wall_time_s"} == {
         key: value for key, value in old.items() if key != "wall_time_s"}
+
+
+def test_trace_has_a_row_for_every_policy_step(mj, tmp_path):
+    result, _, rows = rollout(mj, tmp_path, "rows", duration=1.0)
+    assert result["status"] == "timeout"
+    assert [int(row["step"]) for row in rows] == list(range(result["policy_steps"]))
+    assert float(rows[-1]["t_s"]) == pytest.approx(result["simulation_time_s"], abs=1e-4)
+
+
+def test_trace_keeps_the_state_at_an_early_stop(mj, tmp_path):
+    result, _, rows = rollout(mj, tmp_path, "stop_rows", max_constraint_error=-1)
+    assert result["status"] == "constraint_divergence"
+    assert [int(row["step"]) for row in rows] == list(range(result["policy_steps"]))
+    assert float(rows[-1]["t_s"]) == pytest.approx(result["simulation_time_s"], abs=1e-4)

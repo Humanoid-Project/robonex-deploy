@@ -132,7 +132,7 @@ def test_parse_args(ptr, tmp_path):
     args = ptr.parse_args(["--policy", str(policy), "--heading-hold", "--heading-source", "quat"])
     assert args.heading_hold and args.heading_source == "quat"
     for bad in (["--heading-kp", "4"], ["--heading-kp", "-1"], ["--heading-ki", "1"], ["--heading-kp", "nan"],
-                ["--heading-hold", "--read"]):
+                ["--heading-hold", "--read"], ["--keyboard", "--read"]):
         with pytest.raises(SystemExit):
             ptr.parse_args(["--policy", str(policy)] + bad)
 
@@ -261,3 +261,49 @@ def test_ankle_gain_scale(ptr, tmp_path):
     for bad in ("0.5", "2.5", "nan"):
         with pytest.raises(SystemExit):
             ptr.parse_args(["--policy", str(policy), "--ankle-gain-scale", bad])
+
+
+def test_cmd_holding_marks_the_zero_command_window(ptr, tmp_path, capsys):
+    path = tmp_path / "holding.csv"
+    _, seen, _ = run_loop(ptr, path, False)
+    rows = read_csv(path)
+    hold_end = ptr.SETTINGS.ramp_seconds + ptr.SETTINGS.command_hold_seconds
+    times = np.array([float(r["t_s"]) for r in rows])
+    holding = np.array([r["cmd_holding"] for r in rows])
+    assert set(holding[times < hold_end - 0.05]) == {"1"}
+    assert set(holding[times > hold_end + 0.05]) == {"0"}
+    assert np.all(seen[: len(rows)][holding == "1"] == 0.0)
+    assert all(float(r["cmd_vx"]) == pytest.approx(0.2) for r in rows)
+
+
+class _Distribution:
+    version = "1.2.0"
+
+    def __init__(self, direct_url):
+        self.direct_url = direct_url
+
+    def read_text(self, name):
+        return self.direct_url if name == "direct_url.json" else None
+
+
+def test_host_snapshot_common_provenance(ptr, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ptr, "git_state", lambda path: calls.append(Path(path)) or {"path": str(path)})
+    installed = '{"url": "https://github.com/x/robonex-common", "vcs_info": {"vcs": "git", "commit_id": "abc"}}'
+    monkeypatch.setattr(ptr.metadata, "distribution", lambda name: _Distribution(installed))
+    common = ptr.host_snapshot([])["git"]["common"]
+    assert common["version"] == "1.2.0"
+    assert common["direct_url"]["vcs_info"]["commit_id"] == "abc"
+    assert "git" not in common
+    calls.clear()
+    editable = '{"url": "file:///home/u/robonex%20common", "dir_info": {"editable": true}}'
+    monkeypatch.setattr(ptr.metadata, "distribution", lambda name: _Distribution(editable))
+    common = ptr.host_snapshot([])["git"]["common"]
+    assert common["git"] == {"path": "/home/u/robonex common"}
+
+    def missing(name):
+        raise ptr.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(ptr.metadata, "distribution", missing)
+    common = ptr.host_snapshot([])["git"]["common"]
+    assert Path(common["path"]) == Path(ptr.robonex_common.__file__).resolve().parents[2]

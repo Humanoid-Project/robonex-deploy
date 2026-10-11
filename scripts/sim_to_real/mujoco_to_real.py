@@ -60,9 +60,11 @@ from safety import (
     runtime_safety_reason,
     shutdown_report_lines,
     clip_roll_targets,
+    hold_roll_band,
     require_robot_model,
     roll_pairs_for,
     safe_limits,
+    start_roll_blocks,
     verify_model_limits,
     wrap_to_pi,
 )
@@ -166,7 +168,7 @@ def dry_run_report(args, motor_ids, model_path, hard_limits, actuator_ids, cappe
     print(f"Would enable ID {format_ids(motor_ids)} after the preflight zero check and the Enter confirmation.")
 
 
-def move_to_zero(motors, hubs, starts, limits, args):
+def move_to_zero(motors, hubs, starts, limits, args, roll_pairs=(), roll=None):
     tolerance_rad = math.radians(args.zero_tolerance_deg)
     period = 1.0 / args.rate
     commands = dict(starts)
@@ -190,12 +192,20 @@ def move_to_zero(motors, hubs, starts, limits, args):
         dt = clamp(now - last_tick, period * 0.25, period * 2.0)
         last_tick = now
         velocities = {}
+        previous = {mid: limiters[mid].position for mid in motors}
         for mid in sorted(motors):
             position, velocity = limiters[mid].step(
                 zero_targets[mid], dt, args.max_speed, args.max_accel
             )
             commands[mid] = position
             velocities[mid] = velocity
+        if roll_pairs:
+            projected = hold_roll_band(commands, previous, roll_pairs, limits, roll)
+            for mid in motors:
+                limiters[mid].position = projected[mid]
+                limiters[mid].velocity = (projected[mid] - previous[mid]) / dt
+                commands[mid] = projected[mid]
+                velocities[mid] = limiters[mid].velocity
 
         for mid, motor in motors.items():
             motor.control(
@@ -312,9 +322,11 @@ def run(args):
         idle = stop_idle_motors(buses, motor_ids, args.host_id, VARIANT_MOTOR_IDS[args.variant])
         if idle:
             print(f"Stop sent to the other motors on the open buses: {idle}")
-        _, zero_failures = inspect_zero_positions(
+        measured, zero_failures = inspect_zero_positions(
             motors, math.radians(args.zero_tolerance_deg), hard_limits
         )
+        if roll_pairs:
+            zero_failures += start_roll_blocks(measured, roll_pairs, profile.foot_roll, math.radians(1.0))
         if zero_failures:
             raise RuntimeError(
                 "Preflight safety check failed; motors will not be enabled:\n  "
@@ -330,7 +342,7 @@ def run(args):
             enabled_ids = getattr(error, "enabled_ids", enabled_ids)
             raise
         commands.update(starts)
-        commands.update(move_to_zero(motors, hubs, starts, hard_limits, args))
+        commands.update(move_to_zero(motors, hubs, starts, hard_limits, args, roll_pairs, profile.foot_roll))
         limiters = {mid: AxisLimiter(commands[mid]) for mid in motor_ids}
 
         with mujoco.viewer.launch_passive(model, data) as viewer:

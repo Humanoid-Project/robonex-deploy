@@ -62,8 +62,10 @@ def segments(columns, settle_s, min_ramp):
 
 
 def dominant_frequency(x, dt, band=(0.3, 3.0)):
+    if len(x) < 32 or not np.all(np.isfinite(x)):
+        return None
     x = x - np.mean(x)
-    if len(x) < 32 or not np.any(x):
+    if not np.any(x):
         return None
     spectrum = np.abs(np.fft.rfft(x * np.hanning(len(x)))) ** 2
     freq = np.fft.rfftfreq(len(x), dt)

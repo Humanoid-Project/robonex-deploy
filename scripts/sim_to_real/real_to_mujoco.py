@@ -176,6 +176,8 @@ def position_state(value, limits, tolerance_rad):
     if not math.isfinite(value):
         return None, "NaN"
     wrapped = wrap_to_pi(value)
+    if abs(value) > math.pi:
+        return wrapped, "MULTITURN"
     lower, upper = limits
     if wrapped < lower - tolerance_rad or wrapped > upper + tolerance_rad:
         return wrapped, "LIMIT"
@@ -190,6 +192,11 @@ def validate_positions(positions, limits, tolerance_rad):
         target, state = position_state(value, limits[motor_id], tolerance_rad)
         if state == "NaN":
             raise RuntimeError(f"ID {motor_id} mechPos is NaN or infinite")
+        if state == "MULTITURN":
+            raise RuntimeError(
+                f"ID {motor_id} raw mechPos {math.degrees(value):+.3f} deg is outside -180..+180 deg; "
+                "set zero_sta=1 (0x7029) on this motor"
+            )
         if state == "LIMIT":
             lower, upper = limits[motor_id]
             raise RuntimeError(

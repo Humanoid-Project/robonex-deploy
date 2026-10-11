@@ -332,6 +332,7 @@ python3 scripts/policy_test/policy_to_real.py \
 | `<joint>.age_ms` | Live only: time since `FeedbackHub.pump` drained the joint's last type 0x02 frame, taken when the row is written (after send); drain-time age, one stamp per pump batch, not acquisition age |
 | `<joint>.rx_age_ms` | Live only: wall time when the row is written minus the socketcan kernel receive timestamp of that frame |
 | `late_ms`, `poll_ms`, `prev_work_ms` | Live only: tick start minus its schedule, feedback drain time, previous tick's work time before sleep |
+| `cmd_holding` | Live only: 1 while the start hold (ramp plus 0.5 s) feeds the policy a zero command; `cmd_*` still show the requested command |
 | `rx_frames.<channel>` | Live only: CAN frames of any type drained from that bus this tick |
 | `acc_*`, `quat_*`, `imu_temp_c` | AHRS linear acceleration, orientation and IMU temperature of the sample read this tick |
 | `<joint>.mode`, `.action`, `.slew_vel` | Live only: motor mode status, runner-clipped action fed back to the policy, slew-limiter velocity |

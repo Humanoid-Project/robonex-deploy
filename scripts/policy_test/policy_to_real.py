@@ -23,6 +23,7 @@ import tty
 from dataclasses import asdict, dataclass, field, replace
 from importlib import metadata
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 PROGRAM_STARTED = time.monotonic()
 
@@ -89,6 +90,7 @@ from safety import (
     align_angle,
     brake_and_stop,
     enable_with_runtime_feedback,
+    hold_roll_band,
     inspect_zero_positions,
     open_hardware,
     require_robot_model,
@@ -524,7 +526,7 @@ HEADING_COLUMNS = (
 )
 LOOP_EXTRA_COLUMNS = (
     "late_ms", "poll_ms", "prev_work_ms", "slew_lag_deg", "runner_clip_total", "target_clip_total",
-    "roll_clip_total", "roll_reprojected_total", "thermal_load_max",
+    "roll_clip_total", "roll_reprojected_total", "thermal_load_max", "cmd_holding",
 )
 STEP_EXTRA_COLUMNS = LOOP_EXTRA_COLUMNS + IMU_EXTRA_COLUMNS + HEADING_COLUMNS
 JOINT_EXTRA_FIELDS = ("mode", "action", "slew_vel")
@@ -554,7 +556,8 @@ def heading_cells(heading):
         return [""] * len(HEADING_COLUMNS)
 
 
-def step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, pipeline, thermal, sample, heading=None):
+def step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, pipeline, thermal, sample, heading=None,
+                     holding=None):
     try:
         loads = getattr(thermal, "load", None) or {}
         cells = [
@@ -565,6 +568,7 @@ def step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, pipeline, therma
             getattr(pipeline, "roll_clip_count", ""),
             getattr(commander, "roll_reprojected_count", ""),
             _round(max(loads.values()) if loads else None, 4),
+            "" if holding is None else int(holding),
         ]
     except Exception:
         cells = [""] * len(LOOP_EXTRA_COLUMNS)
@@ -678,6 +682,12 @@ def imu_driver_stats(imu):
 def host_snapshot(channels):
     repos = {"deploy": git_state(THIS_FILE.parents[2])}
     try:
+        distribution = metadata.distribution("robonex-common")
+        direct_url = json.loads(distribution.read_text("direct_url.json") or "{}")
+        repos["common"] = {"version": distribution.version, "direct_url": direct_url}
+        if direct_url.get("dir_info", {}).get("editable") and direct_url.get("url", "").startswith("file://"):
+            repos["common"]["git"] = git_state(Path(unquote(urlparse(direct_url["url"]).path)))
+    except metadata.PackageNotFoundError:
         repos["common"] = git_state(Path(robonex_common.__file__).resolve().parents[2])
     except Exception as error:
         repos["common"] = {"error": str(error)}
@@ -1316,14 +1326,16 @@ def run_read(policy_path, contract, args):
             read_log.close()
             print(f"Recorded to {read_log.path}")
             if read_log.arrays.error:
-                print(f"Warning: arrays not saved ({read_log.arrays.error})")
+                saved = read_log.arrays.error.startswith("capacity")
+                print(f"Warning: arrays {'truncated' if saved else 'not saved'} ({read_log.arrays.error})")
             if timing.warning():
                 print(timing.warning())
         print("Stopped. No motor was enabled or commanded.")
     return 0
 
 
-def approach_pose(commander, joints, targets, motors, limits, settings, label, faults, recorder=None):
+def approach_pose(commander, joints, targets, motors, limits, settings, label, faults, recorder=None,
+                  roll_pairs=(), roll=None):
     print(f"\nSpeed-limited move to the {label} pose ({settings.approach_max_speed:.2f} rad/s cap).")
     tolerance = settings.approach_tolerance_deg * DEG
     period = 1.0 / 100.0
@@ -1344,12 +1356,15 @@ def approach_pose(commander, joints, targets, motors, limits, settings, label, f
 
         dt = clamp(now - last_tick, period * 0.25, period * 2.0)
         last_tick = now
+        previous = dict(commander.commands)
         commander.send(
             targets,
             dt,
             settings.approach_max_speed,
             settings.approach_max_accel,
             use_velocity_target=True,
+            reproject=(lambda commands: hold_roll_band(commands, previous, roll_pairs, limits, roll))
+            if roll_pairs else None,
         )
         if recorder is not None:
             recorder.record(label, commander.commands)
@@ -1845,7 +1860,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     send_ms=send_ms,
                     timing=timing.safe_update(now, imu.last_sample, imu_read_ns),
                     extra=step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, runner.pipeline,
-                                           thermal, imu.last_sample, heading),
+                                           thermal, imu.last_sample, heading, holding),
                     policy_action=policy_action, slew_velocities=commander.velocities,
                     observation=observation, positions=positions, velocities=velocities,
                 )
@@ -2056,7 +2071,7 @@ def run_deploy(policy_path, contract, args):
         approach_started = time.monotonic()
         try:
             approach_pose(commander, joints, home_targets, motors, hard_limits, SETTINGS, "default", faults,
-                          recorder=phases)
+                          recorder=phases, roll_pairs=roll_pairs, roll=profile.foot_roll)
         finally:
             end_meta["approach"] = {
                 "seconds": time.monotonic() - approach_started,
@@ -2419,6 +2434,8 @@ def parse_args(argv=None):
         parser.error("--heading-ki must be in [0, 0.5]")
     if args.heading_hold and args.read:
         parser.error("--heading-hold has no effect in --read mode")
+    if args.keyboard and args.read:
+        parser.error("--keyboard has no effect in --read mode")
     for name, value, limit in (
         ("--vx", args.vx, COMMAND_LIMITS[0]),
         ("--vy", args.vy, COMMAND_LIMITS[1]),

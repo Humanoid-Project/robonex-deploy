@@ -36,7 +36,7 @@ def identity_path():
 
 
 def attached_robot_model(path=None):
-    path = ROBOT_IDENTITY_FILE if path is None else Path(path)
+    path = identity_path() if path is None else Path(path)
     try:
         value = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
