@@ -1290,7 +1290,8 @@ def run_read(policy_path, contract, args):
     period = 1.0 / contract.policy_hz
     print_every = max(1, round(contract.policy_hz / SETTINGS.read_print_hz))
     step = 0
-    deadline = None if args.duration is None else time.monotonic() + args.duration
+    duration = getattr(args, "duration", None)
+    deadline = None if duration is None else time.monotonic() + duration
     # The preview prints at read_print_hz, not the policy rate, and nothing here commits a
     # command, so the gait clock has no step counter to ride on. Derive it from elapsed time
     # instead: otherwise the preview shows a frozen phase and the policy it displays is not
@@ -1793,7 +1794,8 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
     last_status = 0.0
     ramp_started = next_tick
     home = {motor_id: wrap_to_pi(commander.commands[motor_id]) for motor_id in motors}
-    deadline = None if args.duration is None else next_tick + args.duration
+    duration = getattr(args, "duration", None)
+    deadline = None if duration is None else next_tick + duration
     commander.reset_stats()
     reproject = roll_reprojector(runner.pipeline, runner.motor_ids)
     owns_telemetry = telemetry is None and bool(getattr(args, "telemetry", None))
@@ -2097,7 +2099,6 @@ def run_deploy(policy_path, contract, args):
         print(f"  motor IDs   : {sorted(motor_ids)}")
         if hold_ids:
             print(f"  held at 0   : {sorted(hold_ids)}  (--zero-head)")
-        print(f"  duration    : {'until Ctrl-C' if args.duration is None else f'{args.duration:.1f} s'}")
         print(f"  tilt stop   : {SETTINGS.max_tilt_deg:g} deg from vertical")
         print("  The robot must hang on the stand or be held; this tool cannot catch a fall.")
         print("  Keep the emergency stop within reach.")
@@ -2356,7 +2357,6 @@ def parse_args(argv=None):
         action="store_true",
         help="Read-only preview: print observation, action and targets without commanding any motor",
     )
-    parser.add_argument("--duration", type=float, help="Stop after this many seconds")
     parser.add_argument(
         "--keyboard",
         action="store_true",
@@ -2478,8 +2478,6 @@ def parse_args(argv=None):
     args.policy = args.policy.expanduser().resolve()
     if not args.policy.is_file():
         parser.error(f"Policy not found: {args.policy}")
-    if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0.0):
-        parser.error("--duration must be finite and positive")
     if not math.isfinite(args.gain_scale) or not 0.0 < args.gain_scale <= 1.0:
         parser.error("--gain-scale must be in (0, 1]")
     if not math.isfinite(args.ankle_gain_scale) or not 1.0 <= args.ankle_gain_scale <= 2.0:

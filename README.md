@@ -278,7 +278,6 @@ python3 scripts/sim_to_real/real_to_mujoco.py --robot max --once --motor-id head
 | --- | --- | --- | --- |
 | - | `--policy` | `Required` | ONNX policy path (manifest next to it) |
 | - | `--read` | Off | Read-only preview; no motor is commanded |
-| - | `--duration` | Until Ctrl-C | Stop after this many seconds |
 | - | `--vx` / `--vy` / `--wz` | `0.0` | Constant velocity command inside the trained envelope |
 | - | `--keyboard` | Off | Steer the command with w/s, q/e, a/d, SPACE |
 | - | `--heading-hold` | Off | PI heading hold on the yaw-rate command the policy sees (±0.2 rad/s); engages with wz 0 and vx/vy above the gait deadband |
@@ -296,7 +295,6 @@ python3 scripts/sim_to_real/real_to_mujoco.py --robot max --once --motor-id head
 # Example
 python3 scripts/policy_test/policy_to_real.py \
   --policy policies/<run>/policy.onnx \
-  --duration 60 \
   --keyboard \
   --approach-tolerance-deg 5 \
   --telemetry \
@@ -305,7 +303,6 @@ python3 scripts/policy_test/policy_to_real.py \
 # Straight walk with heading hold
 python3 scripts/policy_test/policy_to_real.py \
   --policy policies/<run>/policy.onnx \
-  --duration 30 \
   --vx 0.1 \
   --keyboard \
   --heading-hold \
@@ -317,7 +314,6 @@ python3 scripts/policy_test/policy_to_real.py \
 python3 scripts/policy_test/policy_to_real.py \
   --policy policies/<run>/policy.onnx \
   --read \
-  --duration 60 \
   --telemetry
 
 # Read-only gravity bias-correction capture, no motor commanded
@@ -325,7 +321,6 @@ python3 scripts/policy_test/policy_to_real.py \
   --policy policies/<run>/policy.onnx \
   --read \
   --gravity-bc \
-  --duration 120 \
   --telemetry \
   --log
 ```
