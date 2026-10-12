@@ -88,7 +88,7 @@ def test_yaw_frame_and_contact_filter(mj, monkeypatch):
 def rollout(module, tmp_path, name, duration=3.6, **overrides):
     deploy = Path(os.environ.get("ROBONEX_DEPLOY_TEST_ROOT", "/home/polygon/humanoid_project/robonex-deploy"))
     policy = deploy / "policies/2026-10-08_W113s43E_v2_2_edu_base_iter999/policy.onnx"
-    scene = Path(os.environ.get("ROBONEX_DESCRIPTION_ROOT", "/home/polygon/humanoid_project/robonex-description")) / "ver2-2/mujoco/robot/edu/scene.xml"
+    scene = Path(os.environ.get("ROBONEX_DESCRIPTION_ROOT", "/home/polygon/humanoid_project/robonex-description")) / "ver2-3/mujoco/robot/edu/scene.xml"
     contract = module.PolicyContract.load(policy.with_name("policy_manifest.json"))
     model = module.mujoco.MjModel.from_xml_path(str(scene))
     data = module.mujoco.MjData(model)

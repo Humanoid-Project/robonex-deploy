@@ -134,7 +134,7 @@ def verify_model_limits(model, actuator_ids, motor_ids):
 LEG_PROFILE = {identity: "ver2_edu" for identity in ROBOT_VARIANTS.values()}
 
 
-MODEL_VERSION = {"edu": "ver2-2", "pro": "ver2", "max": "ver2"}
+MODEL_VERSION = {"edu": "ver2-3", "pro": "ver2", "max": "ver2"}
 
 
 def fixed_model_path(robot):
