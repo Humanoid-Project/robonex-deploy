@@ -1378,6 +1378,8 @@ def run_read(policy_path, contract, args):
         imu.stop()
         if read_log is not None:
             read_log.close()
+            for path, message in sync_to_disk((read_log.path, read_log.arrays.path)).items():
+                print(f"Warning: {path} not synced to disk ({message})")
             print(f"Recorded to {read_log.path}")
             if read_log.arrays.error:
                 saved = read_log.arrays.error.startswith("capacity")
@@ -2215,6 +2217,21 @@ def run_deploy(policy_path, contract, args):
     return 0
 
 
+def sync_to_disk(paths):
+    errors = {}
+    files = [Path(path) for path in paths if path is not None and Path(path).exists()]
+    for path in files + sorted({path.parent for path in files}):
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError as error:
+            errors[str(path)] = f"{type(error).__name__}: {error}"
+    return errors
+
+
 def close_recordings(telemetry, phases, end_meta, exit_text, shutdown_report, stats, commander, runner,
                      thermal, faults, channels):
     errors = {}
@@ -2236,6 +2253,9 @@ def close_recordings(telemetry, phases, end_meta, exit_text, shutdown_report, st
               f"{telemetry.phases_path.name}, {path.name if path else '-'}")
     except Exception as error:
         print(f"Warning: run summary not written ({type(error).__name__}: {error})")
+    paths = (telemetry.path, telemetry.arrays.path, telemetry.phases_path, telemetry.meta_path)
+    for path, message in sync_to_disk(paths).items():
+        print(f"Warning: {path} not synced to disk ({message})")
     problems = dict(end_meta.get("recording_errors", {}))
     if "summary_error" in end_meta:
         problems["summary"] = end_meta["summary_error"]
@@ -2616,6 +2636,8 @@ def main(argv=None):
             finally:
                 sys.stdout = original_stdout
                 sys.stderr = original_stderr
+                for path, message in sync_to_disk((args.log,)).items():
+                    print(f"Warning: {path} not synced to disk ({message})")
     except OSError as error:
         print(f"Log error: {error}")
         return 1

@@ -1,6 +1,7 @@
 import csv
 import json
 import math
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -422,3 +423,39 @@ def test_send_timing_columns_follow_the_loop(modules, monkeypatch, tmp_path, cap
         assert obs_ms >= 0.0
         assert first_ms - obs_ms == pytest.approx(3.0, abs=1.0e-3)
         assert last_ms >= first_ms
+
+
+def test_full_deploy_syncs_every_recording_to_disk(modules, monkeypatch, tmp_path, capsys):
+    _, new = modules
+    synced = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        synced.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        real_fsync(fd)
+
+    monkeypatch.setattr(new.os, "fsync", spy)
+    run = run_full_deploy(new, monkeypatch, tmp_path)
+    out = capsys.readouterr().out
+    assert run.error is None
+    stem = run.path.stem
+    expected = {run.path, run.path.parent}
+    expected |= {run.path.with_name(stem + suffix) for suffix in ("_arrays.npz", "_phases.csv", "_meta.json")}
+    assert expected <= set(synced)
+    assert synced.index(run.path.with_name(stem + "_meta.json")) < synced.index(run.path.parent)
+    assert "not synced" not in out
+
+
+def test_sync_to_disk_reports_failures_and_skips_missing_files(modules, monkeypatch, tmp_path):
+    _, new = modules
+    present = tmp_path / "a.csv"
+    present.write_text("x\n")
+
+    def fail(fd):
+        raise OSError(5, "Input/output error")
+
+    assert new.sync_to_disk([present, tmp_path / "missing.csv", None]) == {}
+    monkeypatch.setattr(new.os, "fsync", fail)
+    errors = new.sync_to_disk([present])
+    assert set(errors) == {str(present), str(tmp_path)}
+    assert all(message.startswith("OSError") for message in errors.values())
