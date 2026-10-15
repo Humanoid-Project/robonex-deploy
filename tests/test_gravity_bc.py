@@ -43,7 +43,18 @@ def pair(tmp_path_factory):
     base_dir.mkdir(parents=True)
     base_path = base_dir / "policy_to_real_baseline_bc.py"
     base_path.write_text(source)
-    return load_module("policy_to_real_baseline_bc", base_path), load_module("policy_to_real_bc", POLICY_TO_REAL)
+    hold_dir = base_dir.parent / "sim_to_real"
+    hold_dir.mkdir()
+    hold_dir.joinpath("heading_hold.py").write_text(subprocess.run(
+        ["git", "-C", str(DEPLOY), "show", f"{BASELINE_COMMIT}:scripts/sim_to_real/heading_hold.py"],
+        check=True, capture_output=True, text=True,
+    ).stdout)
+    sys.path.insert(0, str(hold_dir))
+    try:
+        baseline = load_module("policy_to_real_baseline_bc", base_path)
+    finally:
+        sys.path.remove(str(hold_dir))
+    return baseline, load_module("policy_to_real_bc", POLICY_TO_REAL)
 
 
 @pytest.fixture(scope="module")
@@ -105,6 +116,10 @@ def run_loop(module, telemetry_path, duration=3.0, **extra):
 
 
 SEND_TIMING_COLUMNS = ("obs_ms", "tx_first_ms", "tx_last_ms")
+REMOVED_HEADING_COLUMNS = (
+    "heading_gyro_deg", "heading_quat_deg", "heading_target_deg", "heading_error_deg",
+    "heading_integral", "heading_wz", "heading_engaged", "policy_wz",
+)
 
 
 def read_rows(csv_path):
@@ -134,7 +149,9 @@ def test_off_is_identical_to_baseline(pair, tmp_path, capsys):
     assert off_seen == base_seen
     base_rows, off_rows = read_rows(base_csv), read_rows(off_csv)
     assert not set(SEND_TIMING_COLUMNS) & set(base_rows[0])
-    assert drop_columns(off_rows, SEND_TIMING_COLUMNS) == base_rows
+    assert set(REMOVED_HEADING_COLUMNS) <= set(base_rows[0])
+    assert not set(REMOVED_HEADING_COLUMNS) & set(off_rows[0])
+    assert drop_columns(off_rows, SEND_TIMING_COLUMNS) == drop_columns(base_rows, REMOVED_HEADING_COLUMNS)
     base_arrays, off_arrays = load_arrays(base_csv), load_arrays(off_csv)
     assert sorted(base_arrays) == sorted(off_arrays)
     assert all(base_arrays[k].tobytes() == off_arrays[k].tobytes() for k in base_arrays)
@@ -374,8 +391,8 @@ def test_parse_args(ptr, tmp_path):
     assert ptr.parse_args(["--policy", str(policy), "--gravity-bc"]).gravity_bc is True
     args = ptr.parse_args(["--policy", str(policy), "--gravity-bc", "--read", "--telemetry"])
     assert args.gravity_bc and args.read and args.telemetry.name.endswith("_read_telemetry.csv")
-    args = ptr.parse_args(["--policy", str(policy), "--gravity-bc", "--heading-hold", "--keyboard"])
-    assert args.gravity_bc and args.heading_hold and args.keyboard
+    args = ptr.parse_args(["--policy", str(policy), "--gravity-bc", "--keyboard"])
+    assert args.gravity_bc and args.keyboard
 
 
 def test_refused_for_a_policy_without_gravity_or_at_another_rate(ptr, monkeypatch, tmp_path, capsys):

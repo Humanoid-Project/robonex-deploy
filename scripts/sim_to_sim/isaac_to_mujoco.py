@@ -37,8 +37,6 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import robonex_common
 from robonex_common.paths import DESCRIPTION_REPO_NAMES, description_model, git_commit, resolve_repo
 from sim_to_real.safety import AxisLimiter
-sys.path.insert(0, str(ROOT / "scripts" / "sim_to_real"))
-from heading_hold import HeadingHold
 from robonex_common.joints import JOINT_BY_MODEL_NAME
 
 SLEW_MAX_SPEED = 6.0
@@ -439,20 +437,6 @@ def apply_joint_friction(model, adapter, levels):
     return applied
 
 
-def base_imu(model, data, adapter):
-    velocity = np.zeros(6, dtype=np.float64)
-    mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_XBODY, adapter.base_body_id, velocity, 1)
-    rotation_world_from_base = data.xmat[adapter.base_body_id].reshape(3, 3)
-    gravity = rotation_world_from_base.T @ adapter.gravity_world
-    return tuple(float(v) for v in velocity[:3]), tuple(float(v) for v in gravity)
-
-
-def base_orientation_sample(data, adapter):
-    w, x, y, z = (float(v) for v in data.xquat[adapter.base_body_id])
-    orientation = type("Orientation", (), {"w": w, "x": x, "y": y, "z": z})()
-    return type("Sample", (), {"orientation": orientation})()
-
-
 def make_key_callback(adapter, lock=None):
     """Drive the velocity command from the viewer keyboard.
 
@@ -629,10 +613,6 @@ def trace_row(model, data, adapter, commanded, step, policy_period, minimum_heig
 
 def simulate(model, data, adapter, args, viewer_handle, command_lock=None):
     command_lock = command_lock if command_lock is not None else threading.Lock()
-    heading = None
-    if getattr(args, "heading_hold", False):
-        heading = HeadingHold(args.heading_kp, args.heading_ki, args.heading_source)
-    next_heading_print = 0.0
     if getattr(args, "joint_friction", None) is not None:
         apply_joint_friction(model, adapter, dict(zip(JOINT_FRICTION_MODELS, args.joint_friction)))
     reset_simulation(model, data, adapter)
@@ -701,19 +681,10 @@ def simulate(model, data, adapter, args, viewer_handle, command_lock=None):
             try:
                 with command_lock:
                     requested = adapter.velocity_command.copy()
-                    if heading is not None:
-                        gyro, gravity = base_imu(model, data, adapter)
-                        heading_wz = heading.update(data.time, gyro, gravity, base_orientation_sample(data, adapter),
-                                                    requested, active=data.time >= args.heading_start_s)
-                        if heading.engaged:
-                            adapter.velocity_command[2] = heading_wz
                     try:
                         _, action, targets = adapter.apply(data, args.max_raw_action)
                     finally:
                         adapter.velocity_command[:] = requested
-                if heading is not None and not args.headless and data.time >= next_heading_print:
-                    next_heading_print = data.time + 1.0
-                    print(heading.status_line(), flush=True)
                 if limiters is not None:
                     diagnostics.roll_reprojected_steps += int(
                         slew_targets(limiters, targets, adapter.pipeline, policy_period))
@@ -814,15 +785,6 @@ def parse_args():
                         help="Pass targets through the deploy slew limiter (policy_to_real defaults)")
     parser.add_argument("--match-isaac", action="store_true",
                         help="Robot-robot collisions off and passive-joint damping 0, as in the Isaac training model")
-    parser.add_argument("--heading-hold", action="store_true",
-                        help="PI heading hold on the yaw-rate command the policy sees, as policy_to_real "
-                             "--heading-hold; engages with wz 0 and vx/vy above the gait deadband")
-    parser.add_argument("--heading-kp", type=float, default=1.0, help="Heading-hold proportional gain (0-2)")
-    parser.add_argument("--heading-ki", type=float, default=0.1, help="Heading-hold integral gain (0-0.5)")
-    parser.add_argument("--heading-source", choices=("gyro", "quat"), default="gyro",
-                        help="Integrated base gyro about the world vertical, or the base orientation yaw")
-    parser.add_argument("--heading-start-s", type=float, default=1.5,
-                        help="Simulated time before the heading hold may engage (deploy ramp + hold)")
     parser.add_argument("--joint-friction", type=float, nargs=2, metavar=("RS02", "RS03"),
                         help="Coulomb friction (N*m) on the 12 motor joints by motor model, e.g. 0.14 0.47 "
                              "(the measured deploy plant)")
@@ -834,8 +796,6 @@ def parse_args():
         parser.error("--metrics-settle-s must be finite and non-negative")
     if args.headless and args.duration is None:
         parser.error("--headless requires --duration")
-    if not 0.0 <= args.heading_kp <= 2.0 or not 0.0 <= args.heading_ki <= 0.5:
-        parser.error("--heading-kp must be in [0, 2] and --heading-ki in [0, 0.5]")
     if args.joint_friction is not None and any(not math.isfinite(v) or v < 0.0 for v in args.joint_friction):
         parser.error("--joint-friction needs two finite non-negative values")
     args.minimum_height = 0.6

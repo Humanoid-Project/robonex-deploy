@@ -101,7 +101,6 @@ from safety import (
     tilt_reason,
     wrap_to_pi,
 )
-from heading_hold import HeadingHold
 from gravity_bc import GravityBC
 
 DEG = math.pi / 180.0
@@ -521,16 +520,12 @@ def timing_cells(timing):
 
 
 IMU_EXTRA_COLUMNS = ("acc_x", "acc_y", "acc_z", "quat_w", "quat_x", "quat_y", "quat_z", "imu_temp_c")
-HEADING_COLUMNS = (
-    "heading_gyro_deg", "heading_quat_deg", "heading_target_deg", "heading_error_deg",
-    "heading_integral", "heading_wz", "heading_engaged", "policy_wz",
-)
 LOOP_EXTRA_COLUMNS = (
     "late_ms", "poll_ms", "prev_work_ms", "slew_lag_deg", "runner_clip_total", "target_clip_total",
     "roll_clip_total", "roll_reprojected_total", "thermal_load_max", "cmd_holding",
     "obs_ms", "tx_first_ms", "tx_last_ms",
 )
-STEP_EXTRA_COLUMNS = LOOP_EXTRA_COLUMNS + IMU_EXTRA_COLUMNS + HEADING_COLUMNS
+STEP_EXTRA_COLUMNS = LOOP_EXTRA_COLUMNS + IMU_EXTRA_COLUMNS
 JOINT_EXTRA_FIELDS = ("mode", "action", "slew_vel")
 READ_JOINT_EXTRA_FIELDS = ("vel", "raw_action", "target")
 PHASE_JOINT_FIELDS = ("age_ms", "pos", "vel", "torque", "temp", "fault", "mode", "commanded", "rx_age_ms")
@@ -567,23 +562,14 @@ def gravity_bc_arrays(gravity_bc):
     return {"gravity_bc": gravity_bc.corrected, "gravity_bc_delta_deg": gravity_bc.delta_deg()}
 
 
-def heading_cells(heading):
-    if heading is None:
-        return [""] * len(HEADING_COLUMNS)
-    try:
-        return heading.cells()
-    except Exception:
-        return [""] * len(HEADING_COLUMNS)
-
-
 def _since_tick_ms(tick, stamp_ns):
     if tick is None or stamp_ns is None:
         return None
     return (stamp_ns * 1.0e-9 - tick) * 1000.0
 
 
-def step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, pipeline, thermal, sample, heading=None,
-                     holding=None, tick=None, obs_ns=None):
+def step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, pipeline, thermal, sample, holding=None,
+                     tick=None, obs_ns=None):
     try:
         loads = getattr(thermal, "load", None) or {}
         cells = [
@@ -601,7 +587,7 @@ def step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, pipeline, therma
         ]
     except Exception:
         cells = [""] * len(LOOP_EXTRA_COLUMNS)
-    return cells + imu_extra_cells(sample) + heading_cells(heading)
+    return cells + imu_extra_cells(sample)
 
 
 def _finite_or_none(value):
@@ -1699,11 +1685,6 @@ class TelemetryRecorder:
             ),
             "command": {"vx": args.vx, "vy": args.vy, "wz": args.wz,
                         "keyboard": bool(getattr(args, "keyboard", False))},
-            "heading_hold": (
-                {"kp": args.heading_kp, "ki": args.heading_ki, "source": args.heading_source,
-                 "integral_limit": HeadingHold.INTEGRAL_LIMIT, "output_limit": HeadingHold.OUTPUT_LIMIT}
-                if getattr(args, "heading_hold", False) else None
-            ),
             "settings": {
                 "gain_scale": settings.gain_scale,
                 "ankle_gain_scale": settings.ankle_gain_scale,
@@ -1833,9 +1814,6 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                                       gravity_bc=getattr(args, "gravity_bc", False))
     timing = TimingProbe() if telemetry is not None else None
     prev_work_ms = None
-    heading = None
-    if getattr(args, "heading_hold", False):
-        heading = HeadingHold(args.heading_kp, args.heading_ki, args.heading_source)
     gravity_bc = GravityBC() if getattr(args, "gravity_bc", False) else None
     if owns_telemetry:
         print(f"Telemetry   : {telemetry.path}  ({contract.policy_hz:.0f} Hz per-motor record)")
@@ -1887,16 +1865,9 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
 
             requested_command = runner.velocity_command.copy()
             holding = now - ramp_started < SETTINGS.ramp_seconds + SETTINGS.command_hold_seconds
-            if heading is not None:
-                heading_wz = heading.update(now, angular_velocity, gravity, imu.last_sample,
-                                            requested_command, active=not holding)
             try:
                 if holding:
                     runner.velocity_command[:] = 0.0
-                elif heading is not None and heading.engaged:
-                    runner.velocity_command[2] = heading_wz
-                if heading is not None:
-                    heading.policy_wz = float(runner.velocity_command[2])
                 observation = runner.observation(positions, velocities, angular_velocity, policy_gravity)
                 obs_ns = time.monotonic_ns()
                 raw_action, policy_action, targets = runner.step(observation, commit=False)
@@ -1938,7 +1909,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     send_ms=send_ms,
                     timing=timing.safe_update(now, imu.last_sample, imu_read_ns),
                     extra=step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, runner.pipeline,
-                                           thermal, imu.last_sample, heading, holding, tick=now, obs_ns=obs_ns),
+                                           thermal, imu.last_sample, holding, tick=now, obs_ns=obs_ns),
                     policy_action=policy_action, slew_velocities=commander.velocities,
                     observation=observation, positions=positions, velocities=velocities, gravity_bc=gravity_bc,
                 )
@@ -1979,8 +1950,6 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                         f"vy {runner.velocity_command[1]:+.2f}  "
                         f"wz {runner.velocity_command[2]:+.2f}    {keyboard.legend()}"
                     )
-                if heading is not None:
-                    lines.append(heading.status_line())
                 lines.append(thermal.worst_line())
                 lines.append(faults.current_line(motors))
                 lines.append(faults.history_line())
@@ -2457,33 +2426,12 @@ def parse_args(argv=None):
         "--wz", type=float, default=0.0, help="Yaw rate command (rad/s)"
     )
     parser.add_argument(
-        "--heading-hold",
-        action="store_true",
-        help="Hold the heading captured when walking starts by adding a yaw-rate command the "
-             "policy sees (PI, output within +/-0.2 rad/s). Engages only while the operator's wz "
-             "is 0 and vx/vy is above the gait deadband; turning or zeroing releases it and the "
-             "next straight command captures a new heading. Off by default",
-    )
-    parser.add_argument(
-        "--heading-kp", type=float, default=1.0, metavar="K",
-        help="Heading-hold proportional gain, (rad/s) per rad of heading error (0-2)",
-    )
-    parser.add_argument(
-        "--heading-ki", type=float, default=0.1, metavar="K",
-        help="Heading-hold integral gain, (rad/s) per rad*s; the integral is limited to +/-0.1 rad/s (0-0.5)",
-    )
-    parser.add_argument(
-        "--heading-source", choices=("gyro", "quat"), default="gyro",
-        help="Heading the loop holds: the bias-calibrated raw gyro integrated about the world vertical "
-             "(gyro), or the N100 AHRS quaternion yaw (quat). Both are recorded either way",
-    )
-    parser.add_argument(
         "--gravity-bc",
         action="store_true",
         help="Feed the policy the AHRS projected gravity rotated by a slow bias correction: the error between the "
              "trailing 40-tick (0.8 s) means of the AHRS gravity and of the accelerometer direction, low-passed "
-             "with a 1 s time constant, at most 8 deg per axis, 0 until the window is full. The gyro, the tilt "
-             "stop and the heading hold keep the raw AHRS values; telemetry adds the corrected gravity and the "
+             "with a 1 s time constant, at most 8 deg per axis, 0 until the window is full. The gyro and the tilt "
+             "stop keep the raw AHRS values; telemetry adds the corrected gravity and the "
              "correction. Off by default",
     )
     parser.add_argument(
@@ -2530,12 +2478,6 @@ def parse_args(argv=None):
         parser.error("--gain-scale must be in (0, 1]")
     if not math.isfinite(args.ankle_gain_scale) or not 1.0 <= args.ankle_gain_scale <= 2.0:
         parser.error("--ankle-gain-scale must be in [1, 2]")
-    if not math.isfinite(args.heading_kp) or not 0.0 <= args.heading_kp <= 2.0:
-        parser.error("--heading-kp must be in [0, 2]; 4 and above jittered at the step rhythm in simulation")
-    if not math.isfinite(args.heading_ki) or not 0.0 <= args.heading_ki <= 0.5:
-        parser.error("--heading-ki must be in [0, 0.5]")
-    if args.heading_hold and args.read:
-        parser.error("--heading-hold has no effect in --read mode")
     if args.keyboard and args.read:
         parser.error("--keyboard has no effect in --read mode")
     for name, value, limit in (
