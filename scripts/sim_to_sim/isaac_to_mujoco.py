@@ -246,6 +246,7 @@ class Diagnostics:
         self.both_contact_steps = 0
         self.contact_normal_force_max = 0.0
         self.fall_time_s = None
+        self.roll_reprojected_steps = 0
         self.last_action = np.zeros(12, dtype=np.float32)
         self.last_targets = np.zeros(12, dtype=np.float32)
 
@@ -388,6 +389,7 @@ class Diagnostics:
             / max(1, self.adapter.pipeline.policy_call_count * 12),
             "target_clip_fraction": self.adapter.pipeline.target_clip_count
             / max(1, self.adapter.pipeline.policy_call_count * 12),
+            "roll_reprojected_fraction": self.roll_reprojected_steps / max(1, self.policy_steps),
             "policy_mapping": self.adapter.mapping(),
         }
 
@@ -497,6 +499,21 @@ def parse_scenario(text):
 
 def command_at(schedule, t):
     return [command for start, command in schedule if start <= t + 1.0e-9][-1]
+
+
+def slew_targets(limiters, targets, pipeline, period):
+    previous = [limiter.position for limiter in limiters]
+    positions = [limiter.step(float(targets[index]), period, SLEW_MAX_SPEED, SLEW_MAX_ACCEL)[0]
+                 for index, limiter in enumerate(limiters)]
+    moved = False
+    if pipeline.roll_pairs:
+        projected, moved = pipeline.clip_roll(positions)
+        for index, limiter in enumerate(limiters):
+            limiter.position = float(projected[index])
+            limiter.velocity = (limiter.position - previous[index]) / period
+            positions[index] = limiter.position
+    targets[:] = positions
+    return moved
 
 
 def strafe_sample(model, data, adapter):
@@ -698,9 +715,8 @@ def simulate(model, data, adapter, args, viewer_handle, command_lock=None):
                     next_heading_print = data.time + 1.0
                     print(heading.status_line(), flush=True)
                 if limiters is not None:
-                    for index, limiter in enumerate(limiters):
-                        position, _ = limiter.step(float(targets[index]), policy_period, SLEW_MAX_SPEED, SLEW_MAX_ACCEL)
-                        targets[index] = position
+                    diagnostics.roll_reprojected_steps += int(
+                        slew_targets(limiters, targets, adapter.pipeline, policy_period))
                     data.ctrl[adapter.actuator_ids] = targets
                 commanded[:] = targets
                 for index, _, _, _ in backlash_joints:

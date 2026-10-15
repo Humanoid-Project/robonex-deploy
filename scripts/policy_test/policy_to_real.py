@@ -528,6 +528,7 @@ HEADING_COLUMNS = (
 LOOP_EXTRA_COLUMNS = (
     "late_ms", "poll_ms", "prev_work_ms", "slew_lag_deg", "runner_clip_total", "target_clip_total",
     "roll_clip_total", "roll_reprojected_total", "thermal_load_max", "cmd_holding",
+    "obs_ms", "tx_first_ms", "tx_last_ms",
 )
 STEP_EXTRA_COLUMNS = LOOP_EXTRA_COLUMNS + IMU_EXTRA_COLUMNS + HEADING_COLUMNS
 JOINT_EXTRA_FIELDS = ("mode", "action", "slew_vel")
@@ -575,8 +576,14 @@ def heading_cells(heading):
         return [""] * len(HEADING_COLUMNS)
 
 
+def _since_tick_ms(tick, stamp_ns):
+    if tick is None or stamp_ns is None:
+        return None
+    return (stamp_ns * 1.0e-9 - tick) * 1000.0
+
+
 def step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, pipeline, thermal, sample, heading=None,
-                     holding=None):
+                     holding=None, tick=None, obs_ns=None):
     try:
         loads = getattr(thermal, "load", None) or {}
         cells = [
@@ -588,6 +595,9 @@ def step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, pipeline, therma
             getattr(commander, "roll_reprojected_count", ""),
             _round(max(loads.values()) if loads else None, 4),
             "" if holding is None else int(holding),
+            _round(_since_tick_ms(tick, obs_ns), 3),
+            _round(_since_tick_ms(tick, getattr(commander, "tx_first_ns", None)), 3),
+            _round(_since_tick_ms(tick, getattr(commander, "tx_last_ns", None)), 3),
         ]
     except Exception:
         cells = [""] * len(LOOP_EXTRA_COLUMNS)
@@ -845,12 +855,23 @@ class PhaseRecorder:
                 self.error = f"write failed, {len(rows)} rows lost: {error}"
 
 
+def policy_session_options():
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+    return options
+
+
 class PolicyRunner:
     def __init__(self, policy_path, contract):
         self.policy_path = policy_path
         self.contract = contract
         self.pipeline = ActionPipeline(contract)
-        self.session = ort.InferenceSession(str(policy_path), providers=["CPUExecutionProvider"])
+        self.session = ort.InferenceSession(
+            str(policy_path), sess_options=policy_session_options(), providers=["CPUExecutionProvider"]
+        )
         inputs = self.session.get_inputs()
         outputs = self.session.get_outputs()
         if len(inputs) != 1 or inputs[0].shape[-1] not in (None, "None", contract.observation_size):
@@ -960,6 +981,8 @@ class TargetCommander:
         self.slew_lag_run_max = 0.0
         self.slew_lag_max_by_motor = {motor_id: 0.0 for motor_id in motors}
         self.roll_reprojected_count = 0
+        self.tx_first_ns = None
+        self.tx_last_ns = None
 
     def reset_stats(self):
         self.slew_limited_count = 0
@@ -970,6 +993,8 @@ class TargetCommander:
         self.slew_lag_run_max = 0.0
         self.slew_lag_max_by_motor = {motor_id: 0.0 for motor_id in self.motors}
         self.roll_reprojected_count = 0
+        self.tx_first_ns = None
+        self.tx_last_ns = None
 
     def send(self, motor_ids_targets, dt, max_speed, max_accel, use_velocity_target, reproject=None, align=True):
         step_lag_max = 0.0
@@ -1007,6 +1032,7 @@ class TargetCommander:
                 self.commands[motor_id] = position
                 self.velocities[motor_id] = limiter.velocity
             self.roll_reprojected_count += int(moved)
+        self.tx_first_ns = time.monotonic_ns()
         for motor_id, motor in self.motors.items():
             motor.control(
                 pos=self.commands[motor_id],
@@ -1015,6 +1041,7 @@ class TargetCommander:
                 kd=self.kd_by_motor[motor_id],
                 torque=0.0,
             )
+        self.tx_last_ns = time.monotonic_ns()
 
     def slew_rate_by_motor(self):
         return {
@@ -1869,6 +1896,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                 if heading is not None:
                     heading.policy_wz = float(runner.velocity_command[2])
                 observation = runner.observation(positions, velocities, angular_velocity, policy_gravity)
+                obs_ns = time.monotonic_ns()
                 raw_action, policy_action, targets = runner.step(observation, commit=False)
             except ValueError as error:
                 raise RuntimeError(f"Safety stop: {error}") from error
@@ -1908,7 +1936,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     send_ms=send_ms,
                     timing=timing.safe_update(now, imu.last_sample, imu_read_ns),
                     extra=step_extra_cells(late_ms, poll_ms, prev_work_ms, commander, runner.pipeline,
-                                           thermal, imu.last_sample, heading, holding),
+                                           thermal, imu.last_sample, heading, holding, tick=now, obs_ns=obs_ns),
                     policy_action=policy_action, slew_velocities=commander.velocities,
                     observation=observation, positions=positions, velocities=velocities, gravity_bc=gravity_bc,
                 )

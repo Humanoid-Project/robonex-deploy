@@ -167,6 +167,9 @@ def test_full_deploy_records_every_phase_and_closes_after_brake(modules, monkeyp
     assert all(row["acc_z"] == "9.8" and row["imu_temp_c"] == "31.5" for row in rows)
     assert all(row["late_ms"] != "" and row["poll_ms"] != "" for row in rows)
     assert rows[0]["prev_work_ms"] == "" and all(row["prev_work_ms"] != "" for row in rows[1:])
+    for row in rows:
+        obs_ms, first_ms, last_ms = (float(row[key]) for key in ("obs_ms", "tx_first_ms", "tx_last_ms"))
+        assert 0.0 <= obs_ms <= first_ms <= last_ms
 
     arrays = np.load(run.path.with_name(run.path.stem + "_arrays.npz"))
     assert arrays["obs"].shape == (len(rows), 235)
@@ -395,3 +398,27 @@ def test_no_head_hold_leaves_the_neck_closed(modules, monkeypatch, tmp_path):
     assert run.error is None
     assert 13 not in run.opened[0]
     assert not [frame for frame in run.control_log if frame[0] == 13]
+
+
+def test_send_timing_columns_follow_the_loop(modules, monkeypatch, tmp_path, capsys):
+    _, new = modules
+    original = FakeSession.run
+
+    def slow_run(self, outputs, feed):
+        new.time.sleep(0.003)
+        return original(self, outputs, feed)
+
+    monkeypatch.setattr(FakeSession, "run", slow_run)
+    run = run_full_deploy(new, monkeypatch, tmp_path)
+    capsys.readouterr()
+    assert run.error is None
+    options = FakeSession.instances[-1].sess_options
+    assert options.intra_op_num_threads == 1 and options.inter_op_num_threads == 1
+    assert options.config == {"session.intra_op.allow_spinning": "0", "session.inter_op.allow_spinning": "0"}
+    rows = read_csv(run.path)
+    assert len(rows) >= 50
+    for row in rows:
+        obs_ms, first_ms, last_ms = (float(row[key]) for key in ("obs_ms", "tx_first_ms", "tx_last_ms"))
+        assert obs_ms >= 0.0
+        assert first_ms - obs_ms == pytest.approx(3.0, abs=1.0e-3)
+        assert last_ms >= first_ms

@@ -104,6 +104,19 @@ def run_loop(module, telemetry_path, duration=3.0, **extra):
     return control_log, session.observations, seen
 
 
+SEND_TIMING_COLUMNS = ("obs_ms", "tx_first_ms", "tx_last_ms")
+
+
+def read_rows(csv_path):
+    with csv_path.open(newline="") as stream:
+        return list(csv.reader(stream))
+
+
+def drop_columns(rows, names):
+    keep = [index for index, name in enumerate(rows[0]) if name not in names]
+    return [[row[index] for index in keep] for row in rows]
+
+
 def load_arrays(csv_path):
     with np.load(csv_path.with_name(csv_path.stem + "_arrays.npz")) as data:
         return {key: data[key] for key in data.files}
@@ -119,7 +132,9 @@ def test_off_is_identical_to_baseline(pair, tmp_path, capsys):
     assert np.asarray(off_commands).tobytes() == np.asarray(base_commands).tobytes()
     assert all(a.tobytes() == b.tobytes() for a, b in zip(base_obs, off_obs))
     assert off_seen == base_seen
-    assert off_csv.read_bytes() == base_csv.read_bytes()
+    base_rows, off_rows = read_rows(base_csv), read_rows(off_csv)
+    assert not set(SEND_TIMING_COLUMNS) & set(base_rows[0])
+    assert drop_columns(off_rows, SEND_TIMING_COLUMNS) == base_rows
     base_arrays, off_arrays = load_arrays(base_csv), load_arrays(off_csv)
     assert sorted(base_arrays) == sorted(off_arrays)
     assert all(base_arrays[k].tobytes() == off_arrays[k].tobytes() for k in base_arrays)

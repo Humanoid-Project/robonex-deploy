@@ -16,10 +16,21 @@ POLICY_TO_REAL = DEPLOY / "scripts" / "policy_test" / "policy_to_real.py"
 TIMING_REPORT = DEPLOY / "scripts" / "analysis" / "timing_report.py"
 
 
+class FakeSessionOptions:
+    def __init__(self):
+        self.intra_op_num_threads = 0
+        self.inter_op_num_threads = 0
+        self.config = {}
+
+    def add_session_config_entry(self, key, value):
+        self.config[key] = value
+
+
 class FakeSession:
     instances = []
 
-    def __init__(self, path, providers=None):
+    def __init__(self, path, sess_options=None, providers=None):
+        self.sess_options = sess_options
         rng = np.random.default_rng(7)
         self.weights = rng.normal(0.0, 0.05, size=(12, 235)).astype(np.float32)
         self.observations = []
@@ -39,7 +50,8 @@ class FakeSession:
 
 def install_stubs():
     if "onnxruntime" not in sys.modules and importlib.util.find_spec("onnxruntime") is None:
-        sys.modules["onnxruntime"] = types.SimpleNamespace(InferenceSession=FakeSession)
+        sys.modules["onnxruntime"] = types.SimpleNamespace(InferenceSession=FakeSession,
+                                                         SessionOptions=FakeSessionOptions)
     if "n100" not in sys.modules and importlib.util.find_spec("n100") is None:
         sys.modules["n100"] = types.ModuleType("n100")
 
@@ -50,7 +62,7 @@ def load_module(name, path):
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
-    module.ort = types.SimpleNamespace(InferenceSession=FakeSession)
+    module.ort = types.SimpleNamespace(InferenceSession=FakeSession, SessionOptions=FakeSessionOptions)
     return module
 
 

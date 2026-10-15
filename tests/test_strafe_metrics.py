@@ -160,3 +160,20 @@ def test_trace_keeps_the_state_at_an_early_stop(mj, tmp_path):
     assert result["status"] == "constraint_divergence"
     assert [int(row["step"]) for row in rows] == list(range(result["policy_steps"]))
     assert float(rows[-1]["t_s"]) == pytest.approx(result["simulation_time_s"], abs=1e-4)
+
+
+def test_simulate_routes_targets_through_slew_targets(mj, tmp_path, monkeypatch):
+    calls = []
+    original = mj.slew_targets
+
+    def spy(limiters, targets, pipeline, period):
+        calls.append(period)
+        return original(limiters, targets, pipeline, period)
+
+    monkeypatch.setattr(mj, "slew_targets", spy)
+    result, _, _ = rollout(mj, tmp_path, "spy", duration=0.5)
+    assert len(calls) == result["policy_steps"] > 0
+    assert 0.0 <= result["roll_reprojected_fraction"] <= 1.0
+    calls.clear()
+    result, _, _ = rollout(mj, tmp_path, "spy_off", duration=0.5, slew_limit=False)
+    assert calls == [] and result["roll_reprojected_fraction"] == 0.0
