@@ -109,9 +109,18 @@ def test_mujoco_to_real_run_identity_unreadable_exit_1(tmp_path, monkeypatch, ca
     assert path.exists()
 
 
+def test_joint_probe_refuses_retired_identity_before_hardware(tmp_path, monkeypatch, capsys):
+    _identity(tmp_path, monkeypatch, "ver2_pro")
+    args = _probe_args(tmp_path, monkeypatch, robot="ver2_pro")
+    monkeypatch.setattr(joint_probe, "open_hardware", lambda *a, **k: pytest.fail("bus opened for a retired robot model"))
+    monkeypatch.setattr(builtins, "input", lambda *_: pytest.fail("no confirmation before the identity check"))
+    assert joint_probe.run(args) == 1
+    assert "ver2_pro is retired" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("content, expected", [
     (None, "No robot identity"),
-    ("ver2_pro", "The attached robot is ver2_pro"),
+    ("ver2_pro", "ver2_pro is retired"),
     ("ver9", "names an unknown robot model 'ver9'"),
 ])
 def test_joint_probe_identity_errors_exit_1(content, expected, tmp_path, monkeypatch, capsys):

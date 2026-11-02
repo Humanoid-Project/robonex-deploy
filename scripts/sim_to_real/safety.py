@@ -147,6 +147,9 @@ def fixed_model_path(robot):
     return description_model(f"{version}/mujoco/robot/{robot}/scene_fixed.xml", anchors=(__file__,))
 
 
+RETIRED_ROBOT_MODELS = ("ver2_pro", "ver2_max")
+
+
 def require_robot_model(expected, path=None):
     path = identity_path() if path is None else Path(path)
     try:
@@ -162,6 +165,12 @@ def require_robot_model(expected, path=None):
         )
     if attached not in known_names:
         raise RuntimeError(f"{path} names an unknown robot model {attached!r} (known: {known})")
+    for name in (attached, expected):
+        if name in RETIRED_ROBOT_MODELS:
+            raise RuntimeError(
+                f"{name} is retired (robonex-description keeps only ver2_edu; pro and max were retired). "
+                "Motors will not be enabled."
+            )
     if attached != expected:
         raise RuntimeError(
             f"The attached robot is {attached} ({path}), but this run is for {expected}. "
