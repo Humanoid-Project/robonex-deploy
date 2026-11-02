@@ -64,9 +64,9 @@ def parse_args(argv=None):
     try:
         args.variant, args.variant_source = resolve_variant(args.robot, need_identity=False)
         args.motor_ids = resolve_motor_ids(args.motor_id, args.variant)
+        args.model = fixed_model_path(ROBOT_VARIANTS_SHORT[args.variant])
     except ValueError as error:
         parser.error(str(error))
-    args.model = fixed_model_path(ROBOT_VARIANTS_SHORT[args.variant])
     args.interface = DEFAULT_INTERFACE
     args.host_id = HOST_ID
     args.rate = 30.0
