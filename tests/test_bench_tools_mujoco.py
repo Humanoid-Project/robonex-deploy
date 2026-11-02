@@ -24,8 +24,8 @@ from robonex_common.protocol import (
     parse_arbitration_id,
 )
 
-VARIANTS = ("edu", "pro", "max")
-NOT_IN_SIM = {"edu": [13], "pro": [13], "max": []}
+VARIANTS = ("edu",)
+NOT_IN_SIM = {"edu": [13]}
 fmt = bench.format_ids
 
 
@@ -135,8 +135,8 @@ def test_dry_run_default_legs_edu(tmp_path, monkeypatch, capsys):
     assert sorted(_rows(out, "Dry run:")) == list(range(1, 13))
 
 
-def test_dry_run_head_name_and_hex_max(tmp_path, monkeypatch, capsys):
-    code, captured = _dry_run(tmp_path, monkeypatch, capsys, "max", ["head", "left_knee_pitch", "0x1"])
+def test_dry_run_head_name_and_hex_edu(tmp_path, monkeypatch, capsys):
+    code, captured = _dry_run(tmp_path, monkeypatch, capsys, "edu", ["head", "left_knee_pitch", "0x1"])
     out = captured.out
     assert code == 0
     assert "Selected    : 1, 4, 13 (3 motors)" in out
@@ -144,12 +144,12 @@ def test_dry_run_head_name_and_hex_max(tmp_path, monkeypatch, capsys):
     rows = _rows(out, "Dry run:")
     assert sorted(rows) == [1, 4, 13]
     assert "neck_pitch" in rows[13] and "rs05" in rows[13] and _limit_text(13) in rows[13]
-    assert rows[13].split()[-1] in ("ok", "PLACEHOLDER")
-    assert "not in sim" not in out
+    assert "not in sim" in rows[13]
+    assert "not in sim" not in rows[1] + rows[4]
 
 
-def test_dry_run_head_only_max_uses_only_profile(tmp_path, monkeypatch, capsys):
-    code, captured = _dry_run(tmp_path, monkeypatch, capsys, "max", ["head"])
+def test_dry_run_head_only_edu_uses_only_profile(tmp_path, monkeypatch, capsys):
+    code, captured = _dry_run(tmp_path, monkeypatch, capsys, "edu", ["head"])
     assert code == 0
     assert "Leg limits  : ver2_edu profile" in captured.out
     assert "Would enable ID 13 after" in captured.out
@@ -158,9 +158,8 @@ def test_dry_run_head_only_max_uses_only_profile(tmp_path, monkeypatch, capsys):
 @pytest.mark.parametrize("variant, selection, message", [
     ("edu", ["15"], "motor ID 15 is not on ver2_edu; ver2_edu has 1–13"),
     ("edu", ["arms"], "ver2_edu has no arms motors (its motors: 1–13)"),
-    ("max", ["19"], "motor ID 19 is not on ver2_max"),
-    ("max", ["14"], "motor ID 14 is not on ver2_max"),
-    ("max", ["left_wrist"], "unknown motor selection 'left_wrist'"),
+    ("edu", ["14"], "motor ID 14 is not on ver2_edu"),
+    ("edu", ["left_wrist"], "unknown motor selection 'left_wrist'"),
 ])
 def test_selection_errors(variant, selection, message, tmp_path, monkeypatch, capsys):
     _identity(tmp_path, monkeypatch, f"ver2_{variant}")
@@ -189,15 +188,15 @@ def test_no_identity_file(tmp_path, monkeypatch, capsys):
         err = capsys.readouterr().err
         assert "no robot identity file" in err and str(path) in err
     with pytest.raises(SystemExit) as info:
-        mujoco_to_real.main(["--robot", "pro"])
+        mujoco_to_real.main(["--robot", "edu"])
     assert info.value.code == 2
     assert "no robot identity file" in capsys.readouterr().err
 
-    assert mujoco_to_real.main(["--dry-run", "--robot", "pro", "--motor-id", "all"]) == 0
+    assert mujoco_to_real.main(["--dry-run", "--robot", "edu", "--motor-id", "all"]) == 0
     out = capsys.readouterr().out
-    assert f"Robot       : ver2_pro (from --robot pro (no identity file at {path}))" in out
+    assert f"Robot       : ver2_edu (from --robot edu (no identity file at {path}))" in out
     assert f"no robot identity file at {path} (variant came from --robot)" in out
-    assert "Would enable ID 1–13, 15–18, 20–23" in out
+    assert "Would enable ID 1–13" in out
     assert not path.exists()
 
 
@@ -315,7 +314,7 @@ def test_bench_gains_and_cap():
 
 
 def test_dry_run_table_marks_capped(tmp_path, monkeypatch, capsys):
-    _identity(tmp_path, monkeypatch, "ver2_max")
+    _identity(tmp_path, monkeypatch, "ver2_edu")
     args = mujoco_to_real.parse_args(["--dry-run", "--motor-id", "head", "1"])
     args.gain_scale = 10.0
     mujoco_to_real.run(args)
@@ -335,17 +334,18 @@ def _patched_loader(monkeypatch, motor_id, ctrlrange):
     monkeypatch.setattr(mujoco_to_real, "load_fixed_model", loader)
 
 
-def test_arm_limit_mismatch_is_named(tmp_path, monkeypatch, capsys):
-    _identity(tmp_path, monkeypatch, "ver2_pro")
-    _patched_loader(monkeypatch, 17, (-1.0, 1.0))
-    assert mujoco_to_real.main(["--dry-run", "--motor-id", "legs", "arms"]) == 1
-    out = capsys.readouterr().out
-    assert "Stopped: MuJoCo actuator limits differ from robonex-common MOTOR_LIMITS_BY_ID:" in out
-    assert (f"ID 17 left_shoulder_yaw (actuator l_shoulder_yaw): MuJoCo ctrlrange (-1.0, 1.0) "
-            f"!= robonex-common {MOTOR_LIMITS_BY_ID[17]}") in out
-    assert "ID 16 " not in out and "Dry run:" not in out
-    assert mujoco_to_real.main(["--dry-run", "--motor-id", "legs", "right_arm"]) == 0
-    assert "Would enable ID 1–12, 20–23" in capsys.readouterr().out
+@pytest.mark.parametrize("module, flag, variant", [
+    (mujoco_to_real, "--dry-run", "pro"), (mujoco_to_real, "--dry-run", "max"),
+    (real_to_mujoco, "--once", "pro"), (real_to_mujoco, "--once", "max"),
+])
+def test_retired_variants_are_refused(module, flag, variant, tmp_path, monkeypatch, capsys):
+    _identity(tmp_path, monkeypatch, f"ver2_{variant}")
+    monkeypatch.setattr(module, "open_hardware", lambda *a, **k: pytest.fail("a bus was opened"), raising=False)
+    with pytest.raises(SystemExit) as info:
+        module.main([flag])
+    assert info.value.code == 2
+    err = capsys.readouterr().err
+    assert f"ver2_{variant} has no MuJoCo model" in err and "Traceback" not in err
 
 
 def test_leg_limit_mismatch_matches_no_profile(tmp_path, monkeypatch, capsys):
@@ -420,41 +420,40 @@ def _assert_read_only(fake):
         assert int.from_bytes(data[0:2], "little") == MECHANICAL_POSITION_INDEX
 
 
-def test_real_to_mujoco_once_virtual_max(tmp_path, monkeypatch, capsys):
-    _identity(tmp_path, monkeypatch, "ver2_max")
+def test_real_to_mujoco_once_virtual_edu(tmp_path, monkeypatch, capsys):
+    _identity(tmp_path, monkeypatch, "ver2_edu")
     _virtual_args(monkeypatch)
     beyond = MOTOR_LIMITS_BY_ID[13][1] + math.radians(10.0)
     fake = FakeMotors({
         "can0": {1: 0.1, 4: -0.2},
-        "can2": {15: 0.3},
         "can4": {13: beyond},
     })
     try:
-        code = real_to_mujoco.main(["--once", "--motor-id", "1", "4", "13", "15", "16"])
+        code = real_to_mujoco.main(["--once", "--motor-id", "1", "2", "4", "13"])
     finally:
         fake.close()
     out = capsys.readouterr().out
     assert code == 1, out
     rows = _rows(out, "(one read)")
-    assert sorted(rows) == [1, 4, 13, 15, 16]
-    for mid in (1, 4, 15):
+    assert sorted(rows) == [1, 2, 4, 13]
+    for mid in (1, 4):
         assert rows[mid].split()[-2:] == ["OK", "ok"], rows[mid]
     assert "LIMIT" in rows[13] and _limit_text(13) in rows[13]
-    assert "no response" in rows[16] and "NO REPLY" in rows[16]
-    assert "-11.46deg" in rows[4] and "+17.19deg" in rows[15]
+    assert "no response" in rows[2] and "NO REPLY" in rows[2]
+    assert "-11.46deg" in rows[4]
     _assert_read_only(fake)
     targets = {target for _c, _comm, _d, target, _data in fake.frames}
-    assert targets == {1, 4, 13, 15, 16}
+    assert targets == {1, 2, 4, 13}
     channels = {target: channel for channel, _comm, _d, target, _data in fake.frames}
-    assert channels == {1: "can0", 4: "can0", 15: "can2", 16: "can2", 13: "can4"}
+    assert channels == {1: "can0", 2: "can0", 4: "can0", 13: "can4"}
 
 
-def test_real_to_mujoco_once_virtual_pro_head_not_in_sim(tmp_path, monkeypatch, capsys):
-    _identity(tmp_path, monkeypatch, "ver2_pro")
+def test_real_to_mujoco_once_virtual_edu_head_not_in_sim(tmp_path, monkeypatch, capsys):
+    _identity(tmp_path, monkeypatch, "ver2_edu")
     _virtual_args(monkeypatch)
-    fake = FakeMotors({"can2": {15: -0.25}, "can4": {13: 0.1}})
+    fake = FakeMotors({"can0": {1: -0.25}, "can4": {13: 0.1}})
     try:
-        code = real_to_mujoco.main(["--once", "--motor-id", "head", "15"])
+        code = real_to_mujoco.main(["--once", "--motor-id", "head", "1"])
     finally:
         fake.close()
     out = capsys.readouterr().out
@@ -462,21 +461,18 @@ def test_real_to_mujoco_once_virtual_pro_head_not_in_sim(tmp_path, monkeypatch, 
     rows = _rows(out, "(one read)")
     assert rows[13].split()[-4:] == ["OK", "not", "in", "sim"]
     assert _limit_text(13) in rows[13]
-    assert rows[15].split()[-2:] == ["OK", "ok"] and _limit_text(15) in rows[15]
+    assert rows[1].split()[-2:] == ["OK", "ok"]
     _assert_read_only(fake)
 
 
-@pytest.mark.parametrize("variant", ["max", "pro"])
-def test_mirror_arm_and_neck_qpos(variant):
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_mirror_leg_qpos(variant):
     model_path, model, actuators = safety.load_fixed_model(
         safety.fixed_model_path(variant), VARIANT_MOTOR_IDS[f"ver2_{variant}"]
     )
     model.opt.gravity[:] = 0.0
-    targets = {15: -0.3, 18: 0.4, 22: 0.25, 4: -0.4}
-    if variant == "max":
-        targets[13] = 0.2
-    else:
-        assert 13 not in actuators
+    targets = {1: 0.1, 4: -0.4, 7: -0.1, 10: 0.4}
+    assert 13 not in actuators
     selected = {mid: actuators[mid] for mid in targets}
     data = mujoco.MjData(model)
     qpos_addresses = real_to_mujoco.initialize_simulation(model, data, selected, targets)

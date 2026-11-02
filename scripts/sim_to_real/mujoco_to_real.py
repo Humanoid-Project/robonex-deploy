@@ -104,9 +104,9 @@ def parse_args(argv=None):
     try:
         args.variant, args.variant_source = resolve_variant(args.robot, need_identity=not args.dry_run)
         args.motor_ids = resolve_motor_ids(args.motor_id, args.variant)
+        args.model = fixed_model_path(ROBOT_VARIANTS_SHORT[args.variant])
     except ValueError as error:
         parser.error(str(error))
-    args.model = fixed_model_path(ROBOT_VARIANTS_SHORT[args.variant])
     args.max_speed = 0.10
     args.max_accel = 0.25
     args.interface = DEFAULT_INTERFACE
