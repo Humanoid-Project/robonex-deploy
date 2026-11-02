@@ -39,7 +39,9 @@ robonex-deploy/
 │   ├── sim_to_real/
 │   │   ├── bench.py
 │   │   ├── safety.py
+│   │   ├── slider_link.py
 │   │   ├── mujoco_to_real.py
+│   │   ├── slider_sender.py
 │   │   └── real_to_mujoco.py
 │   └── policy_test/
 │       ├── CMakeLists.txt
@@ -218,6 +220,7 @@ Head limit ±73° and shoulder pitch (15, 20) ±100° (user, 2026-10-01). PLACEH
 | --- | --- | --- | --- |
 | - | `--motor-id` | `legs` (`1`–`12`) | IDs, groups (`left_leg`, `right_leg`, `head`, `left_arm`, `right_arm`, `legs`, `arms`, `all`) or joint names (`left_knee_pitch`); `not in sim` motors are moved to zero and held |
 | - | `--robot` | Identity file | `edu`, `pro`, `max` (or `ver2_*`); must match the identity file |
+| - | `--remote` | - | Host running `slider_sender.py`; no viewer here, slider targets come over UDP port `47021` |
 | - | `--dry-run` | Off | Print variant, buses and the per-motor kp/kd/limit table, then exit; no CAN bus is opened |
 
 ```bash
@@ -236,6 +239,29 @@ python3 scripts/sim_to_real/mujoco_to_real.py --motor-id head
 # pro / max identity file
 python3 scripts/sim_to_real/mujoco_to_real.py --motor-id legs arms
 python3 scripts/sim_to_real/mujoco_to_real.py --robot max --motor-id all
+
+# Jetson without a display (run inside tmux)
+python3 scripts/sim_to_real/mujoco_to_real.py --remote <laptop-ip>
+```
+
+<br>
+
+### `slider_sender.py`
+
+Runs the MuJoCo Control sliders on a computer with a display and sends them to `mujoco_to_real.py --remote`; opens no CAN bus.
+
+| Command | Option | Default | Description |
+| --- | --- | --- | --- |
+| - | `--robot-host` | `Required` | Robot computer running `mujoco_to_real.py --remote <this computer>` |
+| - | `--robot` | `Required` | `edu`, `pro`, `max` (or `ver2_*`); must match the robot identity file |
+| - | `--rate` | `50` | Send rate in Hz (10–200) |
+
+```bash
+# Example
+cd ~/humanoid_project/robonex-deploy
+source .venv/bin/activate
+
+python3 scripts/sim_to_real/slider_sender.py --robot-host <jetson-ip> --robot edu
 ```
 
 <br>

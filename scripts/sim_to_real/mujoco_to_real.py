@@ -4,13 +4,13 @@ from __future__ import annotations
 import argparse
 import math
 from pathlib import Path
+import signal
 import sys
+import threading
 import time
 
 import can
 import mujoco
-import mujoco.viewer
-import numpy as np
 
 THIS_FILE = Path(__file__).resolve()
 SCRIPTS_DIR = THIS_FILE.parents[1]
@@ -68,8 +68,23 @@ from safety import (
     verify_model_limits,
     wrap_to_pi,
 )
+from slider_link import (
+    ARM_TOLERANCE_RAD,
+    TARGET_HOLD_AFTER,
+    TargetBox,
+    TargetReceiver,
+    viewer_loop,
+)
 
 ZERO_SETTLE_TIMEOUT = 5.0
+VIEWER_START_TIMEOUT = 10.0
+STATUS_PERIOD = 0.1
+STATE_NOTES = {
+    "waiting": "no slider targets yet; holding the current position",
+    "holding": f"no new slider targets for {TARGET_HOLD_AFTER:g} s; holding the current position",
+    "syncing": "setting the sliders to the robot's current command before tracking resumes",
+    "tracking": "tracking the sliders",
+}
 ROBOT_VARIANTS_SHORT = {name: short for short, name in ROBOT_VARIANTS.items()}
 
 
@@ -81,6 +96,8 @@ def parse_args(argv=None):
                         help=selection_help() + ". A motor without a MuJoCo actuator on the attached variant is moved to zero and held there")
     parser.add_argument("--robot", choices=(*ROBOT_VARIANTS, *ROBOT_VARIANTS.values()),
                         help="Check only: must match the robot identity file, which sets the variant")
+    parser.add_argument("--remote", metavar="HOST",
+                        help="Take the slider targets over UDP from slider_sender.py on HOST instead of a local MuJoCo viewer (headless, for the Jetson)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Resolve variant, motors, gains, limits and buses and print the start table; no CAN bus is opened")
     args = parser.parse_args(argv)
@@ -142,9 +159,17 @@ def print_motor_table(args, motor_ids, hard_limits, actuator_ids, capped):
     print_table(("ID", "joint", "motor", "bus", "kp", "kd", "limit deg", "sim", "note"), rows)
 
 
+def target_source_text(args):
+    if args.remote:
+        return f"slider_sender.py on {args.remote} (UDP)"
+    return "MuJoCo viewer on this computer"
+
+
 def confirm_hardware(args, motor_ids, model_path, hard_limits, actuator_ids, capped):
     print("\nThe real motors will move.")
     print(f"  model       : {model_path}")
+    print(f"  targets     : {target_source_text(args)}")
+    print(f"  link loss   : hold after {TARGET_HOLD_AFTER:g} s without new targets, resume after the sliders are synced")
     print(f"  max speed   : {args.max_speed:.3f} rad/s ({math.degrees(args.max_speed):.2f} deg/s)")
     print(f"  max accel   : {args.max_accel:.3f} rad/s^2")
     print_motor_table(args, motor_ids, hard_limits, actuator_ids, capped)
@@ -159,6 +184,7 @@ def confirm_hardware(args, motor_ids, model_path, hard_limits, actuator_ids, cap
 def dry_run_report(args, motor_ids, model_path, hard_limits, actuator_ids, capped):
     print("\nDry run: nothing below is sent to a motor.")
     print(f"  model       : {model_path}")
+    print(f"  targets     : {target_source_text(args)}")
     print_motor_table(args, motor_ids, hard_limits, actuator_ids, capped)
     blockers = channel_problems(motor_ids, args.interface)
     if attached_robot_model(identity_path()) is None:
@@ -270,8 +296,8 @@ def actual_deg(motor):
     return deg_text(None if actual is None else wrap_to_pi(actual))
 
 
-def print_status(motors, commands, targets, actuator_ids):
-    print(f"[{time.strftime('%H:%M:%S')}] hardware tracking")
+def print_status(motors, commands, targets, actuator_ids, state):
+    print(f"[{time.strftime('%H:%M:%S')}] hardware {state}: {STATE_NOTES[state]}")
     print_table(("ID", "joint", "sim target", "limited cmd", "actual", "sim"), [
         [
             mid, JOINT_MAP[mid], deg_text(targets[mid]), deg_text(wrap_to_pi(commands[mid])),
@@ -279,6 +305,275 @@ def print_status(motors, commands, targets, actuator_ids):
         ]
         for mid in sorted(commands)
     ])
+
+
+def status_rows(motors, commands, targets, actuator_names):
+    rows = []
+    for mid in sorted(commands):
+        motor = motors[mid]
+        actual = None if motor.last_position is None else wrap_to_pi(motor.last_position)
+        rows.append([
+            mid, JOINT_MAP[mid], actuator_names.get(mid), targets[mid],
+            wrap_to_pi(commands[mid]), actual, motor.last_temp,
+        ])
+    return rows
+
+
+def fresh_targets(received, stamp, now, motor_ids, actuator_names, commands, command_limits):
+    if received is None or stamp is None or now - stamp > TARGET_HOLD_AFTER:
+        return None
+    targets = {}
+    for mid in motor_ids:
+        name = actuator_names.get(mid)
+        if name is None:
+            targets[mid] = commands[mid]
+            continue
+        if name not in received:
+            return None
+        lower, upper = command_limits[mid]
+        targets[mid] = clamp(received[name], lower, upper)
+    return targets
+
+
+def track(motors, hubs, motor_ids, actuator_names, commands, limiters, hard_limits, command_limits,
+          roll_pairs, roll, args, box, report=None):
+    period = 1.0 / args.rate
+    next_tick = time.monotonic()
+    last_tick = next_tick
+    last_print = 0.0
+    state = None
+    armed = False
+    hold = None
+
+    while True:
+        now = time.monotonic()
+
+        for hub in hubs.values():
+            hub.pump()
+        reason = runtime_safety_reason(motors, commands, hard_limits, now, args)
+        if reason:
+            raise RuntimeError("Safety stop: " + reason)
+
+        received, stamp, _session, closed = box.latest()
+        if closed:
+            return
+        live = fresh_targets(received, stamp, now, motor_ids, actuator_names, commands, command_limits)
+        if live is not None and roll_pairs:
+            live = clip_roll_targets(live, roll_pairs, command_limits, roll)
+
+        if armed and live is None:
+            armed = False
+        if not armed:
+            if hold is None:
+                hold = {mid: limiters[mid].position for mid in motor_ids}
+                box.set_sync({
+                    actuator_names[mid]: wrap_to_pi(hold[mid]) for mid in motor_ids if mid in actuator_names
+                })
+            if live is not None and all(
+                abs(wrap_to_pi(live[mid] - hold[mid])) <= ARM_TOLERANCE_RAD for mid in motor_ids
+            ):
+                armed = True
+                hold = None
+                box.set_sync(None)
+
+        if armed:
+            targets = live
+            current = "tracking"
+        else:
+            targets = dict(hold)
+            current = "waiting" if stamp is None else ("holding" if live is None else "syncing")
+        if current != state:
+            state = current
+            print(f"[{time.strftime('%H:%M:%S')}] {STATE_NOTES[state]}")
+
+        dt = clamp(now - last_tick, period * 0.25, period * 2.0)
+        last_tick = now
+        command_velocities = {}
+        previous = {mid: limiters[mid].position for mid in motor_ids}
+        for mid in motor_ids:
+            position, velocity = limiters[mid].step(targets[mid], dt, args.max_speed, args.max_accel)
+            commands[mid] = position
+            command_velocities[mid] = velocity
+        if roll_pairs:
+            projected = clip_roll_targets(commands, roll_pairs, command_limits, roll)
+            for mid in motor_ids:
+                limiters[mid].position = projected[mid]
+                limiters[mid].velocity = (projected[mid] - previous[mid]) / dt
+                commands[mid] = projected[mid]
+                command_velocities[mid] = limiters[mid].velocity
+
+        for mid, motor in motors.items():
+            motor.control(
+                pos=commands[mid], vel=command_velocities[mid],
+                kp=args.kp[mid], kd=args.kd[mid], torque=0.0,
+            )
+
+        if report is not None:
+            report(state, targets, commands)
+        if now - last_print >= 1.0:
+            last_print = now
+            print_status(motors, commands, targets, actuator_names, state)
+
+        next_tick += period
+        sleep = next_tick - time.monotonic()
+        if sleep > 0.0:
+            time.sleep(sleep)
+        elif time.monotonic() - next_tick > period:
+            next_tick = time.monotonic()
+
+
+class LocalViewer:
+    def __init__(self, model, data, actuator_ids, actuator_names, box, rate):
+        self.model = model
+        self.data = data
+        self.by_name = {actuator_names[mid]: aid for mid, aid in actuator_ids.items()}
+        self.box = box
+        self.rate = rate
+        self.errors = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="mujoco-viewer", daemon=True)
+
+    def start(self):
+        self._thread.start()
+        deadline = time.monotonic() + VIEWER_START_TIMEOUT
+        while time.monotonic() < deadline:
+            if self.box.latest()[1] is not None:
+                return
+            if self.errors:
+                break
+            time.sleep(0.05)
+        self.stop()
+        detail = self.errors[0] if self.errors else f"no slider values within {VIEWER_START_TIMEOUT:g} s"
+        raise RuntimeError(
+            f"The MuJoCo viewer did not start ({detail}). Without a display, run slider_sender.py "
+            "on a computer with one and start this script with --remote <that computer>"
+        )
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
+
+    def _run(self):
+        launch = 0
+        while not self._stop.is_set():
+            launch += 1
+            session = f"viewer-{launch}"
+            try:
+                viewer_loop(
+                    self.model, self.data, self.by_name,
+                    lambda targets: self.box.put(targets, time.monotonic(), session),
+                    self.rate, self._stop.is_set, self.box.sync,
+                )
+            except Exception as error:
+                self.errors.append(f"{type(error).__name__}: {error}")
+                if self.box.latest()[1] is None:
+                    return
+                print(f"\nMuJoCo viewer error ({error}); reopening it in 1 s. The motors hold their position meanwhile.")
+                time.sleep(1.0)
+                continue
+            break
+        if not self._stop.is_set():
+            self.box.close()
+
+
+def wait_for_sender(receiver, box):
+    print(f"\nWaiting for slider_sender.py on {receiver.peer} (UDP port {receiver.sock.getsockname()[1]}). Ctrl-C quits.")
+    last_print = time.monotonic()
+    while box.latest()[1] is None:
+        if time.monotonic() - last_print >= 5.0:
+            last_print = time.monotonic()
+            extra = f"; last rejected packet: {receiver.last_reject}" if receiver.last_reject else ""
+            print(f"  still waiting for slider_sender.py on {receiver.peer}{extra}")
+        time.sleep(0.1)
+    print("slider_sender.py connected.")
+
+
+def wait_for_restart():
+    if not sys.stdin.isatty():
+        raise RuntimeError("Restarting after a stop requires an interactive terminal")
+    try:
+        input("Fix the cause, then press Enter to run the preflight and the Enter confirmation again (Ctrl-C quits): ")
+    except EOFError:
+        raise KeyboardInterrupt from None
+
+
+def run_session(args, setup, box, receiver):
+    motor_ids = setup["motor_ids"]
+    hard_limits = setup["hard_limits"]
+    roll_pairs = setup["roll_pairs"]
+    profile = setup["profile"]
+    buses = {}
+    motors = {}
+    hubs = {}
+    enabled_ids = []
+    stop_ids = []
+    commands = {mid: 0.0 for mid in motor_ids}
+
+    try:
+        try:
+            buses, motors, hubs = open_checked(open_hardware, motor_ids, args.interface, args.host_id)
+            idle = stop_idle_motors(buses, motor_ids, args.host_id, VARIANT_MOTOR_IDS[args.variant])
+            if idle:
+                print(f"Stop sent to the other motors on the open buses: {idle}")
+            measured, zero_failures = inspect_zero_positions(
+                motors, math.radians(args.zero_tolerance_deg), hard_limits
+            )
+            if roll_pairs:
+                zero_failures += start_roll_blocks(measured, roll_pairs, profile.foot_roll, math.radians(1.0))
+            if zero_failures:
+                raise RuntimeError(
+                    "Preflight safety check failed; motors will not be enabled:\n  "
+                    + "\n  ".join(zero_failures)
+                )
+            confirm_hardware(
+                args, motor_ids, setup["model_path"], hard_limits, setup["actuator_ids"], setup["capped"]
+            )
+            stop_ids = list(motor_ids)
+            try:
+                starts, enabled_ids = enable_with_runtime_feedback(
+                    motors, hubs, args.kp, args.kd, hard_limits, enabled_out=enabled_ids,
+                )
+            except RuntimeError as error:
+                enabled_ids = getattr(error, "enabled_ids", enabled_ids)
+                raise
+            commands.update(starts)
+            commands.update(move_to_zero(motors, hubs, starts, hard_limits, args, roll_pairs, profile.foot_roll))
+            limiters = {mid: AxisLimiter(commands[mid]) for mid in motor_ids}
+
+            report = None
+            if receiver is not None:
+                receiver.set_idle(None)
+                last_sent = [0.0]
+                names = setup["actuator_names"]
+
+                def report(state, targets, sent_commands):
+                    now = time.monotonic()
+                    if now - last_sent[0] < STATUS_PERIOD:
+                        return
+                    last_sent[0] = now
+                    receiver.send_status(
+                        state, STATE_NOTES[state], status_rows(motors, sent_commands, targets, names), box.sync(),
+                    )
+
+            print("\nHardware tracking is active. Use only the MuJoCo Control sliders.")
+            track(
+                motors, hubs, motor_ids, setup["actuator_names"], commands, limiters, hard_limits,
+                setup["command_limits"], roll_pairs, profile.foot_roll, args, box, report,
+            )
+            return None
+        finally:
+            box.set_sync(None)
+            shutdown_report = brake_and_stop(
+                motors, buses, enabled_ids, stop_ids, args.brake_time, args.kd
+            )
+            if stop_ids:
+                for line in shutdown_report_lines(shutdown_report):
+                    print(line)
+            else:
+                print("CAN buses closed. No motor control command was sent during the preflight check.")
+    except (RuntimeError, ValueError, OSError, can.CanError) as error:
+        return str(error)
 
 
 def run(args):
@@ -308,129 +603,63 @@ def run(args):
     data = mujoco.MjData(model)
     data.ctrl[:] = 0.0
     mujoco.mj_forward(model, data)
+    setup = {
+        "motor_ids": motor_ids,
+        "model_path": model_path,
+        "actuator_ids": actuator_ids,
+        "actuator_names": {
+            mid: mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, aid) for mid, aid in actuator_ids.items()
+        },
+        "hard_limits": hard_limits,
+        "command_limits": command_limits,
+        "roll_pairs": roll_pairs,
+        "profile": profile,
+        "capped": capped,
+    }
 
-    buses = {}
-    motors = {}
-    hubs = {}
-    enabled_ids = []
-    stop_ids = []
-    commands = {mid: 0.0 for mid in motor_ids}
-    limiters = {mid: AxisLimiter(0.0) for mid in motor_ids}
-
+    box = TargetBox()
+    receiver = None
+    viewer = None
     try:
-        buses, motors, hubs = open_checked(open_hardware, motor_ids, args.interface, args.host_id)
-        idle = stop_idle_motors(buses, motor_ids, args.host_id, VARIANT_MOTOR_IDS[args.variant])
-        if idle:
-            print(f"Stop sent to the other motors on the open buses: {idle}")
-        measured, zero_failures = inspect_zero_positions(
-            motors, math.radians(args.zero_tolerance_deg), hard_limits
-        )
-        if roll_pairs:
-            zero_failures += start_roll_blocks(measured, roll_pairs, profile.foot_roll, math.radians(1.0))
-        if zero_failures:
-            raise RuntimeError(
-                "Preflight safety check failed; motors will not be enabled:\n  "
-                + "\n  ".join(zero_failures)
-            )
-        confirm_hardware(args, motor_ids, model_path, hard_limits, actuator_ids, capped)
-        stop_ids = list(motor_ids)
-        try:
-            starts, enabled_ids = enable_with_runtime_feedback(
-                motors, hubs, args.kp, args.kd, hard_limits, enabled_out=enabled_ids,
-            )
-        except RuntimeError as error:
-            enabled_ids = getattr(error, "enabled_ids", enabled_ids)
-            raise
-        commands.update(starts)
-        commands.update(move_to_zero(motors, hubs, starts, hard_limits, args, roll_pairs, profile.foot_roll))
-        limiters = {mid: AxisLimiter(commands[mid]) for mid in motor_ids}
-
-        with mujoco.viewer.launch_passive(model, data) as viewer:
-            print("\nHardware tracking is active. Use only the MuJoCo Control sliders.")
-
-            period = 1.0 / args.rate
-            sim_steps = max(1, int(round(period / model.opt.timestep)))
-            next_tick = time.monotonic()
-            last_tick = next_tick
-            last_print = 0.0
-
-            while viewer.is_running():
-                now = time.monotonic()
-
-                for hub in hubs.values():
-                    hub.pump()
-                reason = runtime_safety_reason(motors, commands, hard_limits, now, args)
-                if reason:
-                    raise RuntimeError("Safety stop: " + reason)
-
-                with viewer.lock():
-                    if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
-                        raise RuntimeError("MuJoCo state contains NaN or infinity; motor commands stopped")
-                    targets = {}
-                    for mid in motor_ids:
-                        if mid not in actuator_ids:
-                            targets[mid] = commands[mid]
-                            continue
-                        raw_target = float(data.ctrl[actuator_ids[mid]])
-                        if not math.isfinite(raw_target):
-                            raise RuntimeError(f"ID {mid} MuJoCo target is NaN or infinite")
-                        lower, upper = command_limits[mid]
-                        targets[mid] = clamp(raw_target, lower, upper)
-                if roll_pairs:
-                    targets = clip_roll_targets(targets, roll_pairs, command_limits, profile.foot_roll)
-
-                dt = clamp(now - last_tick, period * 0.25, period * 2.0)
-                last_tick = now
-                command_velocities = {}
-                previous = {mid: limiters[mid].position for mid in motor_ids}
-                for mid in motor_ids:
-                    position, velocity = limiters[mid].step(
-                        targets[mid],
-                        dt, args.max_speed, args.max_accel,
-                    )
-                    commands[mid] = position
-                    command_velocities[mid] = velocity
-                if roll_pairs:
-                    projected = clip_roll_targets(commands, roll_pairs, command_limits, profile.foot_roll)
-                    for mid in motor_ids:
-                        limiters[mid].position = projected[mid]
-                        limiters[mid].velocity = (projected[mid] - previous[mid]) / dt
-                        commands[mid] = projected[mid]
-                        command_velocities[mid] = limiters[mid].velocity
-
-                for mid, motor in motors.items():
-                    motor.control(
-                        pos=commands[mid], vel=command_velocities[mid],
-                        kp=args.kp[mid], kd=args.kd[mid], torque=0.0,
-                    )
-
-                with viewer.lock():
-                    mujoco.mj_step(model, data, nstep=sim_steps)
-                viewer.sync()
-
-                if now - last_print >= 1.0:
-                    last_print = now
-                    print_status(motors, commands, targets, actuator_ids)
-
-                next_tick += period
-                sleep = next_tick - time.monotonic()
-                if sleep > 0.0:
-                    time.sleep(sleep)
-                elif time.monotonic() - next_tick > period:
-                    next_tick = time.monotonic()
-    finally:
-        shutdown_report = brake_and_stop(
-            motors, buses, enabled_ids, stop_ids, args.brake_time, args.kd
-        )
-        if stop_ids:
-            for line in shutdown_report_lines(shutdown_report):
-                print(line)
+        if args.remote:
+            receiver = TargetReceiver(args.remote, args.variant, box)
+            receiver.start()
+            receiver.set_idle("starting", "waiting for the operator in the robot terminal")
+            wait_for_sender(receiver, box)
         else:
-            print("CAN buses closed. No motor control command was sent during the preflight check.")
+            viewer = LocalViewer(model, data, actuator_ids, setup["actuator_names"], box, args.rate)
+            viewer.start()
+        while True:
+            if box.latest()[3]:
+                print("\nThe MuJoCo viewer was closed.")
+                return
+            if receiver is not None:
+                receiver.set_idle("starting", "preflight, Enter confirmation and the move to zero in the robot terminal")
+            reason = run_session(args, setup, box, receiver)
+            if reason is None:
+                print("\nThe MuJoCo viewer was closed; motors are stopped.")
+                return
+            print(f"\nStopped: {reason}")
+            print("The program keeps running; nothing is enabled until you confirm again.")
+            if receiver is not None:
+                receiver.set_idle("stopped", f"{reason} | press Enter in the robot terminal to restart")
+            wait_for_restart()
+    finally:
+        if receiver is not None:
+            receiver.close()
+        if viewer is not None:
+            viewer.stop()
+
+
+def _stop_on_signal(signum, _frame):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    raise KeyboardInterrupt
 
 
 def main(argv=None):
     args = parse_args(argv)
+    previous = {sig: signal.signal(sig, _stop_on_signal) for sig in (signal.SIGTERM, signal.SIGHUP)}
     try:
         run(args)
     except KeyboardInterrupt:
@@ -439,6 +668,9 @@ def main(argv=None):
     except (RuntimeError, ValueError, OSError, can.CanError) as error:
         print(f"\nStopped: {error}")
         return 1
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
     return 0
 
 
