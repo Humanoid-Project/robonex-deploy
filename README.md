@@ -12,7 +12,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Robot identity: the model physically attached (ver2_edu, ver2_pro or ver2_max); every motor-enabling script checks it
+# Robot identity: the model physically attached (ver2_edu; ver2_pro and ver2_max are retired); every motor-enabling script checks it
 mkdir -p ~/.config/robonex && echo ver2_edu > ~/.config/robonex/robot_model
 ```
 
@@ -165,7 +165,7 @@ Drives ONE motor of a hung robot around its current position and logs feedback a
 | --- | --- | --- | --- |
 | - | `--motor-id` | `Required` | The single motor to move; must be on `--robot-model` |
 | - | `--profile` | `Required` | `step` (latency), `triangle` (hysteresis), `chirp` (frequency response) |
-| - | `--robot-model` | `Required` | `ver2_edu`, `ver2_pro` or `ver2_max`; must match the robot identity |
+| - | `--robot-model` | `Required` | `ver2_edu` (`ver2_pro` / `ver2_max` are retired); must match the robot identity |
 | - | `--amplitude` | `0.05` | rad, at most 0.15 |
 | - | `--duration` | `20.0` | s, at most 120 |
 | - | `--hold` | `1.0` | step: seconds per level |
@@ -212,14 +212,16 @@ The variant comes from `~/.config/robonex/robot_model`; CAN channels from `~/.co
 | `left_arm` | `15`–`18` shoulder_pitch/roll/yaw, elbow | rs02 | `can2` | - | ✓ | ✓ |
 | `right_arm` | `20`–`23` shoulder_pitch/roll/yaw, elbow | rs02 | `can3` | - | ✓ | ✓ |
 
-Head limit ±73° and shoulder pitch (15, 20) ±100° (user, 2026-10-01). PLACEHOLDER until measured: head kp 20 / kd 1, other arm limits ±45°, arm kp 40 / kd 2. Motors without a MuJoCo actuator (head `13` on edu and pro) show `not in sim`.
+Pro and max are retired (2026-11-02): `robonex-description` keeps only the `ver2` edu model, so `mujoco_to_real.py`, `real_to_mujoco.py` and `slider_sender.py` refuse a `ver2_pro` / `ver2_max` identity before any bus opens; the pro / max and arm columns document the bench-tool ID plan only.
+
+Head limit ±73° and shoulder pitch (15, 20) ±100° (user, 2026-10-01). PLACEHOLDER until measured: head kp 20 / kd 1, other arm limits ±45°, arm kp 40 / kd 2. Motors without a MuJoCo actuator (head `13`) show `not in sim`.
 
 ### `mujoco_to_real.py`
 
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
 | - | `--motor-id` | `legs` (`1`–`12`) | IDs, groups (`left_leg`, `right_leg`, `head`, `left_arm`, `right_arm`, `legs`, `arms`, `all`) or joint names (`left_knee_pitch`); `not in sim` motors are moved to zero and held |
-| - | `--robot` | Identity file | `edu`, `pro`, `max` (or `ver2_*`); must match the identity file |
+| - | `--robot` | Identity file | `edu` (or `ver2_edu`); `pro` / `max` are retired and refused before any bus opens; must match the identity file |
 | - | `--remote` | - | Host running `slider_sender.py`; no viewer here, slider targets come over UDP port `47021` |
 | - | `--dry-run` | Off | Print variant, buses and the per-motor kp/kd/limit table, then exit; no CAN bus is opened |
 
@@ -236,10 +238,6 @@ python3 scripts/sim_to_real/mujoco_to_real.py --motor-id left_leg
 python3 scripts/sim_to_real/mujoco_to_real.py --motor-id 4
 python3 scripts/sim_to_real/mujoco_to_real.py --motor-id head
 
-# pro / max identity file
-python3 scripts/sim_to_real/mujoco_to_real.py --motor-id legs arms
-python3 scripts/sim_to_real/mujoco_to_real.py --robot max --motor-id all
-
 # Jetson without a display (run inside tmux)
 python3 scripts/sim_to_real/mujoco_to_real.py --remote <laptop-ip>
 ```
@@ -253,7 +251,7 @@ Runs the MuJoCo Control sliders on a computer with a display and sends them to `
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
 | - | `--robot-host` | `Required` | Robot computer running `mujoco_to_real.py --remote <this computer>` |
-| - | `--robot` | `Required` | `edu`, `pro`, `max` (or `ver2_*`); must match the robot identity file |
+| - | `--robot` | `Required` | `edu` (or `ver2_edu`); `pro` / `max` are retired and refused; must match the robot identity file |
 | - | `--rate` | `50` | Send rate in Hz (10–200) |
 
 ```bash
@@ -271,7 +269,7 @@ python3 scripts/sim_to_real/slider_sender.py --robot-host <jetson-ip> --robot ed
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
 | - | `--motor-id` | `legs` (`1`–`12`) | Same selection as `mujoco_to_real.py`; `not in sim` motors are read and printed only |
-| - | `--robot` | Identity file | `edu`, `pro`, `max` (or `ver2_*`); must match the identity file, sets the variant when there is none |
+| - | `--robot` | Identity file | `edu` (or `ver2_edu`); `pro` / `max` are retired and refused; must match the identity file, sets the variant when there is none |
 | - | `--once` | Off | Read once, print one table, exit; no viewer, no stop frame |
 
 ```bash
