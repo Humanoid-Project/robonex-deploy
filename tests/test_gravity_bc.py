@@ -2,6 +2,7 @@ import csv
 import importlib.util
 import math
 import subprocess
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,8 +25,9 @@ from test_policy_to_real_timing import (
 from test_policy_to_real_recording import run_full_deploy, load_meta
 
 BASELINE_COMMIT = "0a5bf3d"
-HW_DIR = Path("/home/polygon/humanoid_project/etc/2026-10-11_hw")
-E_BC = Path("/home/polygon/humanoid_project/robonex-walking/etc/delegates/2026-10-12_hwlog/E_work/bc.py")
+DATA = Path(os.environ.get("HUMANOID_DATA", Path.home() / ".agents/departments/humanoid/data"))
+HW_DIR = DATA / "hardware/2026-10-11_hw"
+E_BC = DATA / "analysis/walking-delegates/2026-10-12_hwlog/E_work/bc.py"
 LOGGED_RUNS = ("20261011_195254", "20261011_192811")
 TILT = math.radians(3.0)
 
