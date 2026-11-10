@@ -40,7 +40,6 @@ from bench import (
 )
 from safety import fixed_model_path, load_fixed_model, open_hardware
 
-ROBOT_VARIANTS_SHORT = {name: short for short, name in ROBOT_VARIANTS.items()}
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
@@ -56,7 +55,7 @@ def parse_args(argv=None):
         metavar="MOTOR",
         help=selection_help() + ". A motor without a MuJoCo actuator on the attached variant is read and printed only",
     )
-    parser.add_argument("--robot", choices=(*ROBOT_VARIANTS, *ROBOT_VARIANTS.values()),
+    parser.add_argument("--robot", choices=tuple(ROBOT_VARIANTS),
                         help="Variant check: must match the robot identity file; without that file it sets the variant")
     parser.add_argument("--once", action="store_true",
                         help="Read every selected motor once, print one table and exit; no viewer, no stop frame")
@@ -64,7 +63,7 @@ def parse_args(argv=None):
     try:
         args.variant, args.variant_source = resolve_variant(args.robot, need_identity=False)
         args.motor_ids = resolve_motor_ids(args.motor_id, args.variant)
-        args.model = fixed_model_path(ROBOT_VARIANTS_SHORT[args.variant])
+        args.model = fixed_model_path(args.variant)
     except ValueError as error:
         parser.error(str(error))
     args.interface = DEFAULT_INTERFACE

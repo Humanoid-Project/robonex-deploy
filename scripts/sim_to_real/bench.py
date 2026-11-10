@@ -7,12 +7,21 @@ from pathlib import Path
 import can
 from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
 from robonex_common.buses import bus_map_path
-from robonex_common.joints import ACTUATED_JOINTS, ALL_MOTORS, MOTOR_BY_ID, VARIANT_MOTOR_IDS
+from robonex_common.joints import (
+    ACTUATED_JOINTS,
+    ALL_MOTORS,
+    LEGACY_VARIANT_NAMES,
+    MOTOR_BY_ID,
+    VARIANT_MOTOR_IDS,
+    canonical_variant,
+)
 from robonex_common.motors import MOTOR_SPECS
 
 ROBOT_IDENTITY_ENV = "ROBONEX_ROBOT_MODEL_FILE"
 ROBOT_IDENTITY_FILE = Path.home() / ".config" / "robonex" / "robot_model"
-ROBOT_VARIANTS = {name.removeprefix("ver2_"): name for name in VARIANT_MOTOR_IDS}
+ROBOT_VARIANTS = {**{name: name for name in VARIANT_MOTOR_IDS}, "edu": "ver2", **LEGACY_VARIANT_NAMES}
+RETIRED_ROBOT_MODELS = ("ver2_pro", "ver2_max", "pro", "max")
+RETIRED_NOTE = "retired: the Ver.2 robot is now one model, ver2"
 LEG_MOTOR_IDS = tuple(joint.motor_id for joint in ACTUATED_JOINTS)
 GROUP_ORDER = ("left_leg", "right_leg", "head", "left_arm", "right_arm")
 GROUP_ALIASES = {
@@ -47,7 +56,9 @@ def attached_robot_model(path=None):
 
 
 def variant_name(value):
-    name = ROBOT_VARIANTS.get(value, value)
+    if value in RETIRED_ROBOT_MODELS:
+        raise ValueError(f"{value} is {RETIRED_NOTE}")
+    name = canonical_variant(ROBOT_VARIANTS.get(value, value))
     if name not in VARIANT_MOTOR_IDS:
         known = ", ".join([*ROBOT_VARIANTS, *VARIANT_MOTOR_IDS])
         raise ValueError(f"unknown robot variant {value!r} (known: {known})")
@@ -63,8 +74,11 @@ def resolve_variant(override=None, need_identity=True):
             return requested, f"--robot {override} (no identity file at {path})"
         raise ValueError(
             f"no robot identity file: write the attached robot's variant once with "
-            f"`mkdir -p {path.parent} && echo ver2_edu > {path}` (ver2_edu, ver2_pro or ver2_max)"
+            f"`mkdir -p {path.parent} && echo ver2 > {path}` (known: {', '.join(VARIANT_MOTOR_IDS)})"
         )
+    if attached in RETIRED_ROBOT_MODELS:
+        raise ValueError(f"{path} names {attached}, which is {RETIRED_NOTE}")
+    attached = canonical_variant(attached)
     if attached not in VARIANT_MOTOR_IDS:
         raise ValueError(f"{path} names an unknown robot variant {attached!r} (known: {', '.join(VARIANT_MOTOR_IDS)})")
     if requested and requested != attached:

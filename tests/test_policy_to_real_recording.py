@@ -381,14 +381,14 @@ def test_full_deploy_holds_the_neck_at_zero_and_brakes_it(modules, monkeypatch, 
     monkeypatch.setattr(policy_module, "SETTINGS", replace(policy_module.SETTINGS, hold_head=True))
     run = run_full_deploy(policy_module, monkeypatch, tmp_path)
     assert run.error is None
-    assert 13 in run.opened[0]
-    head = [frame for frame in run.control_log if frame[0] == 13]
+    assert 26 in run.opened[0]
+    head = [frame for frame in run.control_log if frame[0] == 26]
     held = [frame for frame in head if frame[3] > 0.0]
     assert held and held[0][1] == pytest.approx(0.05, abs=1e-3)
     assert all(abs(b[1] - a[1]) <= 0.003 for a, b in zip(held, held[1:]))
     assert held[-1][1] == 0.0 and (held[-1][3], held[-1][4]) == (20.0, 1.0)
     assert any(frame[3] == 0.0 for frame in head)
-    assert run.motors[13].stopped
+    assert run.motors[26].stopped
 
 
 def test_no_head_hold_leaves_the_neck_closed(modules, monkeypatch, tmp_path):
@@ -397,8 +397,8 @@ def test_no_head_hold_leaves_the_neck_closed(modules, monkeypatch, tmp_path):
     monkeypatch.setattr(policy_module, "SETTINGS", replace(policy_module.SETTINGS, hold_head=False))
     run = run_full_deploy(policy_module, monkeypatch, tmp_path)
     assert run.error is None
-    assert 13 not in run.opened[0]
-    assert not [frame for frame in run.control_log if frame[0] == 13]
+    assert 26 not in run.opened[0]
+    assert not [frame for frame in run.control_log if frame[0] == 26]
 
 
 def test_send_timing_columns_follow_the_loop(modules, monkeypatch, tmp_path, capsys):

@@ -18,13 +18,14 @@ import numpy as np
 from robonex_common.can import drain
 from robonex_common.foot_roll import clip_foot_roll, foot_roll
 from robonex_common.joints import JOINT_BY_MODEL_NAME
-from robonex_common.models import ROBOT_MODELS
+from robonex_common.joints import canonical_variant
+from robonex_common.models import ROBOT_MODELS, robot_model
 from robonex_common.paths import description_model
 
 try:
-    from bench import LEG_MOTOR_IDS, ROBOT_VARIANTS, attached_robot_model, identity_path
+    from bench import LEG_MOTOR_IDS, RETIRED_NOTE, RETIRED_ROBOT_MODELS, ROBOT_VARIANTS, attached_robot_model, identity_path
 except ModuleNotFoundError:
-    from .bench import LEG_MOTOR_IDS, ROBOT_VARIANTS, attached_robot_model, identity_path
+    from .bench import LEG_MOTOR_IDS, RETIRED_NOTE, RETIRED_ROBOT_MODELS, ROBOT_VARIANTS, attached_robot_model, identity_path
 from robonex_can import (
     FeedbackHub,
     JOINT_LIMITS_RAD,
@@ -131,23 +132,23 @@ def verify_model_limits(model, actuator_ids, motor_ids):
         )
     return matches[0]
 
-LEG_PROFILE = {identity: "ver2_edu" for identity in ROBOT_VARIANTS.values()}
+LEG_PROFILE = {identity: robot_model(identity).leg_profile for identity in ROBOT_VARIANTS.values()}
 
 
-MODEL_VERSION = {"edu": "ver2"}
+FIXED_MODELS = {"ver2": "ver2/mujoco/robot/edu/scene_fixed.xml"}
 
 
-def fixed_model_path(robot):
-    if robot not in MODEL_VERSION:
+def fixed_model_path(variant):
+    if variant in RETIRED_ROBOT_MODELS:
+        raise ValueError(f"{variant} is {RETIRED_NOTE}; it has no MuJoCo model")
+    variant = canonical_variant(ROBOT_VARIANTS.get(variant, variant))
+    if variant not in FIXED_MODELS:
         raise ValueError(
-            f"ver2_{robot} has no MuJoCo model: robonex-description keeps only "
-            f"{', '.join('ver2_' + name for name in MODEL_VERSION)} (pro and max were retired)"
+            f"{variant} has no MuJoCo model: robonex-description keeps only {', '.join(FIXED_MODELS)}"
         )
-    version = MODEL_VERSION[robot]
-    return description_model(f"{version}/mujoco/robot/{robot}/scene_fixed.xml", anchors=(__file__,))
+    return description_model(FIXED_MODELS[variant], anchors=(__file__,))
 
 
-RETIRED_ROBOT_MODELS = ("ver2_pro", "ver2_max")
 
 
 def require_robot_model(expected, path=None):
@@ -161,17 +162,17 @@ def require_robot_model(expected, path=None):
     if attached is None:
         raise RuntimeError(
             f"No robot identity: write the attached robot's model ({known}) to {path}, e.g. "
-            f"`mkdir -p {path.parent} && echo ver2_edu > {path}`. Motors will not be enabled."
+            f"`mkdir -p {path.parent} && echo ver2 > {path}`. Motors will not be enabled."
         )
-    if attached not in known_names:
-        raise RuntimeError(f"{path} names an unknown robot model {attached!r} (known: {known})")
     for name in (attached, expected):
         if name in RETIRED_ROBOT_MODELS:
             raise RuntimeError(
-                f"{name} is retired (robonex-description keeps only ver2_edu; pro and max were retired). "
+                f"{name} is {RETIRED_NOTE}. "
                 "Motors will not be enabled."
             )
-    if attached != expected:
+    if canonical_variant(attached) not in known_names:
+        raise RuntimeError(f"{path} names an unknown robot model {attached!r} (known: {known})")
+    if canonical_variant(attached) != canonical_variant(expected):
         raise RuntimeError(
             f"The attached robot is {attached} ({path}), but this run is for {expected}. "
             "Motors will not be enabled."

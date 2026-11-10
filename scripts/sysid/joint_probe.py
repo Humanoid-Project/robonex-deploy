@@ -71,8 +71,8 @@ def parse_args(argv=None):
     )
     parser.add_argument("--motor-id", type=lambda v: int(v, 0), required=True)
     parser.add_argument("--profile", choices=("step", "triangle", "chirp"), required=True)
-    parser.add_argument("--robot-model", choices=tuple(ROBOT_VARIANTS.values()), required=True,
-                        help="attached Ver.2 variant (ver2_edu, ver2_pro, ver2_max); all share the ver2_edu leg limits")
+    parser.add_argument("--robot-model", choices=tuple(sorted(ROBOT_VARIANTS)), required=True,
+                        help="attached robot model (ver2; edu and ver2_edu are its legacy names)")
     parser.add_argument("--amplitude", type=float, default=0.05, help="rad, at most %.2f" % MAX_AMPLITUDE_RAD)
     parser.add_argument("--duration", type=float, default=20.0, help="seconds, at most %.0f" % MAX_DURATION_S)
     parser.add_argument("--hold", type=float, default=1.0, help="step: seconds per level")
@@ -84,6 +84,7 @@ def parse_args(argv=None):
                         help="fraction of the per-joint walking gains (kp, kd)")
     parser.add_argument("--output", type=Path, help="CSV path; default results/sysid/<stamp>_<id>_<profile>.csv")
     args = parser.parse_args(argv)
+    args.robot_model = ROBOT_VARIANTS[args.robot_model]
     if args.motor_id not in MOTOR_BY_ID:
         parser.error(f"unknown motor id {args.motor_id}")
     if args.motor_id not in VARIANT_MOTOR_IDS[args.robot_model]:

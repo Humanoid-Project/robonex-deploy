@@ -14,10 +14,10 @@ sys.path.insert(0, str(THIS_FILE.parents[1]))
 sys.path.insert(0, str(THIS_FILE.parent))
 
 from bench import ROBOT_VARIANTS, deg_text, print_table
+from robonex_common.joints import canonical_variant
 from safety import fixed_model_path
 from slider_link import PORT, TargetSender, viewer_loop
 
-ROBOT_VARIANTS_SHORT = {name: short for short, name in ROBOT_VARIANTS.items()}
 STATUS_STALE = 1.0
 
 
@@ -27,11 +27,11 @@ def parse_args(argv=None):
     )
     parser.add_argument("--robot-host", required=True, metavar="HOST",
                         help="Robot computer running mujoco_to_real.py --remote <this computer>")
-    parser.add_argument("--robot", required=True, choices=(*ROBOT_VARIANTS, *ROBOT_VARIANTS.values()),
+    parser.add_argument("--robot", required=True, choices=tuple(ROBOT_VARIANTS),
                         help="Robot variant; must match the robot identity file on the robot computer")
     parser.add_argument("--rate", type=float, default=50.0, help="Send rate in Hz")
     args = parser.parse_args(argv)
-    args.variant = ROBOT_VARIANTS.get(args.robot, args.robot)
+    args.variant = canonical_variant(ROBOT_VARIANTS.get(args.robot, args.robot))
     if not math.isfinite(args.rate) or not 10.0 <= args.rate <= 200.0:
         parser.error("--rate must be between 10 and 200 Hz")
     return args
@@ -57,7 +57,7 @@ def print_robot_status(status, age):
 
 def main(argv=None):
     args = parse_args(argv)
-    model_path = fixed_model_path(ROBOT_VARIANTS_SHORT[args.variant])
+    model_path = fixed_model_path(args.variant)
     model = mujoco.MjModel.from_xml_path(str(model_path))
     data = mujoco.MjData(model)
     data.ctrl[:] = 0.0

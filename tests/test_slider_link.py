@@ -256,7 +256,7 @@ def test_wait_for_restart_needs_a_terminal(monkeypatch):
 
 def test_sender_args():
     args = slider_sender.parse_args(["--robot-host", "orin", "--robot", "edu"])
-    assert args.variant == "ver2_edu" and args.rate == 50.0
+    assert args.variant == "ver2" and args.rate == 50.0
     with pytest.raises(SystemExit):
         slider_sender.parse_args(["--robot-host", "orin", "--robot", "edu", "--rate", "1000"])
 

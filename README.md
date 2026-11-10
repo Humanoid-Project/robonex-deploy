@@ -12,8 +12,8 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Robot identity: the model physically attached (ver2_edu; ver2_pro and ver2_max are retired); every motor-enabling script checks it
-mkdir -p ~/.config/robonex && echo ver2_edu > ~/.config/robonex/robot_model
+# Robot identity: the model physically attached (ver2; ver2_edu is read as ver2); every motor-enabling script checks it
+mkdir -p ~/.config/robonex && echo ver2 > ~/.config/robonex/robot_model
 ```
 
 `robonex-common` is pinned in `requirements.txt` — see [`robonex-common/setup/SETUP.md`](https://github.com/Humanoid-Project/robonex-common/blob/main/setup/SETUP.md).
@@ -165,7 +165,7 @@ Drives ONE motor of a hung robot around its current position and logs feedback a
 | --- | --- | --- | --- |
 | - | `--motor-id` | `Required` | The single motor to move; must be on `--robot-model` |
 | - | `--profile` | `Required` | `step` (latency), `triangle` (hysteresis), `chirp` (frequency response) |
-| - | `--robot-model` | `Required` | `ver2_edu` (`ver2_pro` / `ver2_max` are retired); must match the robot identity |
+| - | `--robot-model` | `Required` | `ver2` (`edu` / `ver2_edu` accepted); must match the robot identity |
 | - | `--amplitude` | `0.05` | rad, at most 0.15 |
 | - | `--duration` | `20.0` | s, at most 120 |
 | - | `--hold` | `1.0` | step: seconds per level |
@@ -177,10 +177,10 @@ Drives ONE motor of a hung robot around its current position and logs feedback a
 
 ```bash
 # Example
-python3 scripts/sysid/joint_probe.py --motor-id 1 --robot-model ver2_edu --profile step --amplitude 0.05
-python3 scripts/sysid/joint_probe.py --motor-id 1 --robot-model ver2_edu --profile triangle --amplitude 0.05 --period 10 --duration 30
-python3 scripts/sysid/joint_probe.py --motor-id 1 --robot-model ver2_edu --profile chirp --amplitude 0.03 --f0 0.2 --f1 5 --duration 40
-python3 scripts/sysid/joint_probe.py --motor-id 13 --robot-model ver2_edu --profile step --amplitude 0.05
+python3 scripts/sysid/joint_probe.py --motor-id 1 --robot-model ver2 --profile step --amplitude 0.05
+python3 scripts/sysid/joint_probe.py --motor-id 1 --robot-model ver2 --profile triangle --amplitude 0.05 --period 10 --duration 30
+python3 scripts/sysid/joint_probe.py --motor-id 1 --robot-model ver2 --profile chirp --amplitude 0.03 --f0 0.2 --f1 5 --duration 40
+python3 scripts/sysid/joint_probe.py --motor-id 26 --robot-model ver2 --profile step --amplitude 0.05
 ```
 
 <br>
@@ -204,24 +204,23 @@ python3 scripts/sysid/analyze_probe.py results/sysid/*_id1_*.csv --output /tmp/p
 
 The variant comes from `~/.config/robonex/robot_model`; CAN channels from `~/.config/robonex/bus_map.json` (default below).
 
-| Group | IDs | Motor | Default CAN | edu | pro | max |
-| --- | --- | --- | --- | --- | --- | --- |
-| `left_leg` | `1`–`6` | rs02 / rs03 | `can0` | ✓ | ✓ | ✓ |
-| `right_leg` | `7`–`12` | rs02 / rs03 | `can1` | ✓ | ✓ | ✓ |
-| `head` | `13` neck_pitch (`14` reserved for neck yaw, no motor yet) | rs05 | `can4` | `13` | `13` | `13` |
-| `left_arm` | `15`–`18` shoulder_pitch/roll/yaw, elbow | rs02 | `can2` | - | ✓ | ✓ |
-| `right_arm` | `20`–`23` shoulder_pitch/roll/yaw, elbow | rs02 | `can3` | - | ✓ | ✓ |
+| ID | Joint | Group | Model | Default CAN |
+| --- | --- | --- | --- | --- |
+| `1`–`6` | `left_hip_yaw` … `left_ankle_lower` | `left_leg` | rs02/rs03 | `can0` |
+| `7`–`12` | `right_hip_yaw` … `right_ankle_lower` | `right_leg` | rs02/rs03 | `can1` |
+| `13`–`15` | reserved | `waist` | - | - |
+| `16`–`20` | `left_shoulder_pitch`, `left_shoulder_roll`, `left_shoulder_yaw`, `left_elbow`, `left_wrist_yaw` | `left_arm` | rs02, rs10p, rs00, rs00, rs05 | `can2` |
+| `21`–`25` | `right_shoulder_pitch`, `right_shoulder_roll`, `right_shoulder_yaw`, `right_elbow`, `right_wrist_yaw` | `right_arm` | rs02, rs10p, rs00, rs00, rs05 | `can3` |
+| `26`–`27` | `neck_pitch`, `neck_yaw` (`28` reserved) | `head` | rs05 | `can4` |
 
-Pro and max are retired (2026-11-02): `robonex-description` keeps only the `ver2` edu model, so `mujoco_to_real.py`, `real_to_mujoco.py` and `slider_sender.py` refuse a `ver2_pro` / `ver2_max` identity before any bus opens; the pro / max and arm columns document the bench-tool ID plan only.
-
-Head limit ±73° and shoulder pitch (15, 20) ±100° (user, 2026-10-01). PLACEHOLDER until measured: head kp 20 / kd 1, other arm limits ±45°, arm kp 40 / kd 2. Motors without a MuJoCo actuator (head `13`) show `not in sim`.
+One robot model, `ver2` (all IDs above); an identity file that still says `ver2_edu` is read as `ver2`. Head pitch ±73°, shoulder pitch (16, 21) ±100°; the other arm and neck-yaw limits (±45° / ±30°) are PLACEHOLDERs until measured. PLACEHOLDER gains: head kp 20 / kd 1, arm kp 40 / kd 2, wrist kp 10 / kd 0.5. Motors without a MuJoCo actuator (`16`–`27`) show `not in sim`.
 
 ### `mujoco_to_real.py`
 
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
 | - | `--motor-id` | `legs` (`1`–`12`) | IDs, groups (`left_leg`, `right_leg`, `head`, `left_arm`, `right_arm`, `legs`, `arms`, `all`) or joint names (`left_knee_pitch`); `not in sim` motors are moved to zero and held |
-| - | `--robot` | Identity file | `edu` (or `ver2_edu`); `pro` / `max` are retired and refused before any bus opens; must match the identity file |
+| - | `--robot` | Identity file | `ver2` (or `edu` / `ver2_edu`); `pro` / `max` are refused before any bus opens; must match the identity file |
 | - | `--remote` | - | Host running `slider_sender.py`; no viewer here, slider targets come over UDP port `47021` |
 | - | `--dry-run` | Off | Print variant, buses and the per-motor kp/kd/limit table, then exit; no CAN bus is opened |
 
@@ -251,7 +250,7 @@ Runs the MuJoCo Control sliders on a computer with a display and sends them to `
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
 | - | `--robot-host` | `Required` | Robot computer running `mujoco_to_real.py --remote <this computer>` |
-| - | `--robot` | `Required` | `edu` (or `ver2_edu`); `pro` / `max` are retired and refused; must match the robot identity file |
+| - | `--robot` | `Required` | `ver2` (or `edu` / `ver2_edu`); `pro` / `max` are refused; must match the robot identity file |
 | - | `--rate` | `50` | Send rate in Hz (10–200) |
 
 ```bash
@@ -269,7 +268,7 @@ python3 scripts/sim_to_real/slider_sender.py --robot-host <jetson-ip> --robot ed
 | Command | Option | Default | Description |
 | --- | --- | --- | --- |
 | - | `--motor-id` | `legs` (`1`–`12`) | Same selection as `mujoco_to_real.py`; `not in sim` motors are read and printed only |
-| - | `--robot` | Identity file | `edu` (or `ver2_edu`); `pro` / `max` are retired and refused; must match the identity file, sets the variant when there is none |
+| - | `--robot` | Identity file | `ver2` (or `edu` / `ver2_edu`); `pro` / `max` are refused; must match the identity file, sets the variant when there is none |
 | - | `--once` | Off | Read once, print one table, exit; no viewer, no stop frame |
 
 ```bash
@@ -283,8 +282,8 @@ python3 scripts/sim_to_real/real_to_mujoco.py --once --motor-id all
 
 # Without an identity file
 python3 scripts/sim_to_real/real_to_mujoco.py --robot edu
-python3 scripts/sim_to_real/real_to_mujoco.py --robot pro --motor-id arms
-python3 scripts/sim_to_real/real_to_mujoco.py --robot max --once --motor-id head
+python3 scripts/sim_to_real/real_to_mujoco.py --robot ver2 --motor-id arms
+python3 scripts/sim_to_real/real_to_mujoco.py --robot ver2 --once --motor-id head
 ```
 
 <br>

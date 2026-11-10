@@ -85,7 +85,6 @@ STATE_NOTES = {
     "syncing": "setting the sliders to the robot's current command before tracking resumes",
     "tracking": "tracking the sliders",
 }
-ROBOT_VARIANTS_SHORT = {name: short for short, name in ROBOT_VARIANTS.items()}
 
 
 def parse_args(argv=None):
@@ -94,7 +93,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--motor-id", dest="motor_id", nargs="+", metavar="MOTOR",
                         help=selection_help() + ". A motor without a MuJoCo actuator on the attached variant is moved to zero and held there")
-    parser.add_argument("--robot", choices=(*ROBOT_VARIANTS, *ROBOT_VARIANTS.values()),
+    parser.add_argument("--robot", choices=tuple(ROBOT_VARIANTS),
                         help="Check only: must match the robot identity file, which sets the variant")
     parser.add_argument("--remote", metavar="HOST",
                         help="Take the slider targets over UDP from slider_sender.py on HOST instead of a local MuJoCo viewer (headless, for the Jetson)")
@@ -104,7 +103,7 @@ def parse_args(argv=None):
     try:
         args.variant, args.variant_source = resolve_variant(args.robot, need_identity=not args.dry_run)
         args.motor_ids = resolve_motor_ids(args.motor_id, args.variant)
-        args.model = fixed_model_path(ROBOT_VARIANTS_SHORT[args.variant])
+        args.model = fixed_model_path(args.variant)
     except ValueError as error:
         parser.error(str(error))
     args.max_speed = 0.10

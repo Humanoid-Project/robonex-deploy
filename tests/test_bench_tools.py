@@ -55,8 +55,8 @@ def _no_hardware(*_args, **_kwargs):
 
 def test_bus_map_fixture():
     from robonex_common.joints import MOTOR_BY_ID
-    assert MOTOR_BY_ID[20].channel == "can0"
-    assert MOTOR_BY_ID[13].channel == "can4"
+    assert MOTOR_BY_ID[21].channel == "can0"
+    assert MOTOR_BY_ID[26].channel == "can4"
 
 
 def test_identity_reader_missing_and_directory(tmp_path):
@@ -111,7 +111,7 @@ def test_mujoco_to_real_run_identity_unreadable_exit_1(tmp_path, monkeypatch, ca
 
 def test_joint_probe_refuses_retired_identity_before_hardware(tmp_path, monkeypatch, capsys):
     _identity(tmp_path, monkeypatch, "ver2_pro")
-    args = _probe_args(tmp_path, monkeypatch, robot="ver2_pro")
+    args = _probe_args(tmp_path, monkeypatch, robot="ver2")
     monkeypatch.setattr(joint_probe, "open_hardware", lambda *a, **k: pytest.fail("bus opened for a retired robot model"))
     monkeypatch.setattr(builtins, "input", lambda *_: pytest.fail("no confirmation before the identity check"))
     assert joint_probe.run(args) == 1
@@ -189,19 +189,17 @@ def test_joint_probe_idle_stop_respects_variant(tmp_path, monkeypatch, capsys):
                 stopped.add(motor_id)
     finally:
         listener.shutdown()
-    assert stopped - {1} == {2, 3, 4, 5, 6}
+    assert stopped - {1} == {2, 3, 4, 5, 6, 21, 22, 23, 24, 25}
     out = capsys.readouterr().out
-    assert "Stop frame first to the other ver2_edu motors on can0: 2–6" in out
+    assert "Stop frame first to the other ver2 motors on can0: 2–6, 21–25" in out
     assert "Stopped: test stop before enable" in out
 
 
-def test_joint_probe_idle_banner_pro(tmp_path, monkeypatch, capsys):
-    _identity(tmp_path, monkeypatch, "ver2_edu")
-    args = _probe_args(tmp_path, monkeypatch, motor_id=1, robot="ver2_pro")
-    monkeypatch.setattr(joint_probe, "open_hardware", _no_hardware)
-    assert joint_probe.run(args) == 1
-    out = capsys.readouterr().out
-    assert "Stop frame first to the other ver2_pro motors on can0: 2–6, 20–23" in out
+def test_joint_probe_retired_robot_model_argument_is_refused(tmp_path, monkeypatch, capsys):
+    with pytest.raises(SystemExit) as info:
+        _probe_args(tmp_path, monkeypatch, motor_id=1, robot="ver2_pro")
+    assert info.value.code == 2
+    assert "invalid choice: 'ver2_pro'" in capsys.readouterr().err
 
 
 def test_help_texts(capsys):
@@ -216,8 +214,8 @@ def test_help_texts(capsys):
 
 
 def test_placeholder_banner_wording(capsys):
-    ids = [15, 16, 17, 18]
-    bench.print_banner("ver2_pro", "test", ids, {mid: mid for mid in ids}, "model.xml", interface="virtual")
+    ids = [16, 17, 18, 19, 20]
+    bench.print_banner("ver2", "test", ids, {mid: mid for mid in ids}, "model.xml", interface="virtual")
     out = capsys.readouterr().out
     placeholders = [
         mid for mid in ids
