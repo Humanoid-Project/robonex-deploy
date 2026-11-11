@@ -214,9 +214,15 @@ def test_full_deploy_failure_still_brakes_then_saves(modules, monkeypatch, tmp_p
     assert run.error is not None and "synthetic pipeline failure" in str(run.error)
     assert run.events.index("brake") < run.events.index("close")
     rows = read_csv(run.path)
-    assert len(rows) == 40
+    assert len(rows) == 41
+    assert all(row["stop_reason"] == "" for row in rows[:40])
+    assert rows[40]["stop_reason"] == "synthetic pipeline failure"
     arrays = np.load(run.path.with_name(run.path.stem + "_arrays.npz"))
-    assert arrays["obs"].shape == (40, 235)
+    assert arrays["obs"].shape == (41, 235)
+    assert arrays["obs"][:40].tobytes() == np.stack(run.observations).astype(np.float32).tobytes()
+    assert np.isfinite(arrays["obs"][40]).all()
+    assert np.isnan(arrays["raw_action"][40]).all()
+    assert arrays["step"].tolist() == list(range(41))
     meta = load_meta(run.path)
     assert "synthetic pipeline failure" in meta["end"]["exit"]
     phases = read_csv(run.path.with_name(run.path.stem + "_phases.csv"))

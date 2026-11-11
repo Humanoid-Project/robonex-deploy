@@ -163,8 +163,6 @@ def resolve_gains(scale, ankle_scale=1.0):
 class Settings:
     interface: str = DEFAULT_INTERFACE
     host_id: int = HOST_ID
-    kp: float = MOTOR_CONTROL_KP
-    kd: float = MOTOR_CONTROL_KD
     # Fraction of the per-joint gains in CONTROL_GAINS_BY_JOINT actually commanded.
     # The trained policy assumes those gains; the measured-hardware scalars above are
     # only the fallback for a joint the table does not cover. Ramp this up from a low
@@ -203,6 +201,7 @@ class Settings:
 SETTINGS = Settings()
 
 GAIT_COMMAND_DEADBAND = 0.05
+SLEW_LAG_REPORT_RAD = math.radians(0.5)
 ENABLE_KP, ENABLE_KD = resolve_gains(SETTINGS.gain_scale)
 
 
@@ -873,6 +872,11 @@ class PolicyRunner:
         self.history = ObservationHistory.from_contract(contract)
         self.gait_step = 0
         self.inference_ms = 0.0
+        self.last_raw_action = None
+        self.session.run(
+            [self.output_name],
+            {self.input_name: np.zeros((1, contract.observation_size), dtype=np.float32)},
+        )
 
     def reset(self):
         self.last_action.fill(0.0)
@@ -910,10 +914,12 @@ class PolicyRunner:
         )
 
     def step(self, observation, commit):
+        self.last_raw_action = None
         started = time.perf_counter()
         raw_action = self.session.run(
             [self.output_name], {self.input_name: observation.reshape(1, -1)}
         )[0][0]
+        self.last_raw_action = raw_action
         self.inference_ms = (time.perf_counter() - started) * 1000.0
         action, targets = self.pipeline.apply(raw_action, max_raw_action=SETTINGS.max_raw_action)
         if commit:
@@ -962,6 +968,7 @@ class TargetCommander:
         self.slew_limited_count = 0
         self.command_count = 0
         self.slew_limited_by_motor = {motor_id: 0 for motor_id in motors}
+        self.slew_lag_over_by_motor = {motor_id: 0 for motor_id in motors}
         self.command_count_by_motor = {motor_id: 0 for motor_id in motors}
         self.slew_lag_step_max = 0.0
         self.slew_lag_run_max = 0.0
@@ -974,6 +981,7 @@ class TargetCommander:
         self.slew_limited_count = 0
         self.command_count = 0
         self.slew_limited_by_motor = {motor_id: 0 for motor_id in self.motors}
+        self.slew_lag_over_by_motor = {motor_id: 0 for motor_id in self.motors}
         self.command_count_by_motor = {motor_id: 0 for motor_id in self.motors}
         self.slew_lag_step_max = 0.0
         self.slew_lag_run_max = 0.0
@@ -994,6 +1002,8 @@ class TargetCommander:
             if lag > 1.0e-9:
                 self.slew_limited_count += 1
                 self.slew_limited_by_motor[motor_id] += 1
+            if lag > SLEW_LAG_REPORT_RAD:
+                self.slew_lag_over_by_motor[motor_id] += 1
             if lag > step_lag_max:
                 step_lag_max = lag
             if lag > self.slew_lag_max_by_motor[motor_id]:
@@ -1032,6 +1042,13 @@ class TargetCommander:
     def slew_rate_by_motor(self):
         return {
             motor_id: self.slew_limited_by_motor[motor_id]
+            / max(1, self.command_count_by_motor[motor_id])
+            for motor_id in self.motors
+        }
+
+    def slew_lag_over_fraction_by_motor(self):
+        return {
+            motor_id: self.slew_lag_over_by_motor[motor_id]
             / max(1, self.command_count_by_motor[motor_id])
             for motor_id in self.motors
         }
@@ -1726,7 +1743,8 @@ class TelemetryRecorder:
         return self.meta_path
 
     def record_stop(self, now, started, reason, commands, gravity=None, gyro=None, imu_age=None,
-                    velocity_command=None):
+                    velocity_command=None, observation=None, raw_action=None, policy_action=None,
+                    targets=None, positions=None, velocities=None, gravity_bc=None):
         """Write the sample that tripped a safety stop.
 
         The checks run at the top of the loop and raise, while `record` is called near the
@@ -1735,11 +1753,29 @@ class TelemetryRecorder:
         it, against the commands it compared them to. The policy columns are blank because
         this step never reached inference.
         """
+        size = len(self.order)
+
+        def filled(values, count):
+            if values is None or np.asarray(values).size != count:
+                return [float("nan")] * count
+            return values
+
+        if observation is None:
+            self.record(
+                now, started, float("nan"), float("nan"), float("nan"),
+                filled(raw_action, size), filled(targets, size), commands,
+                gravity=gravity, gyro=gyro, imu_age=imu_age, velocity_command=velocity_command,
+                stop_reason=reason, allow_flush=False, policy_action=policy_action,
+            )
+            return
         self.record(
             now, started, float("nan"), float("nan"), float("nan"),
-            [float("nan")] * len(self.order), [float("nan")] * len(self.order), commands,
-            gravity=gravity, gyro=gyro, imu_age=imu_age, velocity_command=velocity_command,
-            stop_reason=reason, allow_flush=False,
+            filled(raw_action, size), filled(targets, size), commands,
+            gravity=filled(gravity, 3), gyro=filled(gyro, 3), imu_age=imu_age,
+            velocity_command=filled(velocity_command, 3),
+            stop_reason=reason, allow_flush=False, policy_action=filled(policy_action, size),
+            observation=observation, positions=filled(positions, size), velocities=filled(velocities, size),
+            gravity_bc=gravity_bc,
         )
 
     def flush_if_idle(self, slack_s):
@@ -1863,42 +1899,64 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
             if gravity_bc is not None:
                 policy_gravity = gravity_bc.update(gravity, GravityBC.sample_force(imu.last_sample))
 
-            requested_command = runner.velocity_command.copy()
-            holding = now - ramp_started < SETTINGS.ramp_seconds + SETTINGS.command_hold_seconds
+            observation = None
+            policy_action = None
+            targets = None
+            runner.last_raw_action = None
             try:
-                if holding:
-                    runner.velocity_command[:] = 0.0
-                observation = runner.observation(positions, velocities, angular_velocity, policy_gravity)
-                obs_ns = time.monotonic_ns()
-                raw_action, policy_action, targets = runner.step(observation, commit=False)
-            except ValueError as error:
-                raise RuntimeError(f"Safety stop: {error}") from error
-            finally:
-                runner.velocity_command[:] = requested_command
+                requested_command = runner.velocity_command.copy()
+                holding = now - ramp_started < SETTINGS.ramp_seconds + SETTINGS.command_hold_seconds
+                try:
+                    if holding:
+                        runner.velocity_command[:] = 0.0
+                    observation = runner.observation(positions, velocities, angular_velocity, policy_gravity)
+                    obs_ns = time.monotonic_ns()
+                    raw_action, policy_action, targets = runner.step(observation, commit=False)
+                except ValueError as error:
+                    raise RuntimeError(f"Safety stop: {error}") from error
+                finally:
+                    runner.velocity_command[:] = requested_command
 
-            blend = clamp((now - ramp_started) / SETTINGS.ramp_seconds, 0.0, 1.0)
-            commanded = {}
-            for index, (_, motor_id) in enumerate(joint_row_order(contract)):
-                target = float(targets[index])
-                commanded[motor_id] = home[motor_id] + blend * (target - home[motor_id])
+                blend = clamp((now - ramp_started) / SETTINGS.ramp_seconds, 0.0, 1.0)
+                commanded = {}
+                for index, (_, motor_id) in enumerate(joint_row_order(contract)):
+                    target = float(targets[index])
+                    commanded[motor_id] = home[motor_id] + blend * (target - home[motor_id])
 
-            dt = clamp(now - last_tick, period * 0.25, period * 2.0)
-            last_tick = now
-            send_started = time.monotonic()
-            commander.send(
-                commanded,
-                dt,
-                SETTINGS.policy_max_speed,
-                SETTINGS.policy_max_accel,
-                use_velocity_target=False,
-                reproject=reproject,
-                align=False,
-            )
-            send_ms = (time.monotonic() - send_started) * 1000.0
-            commanded_targets = [
-                commander.commands[motor_id] for _, motor_id in joint_row_order(contract)
-            ]
-            runner.commit_policy_action(policy_action, commanded_targets)
+                dt = clamp(now - last_tick, period * 0.25, period * 2.0)
+                last_tick = now
+                send_started = time.monotonic()
+                commander.send(
+                    commanded,
+                    dt,
+                    SETTINGS.policy_max_speed,
+                    SETTINGS.policy_max_accel,
+                    use_velocity_target=False,
+                    reproject=reproject,
+                    align=False,
+                )
+                send_ms = (time.monotonic() - send_started) * 1000.0
+                commanded_targets = [
+                    commander.commands[motor_id] for _, motor_id in joint_row_order(contract)
+                ]
+                runner.commit_policy_action(policy_action, commanded_targets)
+            except Exception as error:
+                if telemetry is not None:
+                    text = str(error)
+                    prefix = "Safety stop: "
+                    reason = text[len(prefix):] if text.startswith(prefix) else f"{type(error).__name__}: {text}"
+                    try:
+                        telemetry.record_stop(
+                            now, stats.started, reason, commander.commands,
+                            gravity=gravity, gyro=angular_velocity, imu_age=age,
+                            velocity_command=tuple(float(v) for v in runner.velocity_command),
+                            observation=observation, raw_action=runner.last_raw_action,
+                            policy_action=policy_action, targets=targets,
+                            positions=positions, velocities=velocities, gravity_bc=gravity_bc,
+                        )
+                    except Exception:
+                        pass
+                raise
             stats.record(dt, runner.inference_ms)
             if telemetry is not None:
                 telemetry.record(
@@ -2140,49 +2198,52 @@ def run_deploy(policy_path, contract, args):
         exit_text = f"{type(error).__name__}: {error}"
         raise
     finally:
-        brake_kwargs = {}
-        if phases is not None:
-            def observe_brake():
-                for hub in hubs.values():
-                    hub.pump()
-                phases.record("brake")
-            brake_kwargs["observe"] = observe_brake
-        shutdown_report = brake_and_stop(
-            motors, buses, enabled_ids, stop_ids, SETTINGS.brake_time, ENABLE_KD, **brake_kwargs
-        )
-        if telemetry is not None:
-            end_meta["imu_driver_stats_end"] = imu_driver_stats(imu)
-        imu.stop()
-        if stop_ids:
-            for line in shutdown_report_lines(shutdown_report):
-                print(line)
-            print(faults.history_line())
-        else:
-            print("CAN buses closed. No motor control command was sent.")
-        if commander is not None and stats.steps:
-            pipeline = runner.pipeline
-            calls = max(1, pipeline.policy_call_count * pipeline.action_size)
-            print(
-                f"Ran {stats.steps} policy steps in {stats.elapsed():.2f} s; "
-                f"worst period {stats.period_max * 1000.0:.2f} ms, "
-                f"worst inference {stats.inference_ms_max:.2f} ms, "
-                f"slew lag max {math.degrees(commander.slew_lag_run_max):.2f} deg, "
-                f"{thermal.worst_line()}, "
-                f"runner clip {pipeline.runner_clip_count / calls * 100:.2f}%, "
-                f"target clip {pipeline.target_clip_count / calls * 100:.2f}%."
-            )
-        if keyboard is not None:
-            keyboard.stop()
-        if telemetry is not None:
-            previous = None
+        previous = None
+        try:
             if threading.current_thread() is threading.main_thread():
                 previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
-            try:
+        except (ValueError, OSError):
+            previous = None
+        try:
+            brake_kwargs = {}
+            if phases is not None:
+                def observe_brake():
+                    for hub in hubs.values():
+                        hub.pump()
+                    phases.record("brake")
+                brake_kwargs["observe"] = observe_brake
+            shutdown_report = brake_and_stop(
+                motors, buses, enabled_ids, stop_ids, SETTINGS.brake_time, ENABLE_KD, **brake_kwargs
+            )
+            if telemetry is not None:
+                end_meta["imu_driver_stats_end"] = imu_driver_stats(imu)
+            imu.stop()
+            if stop_ids:
+                for line in shutdown_report_lines(shutdown_report):
+                    print(line)
+                print(faults.history_line())
+            else:
+                print("CAN buses closed. No motor control command was sent.")
+            if commander is not None and stats.steps:
+                pipeline = runner.pipeline
+                calls = max(1, pipeline.policy_call_count * pipeline.action_size)
+                print(
+                    f"Ran {stats.steps} policy steps in {stats.elapsed():.2f} s; "
+                    f"worst period {stats.period_max * 1000.0:.2f} ms, "
+                    f"worst inference {stats.inference_ms_max:.2f} ms, "
+                    f"slew lag max {math.degrees(commander.slew_lag_run_max):.2f} deg, "
+                    f"{thermal.worst_line()}, "
+                    f"runner clip {pipeline.runner_clip_count / calls * 100:.2f}%, "
+                    f"target clip {pipeline.target_clip_count / calls * 100:.2f}%."
+                )
+            if keyboard is not None:
+                keyboard.stop()
+            if telemetry is not None:
                 close_recordings(telemetry, phases, end_meta, exit_text, shutdown_report, stats, commander,
                                  runner, thermal, faults, sorted(hubs))
-            finally:
-                if previous is not None:
-                    signal.signal(signal.SIGINT, previous)
+        finally:
+            if previous is not None:
+                signal.signal(signal.SIGINT, previous)
     return 0
 
 
@@ -2267,6 +2328,7 @@ def summarize_run(telemetry, phases, end_meta, exit_text, shutdown_report, stats
         end_meta["slew"] = {
             "lag_run_max_deg": math.degrees(commander.slew_lag_run_max),
             "limited_fraction_by_motor": commander.slew_rate_by_motor(),
+            "lag_over_0p5deg_fraction_by_motor": commander.slew_lag_over_fraction_by_motor(),
             "roll_reprojected_count": commander.roll_reprojected_count,
         }
 
@@ -2448,7 +2510,8 @@ def parse_args(argv=None):
         "--zero-head",
         action="store_true",
         help=(
-            "Also enable the neck motor (ID 13) with fixed gains (kp 20, kd 1, not scaled by --gain-scale), move it "
+            f"Also enable the neck motor (ID {', '.join(str(spec.motor_id) for spec in HOLD_MOTORS)}) "
+            "with fixed gains (kp 20, kd 1, not scaled by --gain-scale), move it "
             "slowly to 0 rad with the legs and hold it there for the whole run (not a policy joint; limit +-74 deg). "
             "Default: the neck is not opened and no frame is sent to it"
         ),

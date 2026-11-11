@@ -34,6 +34,7 @@ class FakeSession:
         rng = np.random.default_rng(7)
         self.weights = rng.normal(0.0, 0.05, size=(12, 235)).astype(np.float32)
         self.observations = []
+        self.warmups = []
         FakeSession.instances.append(self)
 
     def get_inputs(self):
@@ -44,7 +45,10 @@ class FakeSession:
 
     def run(self, outputs, feed):
         observation = np.array(feed["obs"], dtype=np.float32, copy=True)
-        self.observations.append(observation.reshape(-1))
+        if not self.observations and not self.warmups and not observation.any():
+            self.warmups.append(observation.reshape(-1))
+        else:
+            self.observations.append(observation.reshape(-1))
         return [np.sin(observation @ self.weights.T).astype(np.float32) * 2.0]
 
 
@@ -282,8 +286,15 @@ def test_policy_loop_commands_and_observations_unchanged(modules, tmp_path, caps
     base_csv = tmp_path / "base.csv" if with_telemetry else None
     new_csv = tmp_path / "new.csv" if with_telemetry else None
     base_commands, base_obs = run_loop(baseline, contract, base_csv)
+    base_warmups = FakeSession.instances[-1].warmups
     new_commands, new_obs = run_loop(new, contract, new_csv)
+    new_warmups = FakeSession.instances[-1].warmups
     capsys.readouterr()
+
+    assert base_warmups == []
+    assert len(new_warmups) == 1
+    assert new_warmups[0].dtype == np.float32 and new_warmups[0].shape == (contract.observation_size,)
+    assert not new_warmups[0].any()
 
     steps = len(new_obs)
     assert steps >= 150 and len(base_obs) == steps
