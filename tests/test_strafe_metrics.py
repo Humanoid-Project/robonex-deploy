@@ -1,5 +1,6 @@
 import csv
 import importlib.util
+import json
 import math
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from robonex_common.limits import action_normalization
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -89,7 +91,14 @@ def rollout(module, tmp_path, name, duration=3.6, **overrides):
     deploy = Path(os.environ.get("ROBONEX_DEPLOY_TEST_ROOT", "/home/polygon/humanoid_project/robonex-deploy"))
     policy = deploy / "policies/2026-10-08_W113s43E_v2_2_edu_base_iter999/policy.onnx"
     scene = Path(os.environ.get("ROBONEX_DESCRIPTION_ROOT", "/home/polygon/humanoid_project/robonex-description")) / "ver2/mujoco/robot/edu/scene.xml"
-    contract = module.PolicyContract.load(policy.with_name("policy_manifest.json"))
+    manifest = json.loads(policy.with_name("policy_manifest.json").read_text())
+    offsets, scales, clips = action_normalization(0.01, model=manifest["robot_model"])
+    manifest["action_offsets"] = [offsets[name] for name in manifest["joint_order"]]
+    manifest["action_scales"] = [scales[name] for name in manifest["joint_order"]]
+    manifest["target_clips"] = [list(clips[name]) for name in manifest["joint_order"]]
+    restamped = tmp_path / (name + "_policy_manifest.json")
+    restamped.write_text(json.dumps(manifest))
+    contract = module.PolicyContract.load(restamped)
     model = module.mujoco.MjModel.from_xml_path(str(scene))
     data = module.mujoco.MjData(model)
     adapter = module.PolicyAdapter(model, policy, contract)
