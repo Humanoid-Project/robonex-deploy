@@ -880,6 +880,8 @@ class PolicyRunner:
 
     def reset(self):
         self.last_action.fill(0.0)
+        self.history.reset()
+        self.gait_step = 0
 
     def joint_state(self, snapshot):
         size = self.contract.action_size

@@ -26,6 +26,7 @@ from robonex_common.policy import (
     sha256_file,
 )
 from robonex_common.runtime import (
+    OBSERVATION_TERM_SIZES,
     ActionPipeline,
     ObservationHistory,
     assemble_observation,
@@ -133,7 +134,15 @@ class PolicyAdapter:
         self.pipeline = ActionPipeline(contract)
         self.last_action = np.zeros(12, dtype=np.float32)
         self.velocity_command = np.zeros(3, dtype=np.float32)
-        self.history = ObservationHistory()
+        try:
+            self.history = ObservationHistory.from_contract(contract)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+        if self.history.term_sizes != OBSERVATION_TERM_SIZES:
+            raise RuntimeError(
+                f"observation_terms {list(contract.observation_terms)} do not match the deploy "
+                f"layout {[f'{name}:{size}' for name, size in OBSERVATION_TERM_SIZES]}"
+            )
         self.gait_step = 0
         self.object_velocity = np.zeros(6, dtype=np.float64)
         self.gravity_world = np.array((0.0, 0.0, -1.0), dtype=np.float64)
