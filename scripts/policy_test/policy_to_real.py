@@ -70,12 +70,14 @@ from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
 from robonex_common.motors import MOTOR_CONTROL_KD, MOTOR_CONTROL_KP, RATED_TORQUE
 from robonex_common.policy import PolicyContract, python_source_sha256
 from robonex_common.protocol import (
+    COMM_OPERATION,
     CURRENT_LIMIT_INDEX,
     MECHANICAL_VELOCITY_INDEX,
     RUN_MODE_INDEX,
     TORQUE_LIMIT_INDEX,
     VBUS_INDEX,
     ZERO_STATUS_INDEX,
+    parse_arbitration_id,
 )
 from robonex_common.runtime import (
     OBSERVATION_TERM_SIZES,
@@ -531,6 +533,7 @@ PHASE_JOINT_FIELDS = ("age_ms", "pos", "vel", "torque", "temp", "fault", "mode",
 GRAVITY_BC_COLUMNS = (
     "gravity_bc_x", "gravity_bc_y", "gravity_bc_z", "gravity_bc_droll_deg", "gravity_bc_dpitch_deg", "gravity_bc_ready",
 )
+FRESH_COLUMNS = ("fresh_wait_ms", "fresh_resend_ms", "fresh_late_ids", "fresh_rx_age_max_ms")
 
 
 def imu_extra_cells(sample):
@@ -553,6 +556,14 @@ def gravity_bc_cells(gravity_bc):
         return gravity_bc.cells()
     except Exception:
         return [""] * len(GRAVITY_BC_COLUMNS)
+
+
+def fresh_cells(result):
+    if result is None:
+        return [""] * len(FRESH_COLUMNS)
+    ages = result.rx_age_ms.values()
+    return [_round(result.wait_ms, 3), _round(result.resend_ms, 3),
+            " ".join(str(motor_id) for motor_id in result.late_ids), _round(max(ages) if ages else None, 3)]
 
 
 def gravity_bc_arrays(gravity_bc):
@@ -1072,6 +1083,189 @@ class TargetCommander:
         )
 
 
+# --- Fresh joint feedback at the start of a control tick (--fresh-feedback) ---------------
+# Re-send the MIT frame that was last actually sent to every motor, so each one answers with a
+# new type-0x02 frame, and wait for those answers before the observation is built.
+#
+# Clocks: deadlines use time.monotonic(). Freshness compares msg.timestamp with time.time(),
+# because python-can's socketcan (SO_TIMESTAMPNS) and virtual buses stamp frames with the wall
+# clock. A wall-clock step (NTP, manual set) can therefore misjudge freshness for the ticks
+# around it, in either direction: a fresh reply counted as late, or an older reply counted as
+# fresh. That is rare and nothing here guards against it.
+MAX_FRAMES_PER_WAKE = 64   # frames read from one bus before the other buses get a turn
+POLL_SLEEP_S = 0.0002      # poll interval for buses without a fileno() (virtual bus, offline tests)
+
+
+class _RecordingBus:
+    """Stands in for `motor.bus`: forwards everything, remembers the last MIT frame per motor."""
+
+    def __init__(self, bus, cache):
+        self._bus = bus
+        self._cache = cache
+
+    def send(self, msg, timeout=None):
+        comm_type, _, motor_id = parse_arbitration_id(msg.arbitration_id)
+        try:
+            self._bus.send(msg, timeout)
+        except BaseException:
+            self._cache.clear()  # a burst that failed half way is not a state to repeat
+            raise
+        if comm_type == COMM_OPERATION:
+            self._cache[motor_id] = (self._bus, msg)
+        else:
+            self._cache.pop(motor_id, None)  # stop / enable / parameter frame: nothing to repeat
+
+    def __getattr__(self, name):
+        return getattr(self._bus, name)
+
+
+@dataclass
+class FreshResult:
+    resent: int = 0                 # frames re-sent this tick
+    resend_ms: float = 0.0          # time spent in the re-send burst
+    wait_ms: float = 0.0            # time spent waiting for the replies
+    late_ids: list[int] = field(default_factory=list)          # motors with no fresh reply this tick
+    rx_age_ms: dict[int, float] = field(default_factory=dict)  # motor id -> kernel rx age when the wait ended
+    stop_reason: str | None = None
+
+
+class FreshFeedback:
+    def __init__(self, motors, hubs, max_misses=3, wait_s=0.005, tick_cap_s=0.008):
+        self.motors = motors
+        self.hubs = list(hubs.values())
+        self.max_misses = max_misses
+        self.wait_s = wait_s            # deadline after the last re-sent frame
+        self.tick_cap_s = tick_cap_s    # and never later than this after the tick start
+        self.misses = {motor_id: 0 for motor_id in motors}
+        self.cache = {}                 # motor id -> (raw bus, last MIT frame actually sent)
+        self.ticks = 0                  # run totals for the summary; close() keeps them
+        self.late_ticks = 0
+        self.wait_ms_max = 0.0
+        # Everything that can refuse runs before the first motor is touched.
+        originals = {}
+        for motor_id, motor in motors.items():
+            if isinstance(motor.bus, _RecordingBus):
+                raise RuntimeError("FreshFeedback is already installed on these motors")
+            originals[motor_id] = motor.bus
+        # socketcan buses have a real fileno(); python-can's virtual bus raises (offline tests).
+        self._hub_by_bus = {hub.bus: hub for hub in self.hubs}
+        try:
+            for bus in self._hub_by_bus:
+                bus.fileno()
+            self._selectable = True
+        except NotImplementedError:
+            self._selectable = False
+        self._originals = originals     # motor id -> the bus object the motor had before
+        proxies = {}
+        for motor_id, motor in motors.items():
+            bus = originals[motor_id]
+            proxy = proxies.get(id(bus))
+            if proxy is None:
+                proxy = proxies[id(bus)] = _RecordingBus(bus, self.cache)
+            motor.bus = proxy
+
+    def clear(self):
+        """Forget the cached frames."""
+        self.cache.clear()
+
+    def close(self):
+        """Give every motor its original bus back and forget all per-tick state. Idempotent."""
+        for motor_id, bus in self._originals.items():
+            self.motors[motor_id].bus = bus
+        self._originals = {}
+        self.cache.clear()
+        self.misses = {motor_id: 0 for motor_id in self.motors}
+
+    def summary(self):
+        return {"ticks": self.ticks, "ticks_with_late_motor": self.late_ticks, "wait_ms_max": self.wait_ms_max}
+
+    def _ready_hubs(self, timeout):
+        if self._selectable:
+            ready, _, _ = select.select(list(self._hub_by_bus), [], [], timeout)
+            return [self._hub_by_bus[bus] for bus in ready]
+        time.sleep(min(timeout, POLL_SLEEP_S))
+        return self.hubs
+
+    def refresh(self, tick_start):
+        """Re-send the cached frames and wait for one fresh reply per motor.
+
+        Call after the tick's drain. Every motor must have a cached frame, otherwise nothing
+        is sent and the result carries a stop_reason. A miss leaves the motor's previous
+        values in place.
+        """
+        result = FreshResult()
+        missing = sorted(motor_id for motor_id in self.motors if motor_id not in self.cache)
+        if missing:
+            result.stop_reason = f"no MIT frame to repeat for motor IDs {missing}"
+            return result
+        asked = {}  # motor id -> wall time just before its frame was re-sent
+        started = time.monotonic()
+        try:
+            for motor_id in self.motors:
+                bus, msg = self.cache[motor_id]
+                asked[motor_id] = time.time()
+                bus.send(msg)
+        except BaseException:
+            self.clear()
+            raise
+        sent = time.monotonic()
+        result.resent = len(asked)
+        result.resend_ms = (sent - started) * 1000.0
+
+        deadline = min(sent + self.wait_s, tick_start + self.tick_cap_s)
+        pending = set(asked)
+        received = {}  # motor id -> kernel rx timestamp of its fresh reply
+        try:
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                for hub in self._ready_hubs(remaining):
+                    frames = 0
+                    try:
+                        while pending and frames < MAX_FRAMES_PER_WAKE and time.monotonic() < deadline:
+                            msg = hub.bus.recv(timeout=0.0)
+                            if msg is None:
+                                break
+                            frames += 1
+                            # route() returns the motor even when ingest_feedback() rejected a
+                            # short payload, so the length is checked here.
+                            if len(msg.data) < 8:
+                                continue
+                            motor = hub.route(msg, time.monotonic())
+                            if motor is None:
+                                continue
+                            motor.last_rx_kernel_time = msg.timestamp
+                            motor_id = motor.motor_id
+                            # A reply stamped before the re-send answers an older command.
+                            if motor_id in pending and msg.timestamp > asked[motor_id]:
+                                pending.discard(motor_id)
+                                received[motor_id] = msg.timestamp
+                    finally:
+                        # Same bookkeeping as TimestampedFeedbackHub.pump, on top of the tick's drain.
+                        hub.last_pump_frames = getattr(hub, "last_pump_frames", 0) + frames
+                        hub.total_frames = getattr(hub, "total_frames", 0) + frames
+        except BaseException:
+            self.clear()
+            raise
+        result.wait_ms = (time.monotonic() - sent) * 1000.0
+        wall = time.time()
+        result.rx_age_ms = {motor_id: (wall - stamp) * 1000.0 for motor_id, stamp in received.items()}
+        result.late_ids = sorted(pending)
+        self.ticks += 1
+        self.late_ticks += bool(pending)
+        self.wait_ms_max = max(self.wait_ms_max, result.wait_ms)
+        for motor_id in asked:
+            self.misses[motor_id] = self.misses[motor_id] + 1 if motor_id in pending else 0
+        dead = [motor_id for motor_id in result.late_ids if self.misses[motor_id] >= self.max_misses]
+        if dead:
+            result.stop_reason = (
+                f"no fresh feedback from motor IDs {dead} on {self.max_misses} consecutive ticks"
+            )
+            self.clear()
+        return result
+
+
 # Type-0x02 feedback fault flags (Motor.last_fault bit n = 29-bit ID bit 16+n),
 # from the RobStride RS02/RS03 manuals, "Communication Type 2: motor feedback data".
 FAULT_FLAG_NAMES = (
@@ -1566,9 +1760,10 @@ class TelemetryRecorder:
     SLACK_S = 0.005
     MAX_ROWS = 500
 
-    def __init__(self, path, contract, motors, hubs=None, gravity_bc=False):
+    def __init__(self, path, contract, motors, hubs=None, gravity_bc=False, fresh_feedback=False):
         self.path = Path(path)
         self.gravity_bc = bool(gravity_bc)
+        self.fresh_feedback = bool(fresh_feedback)
         self.rows = []
         self.order = joint_row_order(contract)
         self.motors = motors
@@ -1600,6 +1795,8 @@ class TelemetryRecorder:
             header += [f"{short}.{field_name}" for field_name in JOINT_EXTRA_FIELDS]
         if self.gravity_bc:
             header += list(GRAVITY_BC_COLUMNS)
+        if self.fresh_feedback:
+            header += list(FRESH_COLUMNS)
         header.append("stop_reason")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -1622,7 +1819,8 @@ class TelemetryRecorder:
     def record(self, now, started, dt, inference_ms, ramp, raw_action, targets, commands,
                gravity=None, gyro=None, imu_age=None, velocity_command=None, stop_reason="",
                send_ms=None, timing=None, extra=None, policy_action=None, slew_velocities=None,
-               observation=None, positions=None, velocities=None, allow_flush=True, gravity_bc=None):
+               observation=None, positions=None, velocities=None, allow_flush=True, gravity_bc=None,
+               fresh=None):
         wall = time.time()
         row = [
             round(now - started, 4), round(wall, 6), self.step, round(dt * 1000.0, 3),
@@ -1665,6 +1863,8 @@ class TelemetryRecorder:
             ]
         if self.gravity_bc:
             row += gravity_bc_cells(gravity_bc)
+        if self.fresh_feedback:
+            row += fresh_cells(fresh)
         row.append(stop_reason)
         self.rows.append(row)
         if observation is not None:
@@ -1834,7 +2034,7 @@ def _round(value, digits=5):
 
 
 def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, notes, stats,
-                faults, thermal, keyboard=None, telemetry=None):
+                faults, thermal, keyboard=None, telemetry=None, fresh=None):
     period = 1.0 / contract.policy_hz
     stats.started = time.monotonic()
     next_tick = time.monotonic()
@@ -1849,7 +2049,8 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
     owns_telemetry = telemetry is None and bool(getattr(args, "telemetry", None))
     if owns_telemetry:
         telemetry = TelemetryRecorder(args.telemetry, contract, motors, hubs=getattr(joints, "hubs", None),
-                                      gravity_bc=getattr(args, "gravity_bc", False))
+                                      gravity_bc=getattr(args, "gravity_bc", False),
+                                      fresh_feedback=fresh is not None)
     timing = TimingProbe() if telemetry is not None else None
     prev_work_ms = None
     gravity_bc = GravityBC() if getattr(args, "gravity_bc", False) else None
@@ -1867,8 +2068,6 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
             late_ms = (now - next_tick) * 1000.0
             joints.poll()
             poll_ms = (time.monotonic() - now) * 1000.0 if telemetry is not None else None
-            faults.update(motors, now, "policy")
-            thermal.update(motors, now - last_tick)
             def stop(reason, gravity=None, gyro=None, imu_age=None):
                 if telemetry is not None:
                     telemetry.record_stop(
@@ -1878,17 +2077,38 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                     )
                 return RuntimeError("Safety stop: " + reason)
 
+            sample_now = now
+            fresh_result = None
+            if fresh is not None:
+                # Nothing is re-sent to a motor the drained data already condemns.
+                reason = faults.blocking_reason() or runtime_safety_reason(
+                    motors, commander.commands, limits, now, SETTINGS)
+                if reason:
+                    raise stop(reason)
+                try:
+                    fresh_result = fresh.refresh(tick_start=now)
+                except Exception as error:
+                    try:
+                        stop(f"{type(error).__name__}: {error}")
+                    except Exception:
+                        pass
+                    raise
+                if fresh_result.stop_reason:
+                    raise stop(fresh_result.stop_reason)
+                sample_now = time.monotonic()
+            faults.update(motors, sample_now, "policy")
+            thermal.update(motors, now - last_tick)
             fault_reason = faults.blocking_reason()
             if fault_reason:
                 raise stop(fault_reason)
-            reason = runtime_safety_reason(motors, commander.commands, limits, now, SETTINGS)
+            reason = runtime_safety_reason(motors, commander.commands, limits, sample_now, SETTINGS)
             if reason:
                 raise stop(reason)
 
             positions, velocities, missing = runner.joint_state(joints.snapshot())
             if missing:
                 raise stop(f"no feedback for motor IDs {sorted(missing)}")
-            angular_velocity, gravity, age = imu.read(now)
+            angular_velocity, gravity, age = imu.read(now if fresh is None else time.monotonic())
             imu_read_ns = time.monotonic_ns()
             imu_reason = imu.failure_reason(age)
             if imu_reason:
@@ -1972,6 +2192,7 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
                                            thermal, imu.last_sample, holding, tick=now, obs_ns=obs_ns),
                     policy_action=policy_action, slew_velocities=commander.velocities,
                     observation=observation, positions=positions, velocities=velocities, gravity_bc=gravity_bc,
+                    fresh=fresh_result,
                 )
 
             if now - last_status >= 1.0 / SETTINGS.status_hz:
@@ -2087,6 +2308,7 @@ def run_deploy(policy_path, contract, args):
     run_meta = {}
     end_meta = {}
     exit_text = "completed"
+    fresh = None
     try:
         buses, motors, hubs = open_hardware(control_ids, SETTINGS.interface, SETTINGS.host_id)
         idle = stop_idle_motors(buses, control_ids, SETTINGS.host_id)
@@ -2123,7 +2345,8 @@ def run_deploy(policy_path, contract, args):
                     "motors will not be enabled. Rebuild the n100 binding or run without --telemetry"
                 )
             telemetry = TelemetryRecorder(args.telemetry, contract, motors, hubs=hubs,
-                                          gravity_bc=getattr(args, "gravity_bc", False))
+                                          gravity_bc=getattr(args, "gravity_bc", False),
+                                          fresh_feedback=getattr(args, "fresh_feedback", False))
             phases = PhaseRecorder(telemetry.phases_path, contract, motors, imu=imu)
             bias = imu.bias_raw
             run_meta.update({
@@ -2173,6 +2396,8 @@ def run_deploy(policy_path, contract, args):
         end_meta["enable_start_positions_rad"] = {motor_id: _finite_or_none(v) for motor_id, v in starts.items()}
         joints = RuntimeJointSource(motors, hubs)
         commander = TargetCommander(motors, starts, SETTINGS)
+        if getattr(args, "fresh_feedback", False):
+            fresh = FreshFeedback(motors, hubs)  # before approach_pose: its last frame fills the cache
         if phases is not None:
             phases.record("enabled", commander.commands)
         approach_started = time.monotonic()
@@ -2191,7 +2416,7 @@ def run_deploy(policy_path, contract, args):
         runner.reset()
         policy_loop(
             runner, commander, joints, imu, motors, hard_limits, contract, args, notes, stats,
-            faults, thermal, keyboard, telemetry=telemetry
+            faults, thermal, keyboard, telemetry=telemetry, fresh=fresh
         )
     except KeyboardInterrupt:
         exit_text = "stop requested (Ctrl-C)"
@@ -2207,6 +2432,12 @@ def run_deploy(policy_path, contract, args):
         except (ValueError, OSError):
             previous = None
         try:
+            if fresh is not None:
+                try:
+                    fresh.close()  # the brake and stop frames go out on the raw buses
+                    end_meta["fresh_feedback"] = fresh.summary()
+                except Exception as error:
+                    print(f"Warning: fresh feedback close failed ({type(error).__name__}: {error})")
             brake_kwargs = {}
             if phases is not None:
                 def observe_brake():
@@ -2507,6 +2738,11 @@ def parse_args(argv=None):
             "Fraction of the per-joint gains to command (default 1.0 = the gains the "
             "policy was trained at). Ramp up from a low value on the stand."
         ),
+    )
+    parser.add_argument(
+        "--fresh-feedback",
+        action="store_true",
+        help="Repeat each motor's last MIT frame at the start of every policy tick and wait up to 5 ms for the replies",
     )
     parser.add_argument(
         "--zero-head",
