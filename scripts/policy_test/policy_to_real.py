@@ -91,6 +91,9 @@ from safety import (
     ThermalLoad,
     align_angle,
     brake_and_stop,
+    install_stop_signals,
+    mask_signals,
+    restore_signals,
     enable_with_runtime_feedback,
     hold_roll_band,
     inspect_zero_positions,
@@ -2425,12 +2428,10 @@ def run_deploy(policy_path, contract, args):
         exit_text = f"{type(error).__name__}: {error}"
         raise
     finally:
-        previous = None
         try:
-            if threading.current_thread() is threading.main_thread():
-                previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            previous = mask_signals()
         except (ValueError, OSError):
-            previous = None
+            previous = {}
         try:
             if fresh is not None:
                 try:
@@ -2475,8 +2476,7 @@ def run_deploy(policy_path, contract, args):
                 close_recordings(telemetry, phases, end_meta, exit_text, shutdown_report, stats, commander,
                                  runner, thermal, faults, sorted(hubs))
         finally:
-            if previous is not None:
-                signal.signal(signal.SIGINT, previous)
+            restore_signals(previous)
     return 0
 
 
@@ -2863,6 +2863,14 @@ def main(argv=None):
             f"(default {Settings().approach_tolerance_deg:g})"
         )
     ENABLE_KP, ENABLE_KD = resolve_gains(SETTINGS.gain_scale, SETTINGS.ankle_gain_scale)
+    previous = install_stop_signals()
+    try:
+        return run_logged(args)
+    finally:
+        restore_signals(previous)
+
+
+def run_logged(args):
     if args.log is None:
         return run(args)
     try:

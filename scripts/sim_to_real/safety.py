@@ -514,7 +514,8 @@ def tilt_reason(gravity, max_tilt_deg):
 
     The threshold is on the angle between measured gravity and straight down. The three
     recorded hardware runs reach 6.88 deg while walking and 26.12 deg standing under a
-    push, so 30 deg clears normal operation and still fires long before the robot is flat.
+    push, so the 40 deg default (`policy_to_real.py --max-tilt-deg`) clears normal
+    operation and still fires long before the robot is flat.
     """
     if gravity is None or len(gravity) < 3:
         return "IMU returned no gravity vector"
@@ -529,15 +530,39 @@ def tilt_reason(gravity, max_tilt_deg):
     return None
 
 
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+MASKED_SIGNALS = (signal.SIGINT,) + STOP_SIGNALS
+
+
+def _stop_on_signal(signum, _frame):
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+def install_stop_signals():
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+    return {sig: signal.signal(sig, _stop_on_signal) for sig in STOP_SIGNALS}
+
+
+def mask_signals():
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+    return {sig: signal.signal(sig, signal.SIG_IGN) for sig in MASKED_SIGNALS}
+
+
+def restore_signals(previous):
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
+
+
 def brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd, observe=None):
-    previous = None
-    if threading.current_thread() is threading.main_thread():
-        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    previous = mask_signals()
     try:
         return _brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd, observe)
     finally:
-        if previous is not None:
-            signal.signal(signal.SIGINT, previous)
+        restore_signals(previous)
 
 
 def _call_observer(observe, errors):

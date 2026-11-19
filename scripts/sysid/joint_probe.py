@@ -26,6 +26,9 @@ from safety import (
     LEG_PROFILE,
     ROBOT_VARIANTS,
     brake_and_stop,
+    install_stop_signals,
+    mask_signals,
+    restore_signals,
     enable_with_runtime_feedback,
     open_hardware,
     require_robot_model,
@@ -227,7 +230,12 @@ def run(args):
 
 
 def main(argv=None):
-    return run(parse_args(argv))
+    args = parse_args(argv)
+    previous = install_stop_signals()
+    try:
+        return run(args)
+    finally:
+        restore_signals(previous)
 
 
 if __name__ == "__main__":
