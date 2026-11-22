@@ -1,3 +1,4 @@
+import dataclasses
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +34,23 @@ def ptr():
 @pytest.fixture(scope="module")
 def contract():
     return make_contract()
+
+
+WIDE_ANKLE_CLIPS = {
+    "l_ankle_lower_joint": (-0.862665, 0.513599), "l_ankle_upper_joint": (-0.269253, 0.862665),
+    "r_ankle_lower_joint": (-0.513599, 0.862665), "r_ankle_upper_joint": (-0.862665, 0.269253),
+}
+WIDE_ANKLE_SCALES = {
+    "l_ankle_lower_joint": 0.211194, "l_ankle_upper_joint": 0.169625,
+    "r_ankle_lower_joint": 0.211194, "r_ankle_upper_joint": 0.169625,
+}
+
+
+@pytest.fixture(scope="module")
+def unvalidated_wide_contract(contract):
+    clips = tuple(WIDE_ANKLE_CLIPS.get(name, clip) for name, clip in zip(contract.joint_order, contract.target_clips))
+    scales = tuple(WIDE_ANKLE_SCALES.get(name, scale) for name, scale in zip(contract.joint_order, contract.action_scales))
+    return dataclasses.replace(contract, target_clips=clips, action_scales=scales)
 
 
 def raw_actions(contract, steps, seed):
@@ -85,7 +103,18 @@ def test_judge_slew_constants_match_deploy(itm, ptr):
     assert itm.SLEW_MAX_ACCEL == ptr.SETTINGS.policy_max_accel
 
 
-def test_judge_slew_and_roll_reprojection_match_deploy(itm, ptr, contract):
+def test_current_contract_needs_no_slew_reprojection(itm, ptr, contract):
+    period = 1.0 / contract.policy_hz
+    actions = raw_actions(contract, 300, seed=7)
+    judge, moved, _, _ = judge_targets(itm, contract, actions, period)
+    deploy, commander = deploy_targets(ptr, contract, actions, period)
+    assert moved == commander.roll_reprojected_count == 0
+    for step, (a, b) in enumerate(zip(judge, deploy)):
+        np.testing.assert_allclose(a, b, rtol=0.0, atol=1.0e-6, err_msg=f"step {step}")
+
+
+def test_judge_slew_and_roll_reprojection_match_deploy(itm, ptr, unvalidated_wide_contract):
+    contract = unvalidated_wide_contract
     assert contract.foot_roll_limit > 0.0 and contract.foot_roll_pairs
     period = 1.0 / contract.policy_hz
     actions = raw_actions(contract, 300, seed=7)
@@ -97,7 +126,8 @@ def test_judge_slew_and_roll_reprojection_match_deploy(itm, ptr, contract):
         np.testing.assert_allclose(a, b, rtol=0.0, atol=1.0e-6, err_msg=f"step {step}")
 
 
-def test_reprojected_targets_stay_in_the_roll_band(itm, contract):
+def test_reprojected_targets_stay_in_the_roll_band(itm, unvalidated_wide_contract):
+    contract = unvalidated_wide_contract
     period = 1.0 / contract.policy_hz
     judge, moved, limiters, pipeline = judge_targets(itm, contract, raw_actions(contract, 200, seed=3), period)
     assert moved > 0

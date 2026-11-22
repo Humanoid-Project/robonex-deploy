@@ -59,7 +59,7 @@ class RichImuDriver(FakeImuDriver):
         return sample
 
 
-def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False):
+def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False, start_overrides=None, real_roll_pairs=False):
     import safety
     from robonex_common.joints import JOINT_BY_MODEL_NAME
 
@@ -75,6 +75,7 @@ def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False):
     held_ids = module.held_motor_ids(contract.robot_model) if module.SETTINGS.hold_head else []
     starts = {mid: offsets[mid] + 0.05 for mid in motor_ids}
     starts.update({mid: 0.05 for mid in held_ids})
+    starts.update(start_overrides or {})
     motors = {mid: BrakeMotor(mid, starts[mid], control_log, safety.MODE_RUNNING) for mid in motor_ids + held_ids}
     motors[motor_ids[0]].parameters = {0x700B: 17.0, 0x7018: 23.0, 0x701C: 48.2, 0x7005: 0, 0x7029: 1}
     motors[motor_ids[1]].parameters = {0x700B: OSError("bus")}
@@ -89,7 +90,10 @@ def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False):
         self.bias_raw = SimpleNamespace(x=0.001, y=0.002, z=0.003)
         return True
 
+    seen_limits = {}
+
     def enable(motors_, hubs_, kp, kd, limits, enabled_out=None):
+        seen_limits["enable"] = dict(limits)
         events.append("enable")
         enabled_out.extend(sorted(motors_))
         return {mid: motors_[mid].last_position for mid in motors_}, enabled_out
@@ -116,9 +120,26 @@ def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False):
 
     monkeypatch.setattr(module, "open_hardware", open_hardware)
     monkeypatch.setattr(module, "stop_idle_motors", lambda buses, ids, host_id: [])
-    monkeypatch.setattr(module, "inspect_zero_positions",
-                        lambda motors_, tolerance, limits: ({mid: starts[mid] for mid in motors_}, []))
-    monkeypatch.setattr(module, "roll_pairs_for", lambda profile, ids: [])
+    def inspect(motors_, tolerance, limits):
+        seen_limits["preflight"] = dict(limits)
+        return {mid: starts[mid] for mid in motors_}, []
+
+    monkeypatch.setattr(module, "inspect_zero_positions", inspect)
+    if not real_roll_pairs:
+        monkeypatch.setattr(module, "roll_pairs_for", lambda profile, ids: [])
+    original_approach, original_loop = module.approach_pose, module.policy_loop
+
+    def approach(commander, joints, targets, motors_, limits, *args_, **kwargs):
+        seen_limits["approach"] = dict(limits)
+        seen_limits["approach_command"] = dict(kwargs["command_limits"])
+        return original_approach(commander, joints, targets, motors_, limits, *args_, **kwargs)
+
+    def loop(runner, commander, joints, imu, motors_, limits, *args_, **kwargs):
+        seen_limits["policy_loop"] = dict(limits)
+        return original_loop(runner, commander, joints, imu, motors_, limits, *args_, **kwargs)
+
+    monkeypatch.setattr(module, "approach_pose", approach)
+    monkeypatch.setattr(module, "policy_loop", loop)
     monkeypatch.setattr(module, "confirm", lambda prompt: events.append("confirm"))
     monkeypatch.setattr(module, "enable_with_runtime_feedback", enable)
     monkeypatch.setattr(module, "brake_and_stop", brake)
@@ -146,7 +167,45 @@ def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False):
         error = caught
     return SimpleNamespace(path=path, events=events, motors=motors, hubs=hubs, error=error,
                            observations=FakeSession.instances[-1].observations, contract=contract,
-                           control_log=control_log, opened=opened)
+                           control_log=control_log, opened=opened, limits=seen_limits)
+
+
+def test_full_deploy_stops_on_the_stop_limits(modules, monkeypatch, tmp_path, capsys):
+    from robonex_common.joints import JOINT_BY_MODEL_NAME
+    from robonex_common.models import robot_model
+
+    _, new = modules
+    run = run_full_deploy(new, monkeypatch, tmp_path)
+    capsys.readouterr()
+    assert run.error is None
+    profile = robot_model(run.contract.robot_model)
+    stops, commands = profile.stop_limits_by_id(), profile.joint_limits_by_id()
+    leg_ids = [JOINT_BY_MODEL_NAME[name].motor_id for name in run.contract.joint_order]
+    for phase in ("preflight", "enable", "approach", "policy_loop"):
+        assert {mid: run.limits[phase][mid] for mid in leg_ids} == {mid: stops[mid] for mid in leg_ids}
+    assert {mid: run.limits["approach_command"][mid] for mid in leg_ids} == {mid: commands[mid] for mid in leg_ids}
+    assert any(stops[mid] != commands[mid] for mid in leg_ids)
+
+
+def test_full_deploy_refuses_an_ankle_start_between_the_command_and_stop_limits(modules, monkeypatch, tmp_path,
+                                                                                capsys):
+    from robonex_common.foot_roll import foot_roll
+    from robonex_common.joints import JOINT_BY_MODEL_NAME
+    from robonex_common.models import robot_model
+
+    _, new = modules
+    profile = robot_model("ver2_edu")
+    stops, commands = profile.stop_limits_by_id(), profile.joint_limits_by_id()
+    upper = JOINT_BY_MODEL_NAME["l_ankle_upper_joint"].motor_id
+    lower = JOINT_BY_MODEL_NAME["l_ankle_lower_joint"].motor_id
+    start = {upper: math.radians(30.0), lower: math.radians(-3.0)}
+    assert commands[upper][1] < start[upper] < stops[upper][1]
+    assert abs(foot_roll(start[upper], start[lower], profile.foot_roll.coeffs)) < profile.foot_roll.limit
+    run = run_full_deploy(new, monkeypatch, tmp_path, start_overrides=start, real_roll_pairs=True)
+    out = capsys.readouterr().out
+    assert run.error is not None and "Preflight safety check failed" in str(run.error)
+    assert "enable" not in run.events
+    assert f"ID {upper} start" in out and "outside the command range" in out and "BLOCK" in out
 
 
 def load_meta(path):

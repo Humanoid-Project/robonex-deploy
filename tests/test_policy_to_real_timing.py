@@ -88,9 +88,11 @@ def modules(tmp_path_factory):
 
 def make_contract():
     from robonex_common.models import robot_model
-    from robonex_common.policy import PolicyContract
+    from robonex_common.policy import POLICY_JOINT_ORDER, PolicyContract, action_normalization
 
     roll = robot_model("ver2_edu").foot_roll
+    joint_order = list(POLICY_JOINT_ORDER)
+    offsets, scales, clips = action_normalization(model="ver2_edu")
     return PolicyContract.from_dict({
         "schema_version": 3,
         "task": "RoboNex-Walking-V2-Edu-v0",
@@ -109,14 +111,9 @@ def make_contract():
             "joint_pos_rel:12x5", "joint_vel_rel:12x5", "imu_ang_vel:3x5", "projected_gravity:3x5",
             "velocity_commands:3x5", "gait_phase:2x5", "last_action:12x5",
         ],
-        "action_offsets": [0.0, 0.0, 0.13, -0.13, 0.0, 0.0, -0.23648024059811287, 0.23648024059811287,
-                           -0.22908552614940247, 0.23962121825843782, 0.22908552614940247, -0.23962121825843782],
-        "action_scales": [0.25, 0.25, 0.25, 0.25, 0.148886, 0.148886, 0.075494, 0.075494,
-                          0.211194, 0.169625, 0.211194, 0.169625],
-        "target_clips": [[-0.827758, 0.827758], [-0.827758, 0.827758], [-1.648063, 1.648063],
-                         [-1.648063, 1.648063], [-2.084395, 0.164533], [-0.164533, 2.084395],
-                         [-0.792851, -0.01], [0.01, 0.792851], [-0.862665, 0.513599],
-                         [-0.269253, 0.862665], [-0.513599, 0.862665], [-0.862665, 0.269253]],
+        "action_offsets": [offsets[name] for name in joint_order],
+        "action_scales": [scales[name] for name in joint_order],
+        "target_clips": [list(clips[name]) for name in joint_order],
         "runner_action_clip": 14.0,
         "observation_size": 235,
         "action_size": 12,

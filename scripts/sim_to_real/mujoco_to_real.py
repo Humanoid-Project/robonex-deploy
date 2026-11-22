@@ -64,6 +64,7 @@ from safety import (
     require_robot_model,
     roll_pairs_for,
     safe_limits,
+    start_box_blocks,
     start_roll_blocks,
     verify_model_limits,
     wrap_to_pi,
@@ -155,7 +156,7 @@ def print_motor_table(args, motor_ids, hard_limits, actuator_ids, capped):
             f"{math.degrees(lower):+.1f}..{math.degrees(upper):+.1f}",
             sim_state(mid, actuator_ids), " ".join(notes),
         ])
-    print_table(("ID", "joint", "motor", "bus", "kp", "kd", "limit deg", "sim", "note"), rows)
+    print_table(("ID", "joint", "motor", "bus", "kp", "kd", "stop deg", "sim", "note"), rows)
 
 
 def target_source_text(args):
@@ -193,7 +194,7 @@ def dry_run_report(args, motor_ids, model_path, hard_limits, actuator_ids, cappe
     print(f"Would enable ID {format_ids(motor_ids)} after the preflight zero check and the Enter confirmation.")
 
 
-def move_to_zero(motors, hubs, starts, limits, args, roll_pairs=(), roll=None):
+def move_to_zero(motors, hubs, starts, limits, args, roll_pairs=(), roll=None, *, command_limits):
     tolerance_rad = math.radians(args.zero_tolerance_deg)
     period = 1.0 / args.rate
     commands = dict(starts)
@@ -225,7 +226,7 @@ def move_to_zero(motors, hubs, starts, limits, args, roll_pairs=(), roll=None):
             commands[mid] = position
             velocities[mid] = velocity
         if roll_pairs:
-            projected = hold_roll_band(commands, previous, roll_pairs, limits, roll)
+            projected = hold_roll_band(commands, previous, roll_pairs, command_limits, roll)
             for mid in motors:
                 limiters[mid].position = projected[mid]
                 limiters[mid].velocity = (projected[mid] - previous[mid]) / dt
@@ -520,6 +521,7 @@ def run_session(args, setup, box, receiver):
             )
             if roll_pairs:
                 zero_failures += start_roll_blocks(measured, roll_pairs, profile.foot_roll, math.radians(1.0))
+                zero_failures += start_box_blocks(measured, roll_pairs, setup["command_limits"])
             if zero_failures:
                 raise RuntimeError(
                     "Preflight safety check failed; motors will not be enabled:\n  "
@@ -537,7 +539,8 @@ def run_session(args, setup, box, receiver):
                 enabled_ids = getattr(error, "enabled_ids", enabled_ids)
                 raise
             commands.update(starts)
-            commands.update(move_to_zero(motors, hubs, starts, hard_limits, args, roll_pairs, profile.foot_roll))
+            commands.update(move_to_zero(motors, hubs, starts, hard_limits, args, roll_pairs, profile.foot_roll,
+                                         command_limits=setup["command_limits"]))
             limiters = {mid: AxisLimiter(commands[mid]) for mid in motor_ids}
 
             report = None
@@ -587,8 +590,12 @@ def run(args):
     actuator_ids = {mid: aid for mid, aid in variant_actuators.items() if mid in motor_ids}
     profile = verify_model_limits(model, actuator_ids, motor_ids)
     model_limits = profile.joint_limits_by_id()
-    hard_limits = {mid: model_limits[mid] if mid in model_limits else JOINT_LIMITS_RAD[mid] for mid in motor_ids}
-    command_limits = safe_limits(motor_ids, margin_rad, hard_limits)
+    model_stops = profile.stop_limits_by_id()
+    hard_limits = {mid: model_stops[mid] if mid in model_stops else JOINT_LIMITS_RAD[mid] for mid in motor_ids}
+    command_limits = safe_limits(
+        motor_ids, margin_rad,
+        {mid: model_limits[mid] if mid in model_limits else JOINT_LIMITS_RAD[mid] for mid in motor_ids},
+    )
     print_banner(
         args.variant, args.variant_source, motor_ids, variant_actuators, model_path.name,
         "moved to zero and held there", args.interface,

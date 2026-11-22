@@ -215,6 +215,26 @@ def start_roll_blocks(measured, pairs, roll, tolerance_rad):
     return blocks
 
 
+def start_box_blocks(measured, pairs, command_limits):
+    blocks = []
+    for pair in pairs:
+        for mid in pair[:2]:
+            position = measured.get(mid)
+            if position is None or not math.isfinite(position):
+                continue
+            wrapped = wrap_to_pi(position)
+            lower, upper = command_limits[mid]
+            if not lower <= wrapped <= upper:
+                print(f"  ID {mid} start {math.degrees(wrapped):+6.2f} deg is outside the command range "
+                      f"{math.degrees(lower):+.1f}..{math.degrees(upper):+.1f} deg  BLOCK")
+                blocks.append(
+                    f"ID {mid}: start {math.degrees(wrapped):+.2f} deg is outside the ankle command range "
+                    f"{math.degrees(lower):+.1f}..{math.degrees(upper):+.1f} deg, so the first command would jump; "
+                    "set the ankle by hand before enabling"
+                )
+    return blocks
+
+
 def clip_roll_targets(targets, pairs, limits, roll):
     out = dict(targets)
     for upper_id, lower_id, sign in pairs:

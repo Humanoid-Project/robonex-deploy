@@ -102,6 +102,7 @@ from safety import (
     roll_pairs_for,
     runtime_safety_reason,
     shutdown_report_lines,
+    start_box_blocks,
     start_roll_blocks,
     tilt_reason,
     wrap_to_pi,
@@ -1593,7 +1594,7 @@ def run_read(policy_path, contract, args):
 
 
 def approach_pose(commander, joints, targets, motors, limits, settings, label, faults, recorder=None,
-                  roll_pairs=(), roll=None):
+                  roll_pairs=(), roll=None, *, command_limits):
     print(f"\nSpeed-limited move to the {label} pose ({settings.approach_max_speed:.2f} rad/s cap).")
     tolerance = settings.approach_tolerance_deg * DEG
     period = 1.0 / 100.0
@@ -1621,7 +1622,7 @@ def approach_pose(commander, joints, targets, motors, limits, settings, label, f
             settings.approach_max_speed,
             settings.approach_max_accel,
             use_velocity_target=True,
-            reproject=(lambda commands: hold_roll_band(commands, previous, roll_pairs, limits, roll))
+            reproject=(lambda commands: hold_roll_band(commands, previous, roll_pairs, command_limits, roll))
             if roll_pairs else None,
         )
         if recorder is not None:
@@ -2278,8 +2279,11 @@ def run_deploy(policy_path, contract, args):
     imu = ImuSource(SETTINGS, notes)
 
     motor_ids = [JOINT_BY_MODEL_NAME[name].motor_id for name in contract.joint_order]
-    model_limits = robot_model(contract.robot_model).joint_limits_by_id()
-    hard_limits = {motor_id: model_limits[motor_id] for motor_id in motor_ids}
+    model = robot_model(contract.robot_model)
+    model_limits = model.joint_limits_by_id()
+    model_stops = model.stop_limits_by_id()
+    command_limits = {motor_id: model_limits[motor_id] for motor_id in motor_ids}
+    hard_limits = {motor_id: model_stops[motor_id] for motor_id in motor_ids}
     home_targets = {
         JOINT_BY_MODEL_NAME[name].motor_id: float(contract.action_offsets[index])
         for index, name in enumerate(contract.joint_order)
@@ -2289,6 +2293,7 @@ def run_deploy(policy_path, contract, args):
         if spec.motor_id in hold_ids:
             limit = HOLD_LIMITS_RAD.get(spec.model_name)
             hard_limits[spec.motor_id] = (spec.lower, spec.upper) if limit is None else (-limit, limit)
+            command_limits[spec.motor_id] = hard_limits[spec.motor_id]
             home_targets[spec.motor_id] = 0.0
     control_ids = motor_ids + hold_ids
 
@@ -2322,6 +2327,7 @@ def run_deploy(policy_path, contract, args):
         roll_pairs = roll_pairs_for(profile, motor_ids)
         if roll_pairs:
             blocking += start_roll_blocks(measured, roll_pairs, profile.foot_roll, math.radians(1.0))
+            blocking += start_box_blocks(measured, roll_pairs, command_limits)
         if blocking:
             if any(line.startswith(f"ID {motor_id} ") for line in blocking for motor_id in hold_ids):
                 blocking.append(
@@ -2406,7 +2412,8 @@ def run_deploy(policy_path, contract, args):
         approach_started = time.monotonic()
         try:
             approach_pose(commander, joints, home_targets, motors, hard_limits, SETTINGS, "default", faults,
-                          recorder=phases, roll_pairs=roll_pairs, roll=profile.foot_roll)
+                          recorder=phases, roll_pairs=roll_pairs, roll=profile.foot_roll,
+                          command_limits=command_limits)
         finally:
             end_meta["approach"] = {
                 "seconds": time.monotonic() - approach_started,
