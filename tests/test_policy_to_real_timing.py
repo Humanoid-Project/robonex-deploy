@@ -441,6 +441,10 @@ def test_timing_report_on_synthetic_csv(timing_report, tmp_path, capsys):
     assert inside.endswith("INSIDE")
     outside = timing_report.report(path, d0_ms=11.0)["budget"]
     assert outside.endswith("OUTSIDE")
+    below_floor = timing_report.report(path, d0_ms=0.0, floor_ms=age["min"] + 0.5)["budget"]
+    assert below_floor.endswith("OUTSIDE")
+    with pytest.raises(ValueError, match="floor_ms"):
+        timing_report.report(path, floor_ms=20.0)
     assert timing_report.main([str(path), "--d0-ms", "3.5", "--output", str(tmp_path / "out.json")]) == 0
     printed = capsys.readouterr().out
     assert "host age" in printed and "INSIDE" in printed

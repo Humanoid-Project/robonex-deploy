@@ -139,6 +139,7 @@ IMU host age (mean, p50, p95, max), host age per window and its least-squares "h
 | - | `csv` | `Required` | One or more `*_live_telemetry.csv` or `*_read_telemetry.csv` |
 | - | `--d0-ms` | Unknown | Fixed IMU delay before the host stamp (ms, finite, >= 0); unknown prints the bound as a function of d0 |
 | - | `--budget-ms` | `15.0` | Trained IMU age range upper end (ms, finite, > 0); the check is host age max <= budget - d0 |
+| - | `--floor-ms` | `2.5` | Trained IMU age range lower end (ms, finite, >= 0, below `--budget-ms`); the check is host age min >= floor - d0 |
 | - | `--window` | `5.0` | Host age window (s, finite, > 0) |
 | - | `--output` | - | JSON output path |
 
@@ -337,7 +338,7 @@ python3 scripts/policy_test/policy_to_real.py \
 | `imu_host_age_ms` | Monotonic time right after `imu.read` minus `sample.host_timestamp_ns`: AHRS publish to policy read age, not raw-gyro age; excludes the device/wire delay d0 and the raw-gyro hold |
 | `imu_device_dt_ms` | Difference of consecutive ticks' `device_timestamp_us` (AHRS device clock) |
 | `imu_host_dt_ms` | Difference of consecutive ticks' `host_timestamp_ns` |
-| `imu_seq_gap` | Seq difference minus 1 between consecutive ticks; seq counts host-accepted AHRS samples, not wire packets, so it is no packet-loss count; `1` is normal (100 Hz publish, 50 Hz read), `-1` = the same sample read twice |
+| `imu_seq_gap` | Seq difference minus 1 between consecutive ticks; seq counts host-accepted AHRS samples, not wire packets, so it is no packet-loss count; `3` is normal at the 200 Hz AHRS rate set since 2026-11-16 (`1` at the earlier 100 Hz), 50 Hz read, `-1` = the same sample read twice |
 | `tick_period_ms` | Unclamped period between loop ticks (`dt_ms` is the clamped slew dt) |
 | `<joint>.age_ms` | Live only: time since `FeedbackHub.pump` drained the joint's last type 0x02 frame, taken when the row is written (after send); drain-time age, one stamp per pump batch, not acquisition age |
 | `<joint>.rx_age_ms` | Live only: wall time when the row is written minus the socketcan kernel receive timestamp of that frame |

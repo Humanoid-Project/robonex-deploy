@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 IMU_BUDGET_MS = 15.0
+IMU_FLOOR_MS = 2.5
 TIMING_COLUMNS = ("imu_host_age_ms", "imu_device_dt_ms", "imu_host_dt_ms", "imu_seq_gap", "tick_period_ms")
 
 
@@ -126,22 +127,26 @@ def joint_ages(columns, suffix):
     return result
 
 
-def budget_line(age_stats, d0_ms, budget_ms=IMU_BUDGET_MS):
+def budget_line(age_stats, d0_ms, budget_ms=IMU_BUDGET_MS, floor_ms=IMU_FLOOR_MS):
     if age_stats is None:
         return "IMU host age: no samples"
-    worst, p95 = age_stats["max"], age_stats["p95"]
+    worst, p95, least = age_stats["max"], age_stats["p95"], age_stats["min"]
     if d0_ms is None:
-        return (f"IMU host age max {worst:.2f} ms (p95 {p95:.2f} ms) stays inside {budget_ms:g} ms - d0 "
-                f"for d0 <= {budget_ms - worst:.2f} ms (p95: d0 <= {budget_ms - p95:.2f} ms); d0 unknown")
-    bound = budget_ms - d0_ms
-    verdict = "INSIDE" if worst <= bound else "OUTSIDE"
-    return (f"IMU host age max {worst:.2f} ms (p95 {p95:.2f} ms) vs bound {budget_ms:g} - {d0_ms:g} = "
-            f"{bound:.2f} ms: {verdict}")
+        return (f"IMU host age min {least:.2f} / max {worst:.2f} ms (p95 {p95:.2f} ms) stays inside "
+                f"[{floor_ms:g}, {budget_ms:g}] ms - d0 for {floor_ms - least:.2f} <= d0 <= {budget_ms - worst:.2f} ms "
+                f"(p95: d0 <= {budget_ms - p95:.2f} ms); d0 unknown")
+    low, high = floor_ms - d0_ms, budget_ms - d0_ms
+    verdict = "INSIDE" if least >= low and worst <= high else "OUTSIDE"
+    return (f"IMU host age min {least:.2f} / max {worst:.2f} ms (p95 {p95:.2f} ms) vs bounds [{floor_ms:g}, {budget_ms:g}] - "
+            f"{d0_ms:g} = [{low:.2f}, {high:.2f}] ms: {verdict}")
 
 
-def report(path, d0_ms=None, window_s=5.0, budget_ms=IMU_BUDGET_MS):
+def report(path, d0_ms=None, window_s=5.0, budget_ms=IMU_BUDGET_MS, floor_ms=IMU_FLOOR_MS):
     check_positive("window_s", window_s)
     check_positive("budget_ms", budget_ms)
+    check_nonnegative("floor_ms", floor_ms)
+    if floor_ms >= budget_ms:
+        raise ValueError(f"floor_ms must be below budget_ms, got {floor_ms} >= {budget_ms}")
     if d0_ms is not None:
         check_nonnegative("d0_ms", d0_ms)
     columns = load(path)
@@ -163,7 +168,7 @@ def report(path, d0_ms=None, window_s=5.0, budget_ms=IMU_BUDGET_MS):
         "tick_period_ms": tick,
         "joint_fb_age_ms": joint_ages(columns, ".age_ms"),
         "joint_rx_age_ms": joint_ages(columns, ".rx_age_ms"),
-        "budget": budget_line(age_stats, d0_ms, budget_ms),
+        "budget": budget_line(age_stats, d0_ms, budget_ms, floor_ms),
     }
 
 
@@ -212,6 +217,7 @@ def main(argv=None):
     parser.add_argument("--d0-ms", type=cli_value(check_nonnegative, "--d0-ms"), default=None,
                         help="Fixed IMU delay before the host stamp, ms; omit to print the bound as a function of d0")
     parser.add_argument("--budget-ms", type=cli_value(check_positive, "--budget-ms"), default=IMU_BUDGET_MS, help="Total IMU age budget, ms")
+    parser.add_argument("--floor-ms", type=cli_value(check_nonnegative, "--floor-ms"), default=IMU_FLOOR_MS, help="Trained IMU age range lower end, ms")
     parser.add_argument("--window", type=cli_value(check_positive, "--window"), default=5.0, help="Phase-drift window, s")
     parser.add_argument("--output", type=Path, help="JSON output path")
     args = parser.parse_args(argv)
@@ -219,7 +225,7 @@ def main(argv=None):
     status = 0
     for path in args.csv:
         try:
-            result = report(path, d0_ms=args.d0_ms, window_s=args.window, budget_ms=args.budget_ms)
+            result = report(path, d0_ms=args.d0_ms, window_s=args.window, budget_ms=args.budget_ms, floor_ms=args.floor_ms)
         except ValueError as error:
             print(f"Error: {error}", file=sys.stderr)
             status = 1
