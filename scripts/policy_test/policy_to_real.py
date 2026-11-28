@@ -2848,8 +2848,28 @@ def run(args):
         return 1
 
 
+ZERO_HEAD_MIN_COMMON = (2, 5, 0)
+
+
+def zero_head_refusal(common_version):
+    try:
+        version = tuple(int(part) for part in common_version.split(".")[:3])
+    except (AttributeError, ValueError):
+        version = ()
+    if version >= ZERO_HEAD_MIN_COMMON:
+        return None
+    return (
+        f"--zero-head is refused with robonex-common {common_version}: before 2.5.0 the neck pitch name maps to "
+        "CAN ID 26, which is the neck yaw motor on the robot. Install robonex-common >= 2.5.0 first"
+    )
+
+
 def main(argv=None):
     args = parse_args(argv)
+    if args.zero_head:
+        refusal = zero_head_refusal(robonex_common.__version__)
+        if refusal:
+            raise SystemExit(refusal)
     global SETTINGS, ENABLE_KP, ENABLE_KD
     SETTINGS = replace(SETTINGS, gain_scale=args.gain_scale, ankle_gain_scale=args.ankle_gain_scale,
                        hold_head=args.zero_head)
