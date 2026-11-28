@@ -21,6 +21,17 @@ from robonex_common.joints import JOINT_BY_MODEL_NAME
 from robonex_common.joints import canonical_variant
 from robonex_common.models import ROBOT_MODELS, robot_model
 from robonex_common.paths import description_model
+from robonex_common.protocol import (
+    COMM_ENABLE,
+    COMM_OPERATION,
+    COMM_PARAMETER_READ,
+    COMM_PARAMETER_WRITE,
+    COMM_SET_CAN_ID,
+    COMM_SET_ZERO,
+    COMM_STOP,
+    HOST_ID,
+    parse_arbitration_id,
+)
 
 try:
     from bench import LEG_MOTOR_IDS, RETIRED_NOTE, RETIRED_ROBOT_MODELS, ROBOT_VARIANTS, attached_robot_model, identity_path
@@ -41,6 +52,14 @@ from robonex_can import (
 
 
 MODE_RUNNING = 2
+FOREIGN_CONTROL_TYPES = {
+    COMM_OPERATION: "MIT",
+    COMM_ENABLE: "enable",
+    COMM_STOP: "stop",
+    COMM_SET_ZERO: "set zero",
+    COMM_SET_CAN_ID: "set ID",
+    COMM_PARAMETER_WRITE: "parameter write",
+}
 
 
 def wrap_to_pi(angle):
@@ -288,7 +307,7 @@ def open_hardware(motor_ids, interface, host_id):
     channels = sorted({channel_for_id(mid) for mid in motor_ids})
     try:
         for channel in channels:
-            buses[channel] = can.Bus(channel=channel, interface=interface)
+            buses[channel] = can.Bus(channel=channel, interface=interface, receive_own_messages=False)
         for mid in motor_ids:
             motors[mid] = Motor(
                 buses[channel_for_id(mid)], mid, SPECS[MOTOR_MODELS[mid]], host_id=host_id
@@ -305,6 +324,7 @@ def open_hardware(motor_ids, interface, host_id):
             bus,
             [motor for mid, motor in motors.items() if channel_for_id(mid) == channel],
             host_id,
+            channel=channel,
         )
         for channel, bus in buses.items()
     }
@@ -313,6 +333,47 @@ def open_hardware(motor_ids, interface, host_id):
 class TimestampedFeedbackHub(FeedbackHub):
     last_pump_frames = 0
     total_frames = 0
+
+    def __init__(self, bus, motors, host_id=HOST_ID, channel=None):
+        super().__init__(bus, motors, host_id)
+        self.channel = channel
+        self.foreign_frames = {"reads": 0, "control": 0, "other": 0}
+        self.foreign_control = None
+        self.reader_warned = False
+
+    def route(self, msg, now=None):
+        motor = super().route(msg, now)
+        if motor is None:
+            self.classify_foreign(msg)
+        return motor
+
+    def classify_foreign(self, msg):
+        if not msg.is_extended_id or getattr(msg, "is_error_frame", False):
+            self.foreign_frames["other"] += 1
+            return
+        comm_type, _, target_id = parse_arbitration_id(msg.arbitration_id)
+        motor = self.motors.get(target_id)
+        if motor is not None and comm_type in FOREIGN_CONTROL_TYPES:
+            self.foreign_frames["control"] += 1
+            reason = (
+                f"foreign {FOREIGN_CONTROL_TYPES[comm_type]} frame (comm type 0x{comm_type:02x}) to motor ID "
+                f"{target_id} on {self.channel}: another program is commanding this motor"
+            )
+            if self.foreign_control is None:
+                self.foreign_control = reason
+            if getattr(motor, "foreign_control", None) is None:
+                motor.foreign_control = reason
+        elif motor is not None and comm_type == COMM_PARAMETER_READ:
+            self.foreign_frames["reads"] += 1
+            if not self.reader_warned:
+                self.reader_warned = True
+                print(
+                    f"\nWarning: foreign parameter read (comm type 0x{comm_type:02x}) to motor ID {target_id} on "
+                    f"{self.channel}: another program is polling the motors; the run continues "
+                    "(counted in end.foreign_frames)"
+                )
+        else:
+            self.foreign_frames["other"] += 1
 
     def pump(self, max_frames=512):
         now = time.monotonic()
@@ -544,6 +605,9 @@ class ThermalLoad:
 
 def runtime_safety_reason(motors, commands, limits, now, args):
     for mid, motor in motors.items():
+        foreign = getattr(motor, "foreign_control", None)
+        if foreign:
+            return foreign
         if motor.last_feedback_time <= 0.0 or motor.last_position is None:
             return f"ID {mid} never received type-0x02 feedback"
         age = now - motor.last_feedback_time

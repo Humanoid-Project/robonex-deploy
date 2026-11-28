@@ -2496,12 +2496,19 @@ def run_deploy(policy_path, contract, args):
             if telemetry is not None:
                 end_meta["imu_driver_stats_end"] = imu_driver_stats(imu)
             imu.stop()
+            foreign_frames = {
+                channel: dict(getattr(hub, "foreign_frames", {})) for channel, hub in sorted(hubs.items())
+            }
+            end_meta["foreign_frames"] = foreign_frames
             if stop_ids:
                 for line in shutdown_report_lines(shutdown_report):
                     print(line)
                 print(faults.history_line())
             else:
                 print("CAN buses closed. No motor control command was sent.")
+            line = foreign_frames_line(foreign_frames)
+            if line:
+                print(line)
             if commander is not None and stats.steps:
                 pipeline = runner.pipeline
                 calls = max(1, pipeline.policy_call_count * pipeline.action_size)
@@ -2522,6 +2529,15 @@ def run_deploy(policy_path, contract, args):
         finally:
             restore_signals(previous)
     return 0
+
+
+def foreign_frames_line(foreign_frames):
+    cells = [
+        f"{channel} reads {counts.get('reads', 0)} control {counts.get('control', 0)} other {counts.get('other', 0)}"
+        for channel, counts in sorted(foreign_frames.items())
+        if any(counts.values())
+    ]
+    return "Foreign CAN frames: " + "; ".join(cells) if cells else None
 
 
 def sync_to_disk(paths):
