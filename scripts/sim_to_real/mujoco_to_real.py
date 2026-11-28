@@ -35,6 +35,7 @@ from bench import (
     attached_robot_model,
     bench_gains,
     channel_problems,
+    check_foreign_traffic,
     check_gain_table,
     deg_text,
     format_ids,
@@ -100,6 +101,8 @@ def parse_args(argv=None):
                         help="Take the slider targets over UDP from slider_sender.py on HOST instead of a local MuJoCo viewer (headless, for the Jetson)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Resolve variant, motors, gains, limits and buses and print the start table; no CAN bus is opened")
+    parser.add_argument("--allow-foreign-readers", action="store_true",
+                        help="Start even when the CAN channels already carry traffic from another program; warn instead of refusing")
     args = parser.parse_args(argv)
     try:
         args.variant, args.variant_source = resolve_variant(args.robot, need_identity=not args.dry_run)
@@ -512,6 +515,7 @@ def run_session(args, setup, box, receiver):
 
     try:
         try:
+            check_foreign_traffic(motor_ids, args.interface, allow=args.allow_foreign_readers)
             buses, motors, hubs = open_checked(open_hardware, motor_ids, args.interface, args.host_id)
             idle = stop_idle_motors(buses, motor_ids, args.host_id, VARIANT_MOTOR_IDS[args.variant])
             if idle:

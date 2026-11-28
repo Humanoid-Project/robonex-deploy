@@ -156,6 +156,7 @@ def test_mujoco_to_real_blocks_a_start_roll_outside_the_band(tmp_path, monkeypat
         measured[upper], measured[lower] = sign * math.radians(20.0), sign * math.radians(20.0)
     assert roll_deg(measured, PAIRS[0]) > 13.0
     monkeypatch.setattr(mujoco_to_real, "parse_args", lambda argv=None: args)
+    monkeypatch.setattr(mujoco_to_real, "check_foreign_traffic", lambda ids, interface, allow=False: [])
     monkeypatch.setattr(mujoco_to_real, "open_checked", lambda opener, *a: ({}, {mid: None for mid in args.motor_ids}, {}))
     monkeypatch.setattr(mujoco_to_real, "stop_idle_motors", lambda *a, **k: [])
     monkeypatch.setattr(mujoco_to_real, "inspect_zero_positions", lambda motors, tol, limits: (dict(measured), []))
@@ -277,6 +278,7 @@ def test_mujoco_to_real_blocks_an_ankle_start_outside_the_command_range(tmp_path
     assert LIMITS[upper][1] - margin < measured[upper] < STOPS[upper][1]
     assert roll_deg(measured, PAIRS[0]) < math.degrees(ROLL.limit)
     monkeypatch.setattr(mujoco_to_real, "parse_args", lambda argv=None: args)
+    monkeypatch.setattr(mujoco_to_real, "check_foreign_traffic", lambda ids, interface, allow=False: [])
     monkeypatch.setattr(mujoco_to_real, "open_checked", lambda opener, *a: ({}, {mid: None for mid in args.motor_ids}, {}))
     monkeypatch.setattr(mujoco_to_real, "stop_idle_motors", lambda *a, **k: [])
     monkeypatch.setattr(mujoco_to_real, "inspect_zero_positions", lambda motors, tol, limits: (dict(measured), []))

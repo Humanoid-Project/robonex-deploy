@@ -120,6 +120,7 @@ def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False, start_o
         opened.append(list(ids))
         return {}, {mid: motors[mid] for mid in ids}, hubs
 
+    monkeypatch.setattr(module, "check_foreign_traffic", lambda ids, interface, allow=False: [])
     monkeypatch.setattr(module, "open_hardware", open_hardware)
     monkeypatch.setattr(module, "stop_idle_motors", lambda buses, ids, host_id: [])
     inspections = []

@@ -108,6 +108,7 @@ from safety import (
     tilt_reason,
     wrap_to_pi,
 )
+from bench import check_foreign_traffic
 from gravity_bc import GravityBC
 
 DEG = math.pi / 180.0
@@ -2344,6 +2345,7 @@ def run_deploy(policy_path, contract, args):
     exit_text = "completed"
     fresh = None
     try:
+        check_foreign_traffic(control_ids, SETTINGS.interface, allow=getattr(args, "allow_foreign_readers", False))
         buses, motors, hubs = open_hardware(control_ids, SETTINGS.interface, SETTINGS.host_id)
         idle = stop_idle_motors(buses, control_ids, SETTINGS.host_id)
         if idle:
@@ -2794,6 +2796,14 @@ def parse_args(argv=None):
             "with fixed gains (kp 20, kd 1, not scaled by --gain-scale), move it "
             "slowly to 0 rad with the legs and hold it there for the whole run (not a policy joint; limit +-74 deg). "
             "Default: the neck is not opened and no frame is sent to it"
+        ),
+    )
+    parser.add_argument(
+        "--allow-foreign-readers",
+        action="store_true",
+        help=(
+            "Start even when the CAN channels already carry traffic before this program opens them "
+            "(another reader or sender is running); prints a warning instead of refusing. Bench use only"
         ),
     )
     parser.add_argument(

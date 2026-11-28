@@ -21,7 +21,7 @@ from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
 from robonex_common.joints import ALL_MOTORS, MOTOR_BY_ID, MOTOR_LIMITS_BY_ID, VARIANT_MOTOR_IDS
 from robonex_can import DEFAULT_INTERFACE, HOST_ID, JOINT_MAP, stop_idle_motors
 from robonex_common.models import robot_model
-from bench import format_ids, identity_path
+from bench import check_foreign_traffic, format_ids, identity_path
 from safety import (
     LEG_PROFILE,
     ROBOT_VARIANTS,
@@ -86,6 +86,8 @@ def parse_args(argv=None):
     parser.add_argument("--gain-scale", type=float, default=1.0,
                         help="fraction of the per-joint walking gains (kp, kd)")
     parser.add_argument("--output", type=Path, help="CSV path; default results/sysid/<stamp>_<id>_<profile>.csv")
+    parser.add_argument("--allow-foreign-readers", action="store_true",
+                        help="start even when the CAN channel already carries traffic from another program; warn instead of refusing")
     args = parser.parse_args(argv)
     args.robot_model = ROBOT_VARIANTS[args.robot_model]
     if args.motor_id not in MOTOR_BY_ID:
@@ -163,6 +165,7 @@ def run(args):
     try:
         require_robot_model(args.robot_model, identity_path())
         input("Press Enter to enable the motor and start, or Ctrl-C to cancel: ")
+        check_foreign_traffic([mid], DEFAULT_INTERFACE, allow=args.allow_foreign_readers)
         buses, motors, hubs = open_hardware([mid], DEFAULT_INTERFACE, HOST_ID)
         stop_idle_motors(buses, [mid], HOST_ID, variant_ids)
         starts, enabled = enable_with_runtime_feedback(motors, hubs, {mid: kp}, {mid: kd}, limits, enabled_out=enabled)

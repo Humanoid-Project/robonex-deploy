@@ -520,6 +520,7 @@ def run_deploy_until_enable(module, monkeypatch, driver_class, telemetry):
 
     monkeypatch.setattr(module, "verify_common_source", lambda contract: None)
     monkeypatch.setattr(module, "require_robot_model", lambda name: None)
+    monkeypatch.setattr(module, "check_foreign_traffic", lambda ids, interface, allow=False: [])
     monkeypatch.setattr(module, "open_hardware", lambda ids, interface, host_id: ({}, {}, {}))
     monkeypatch.setattr(module, "stop_idle_motors", lambda buses, ids, host_id: [])
     monkeypatch.setattr(module, "inspect_zero_positions", lambda motors, tolerance, limits: ({}, []))

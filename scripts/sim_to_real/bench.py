@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+import time
 
 import can
 from robonex_common.actuators import CONTROL_GAINS_BY_JOINT
@@ -37,6 +38,8 @@ MOTOR_BY_NAME = {
 PLACEHOLDER_LIMITS_DEG = (30.0, 45.0)
 SYS_NET = Path("/sys/class/net")
 CAN_BITRATE = 1000000
+FOREIGN_TRAFFIC_WAIT_S = 0.5
+FOREIGN_HAND_CHECK = "ps -eo pid,lstart,tty,args | grep -E 'python|candump|cansend' | grep -v grep"
 
 
 def identity_path():
@@ -195,6 +198,58 @@ def channel_state(channel, interface="socketcan", sys_net=SYS_NET):
     except (OSError, ValueError):
         return "ok"
     return "ok" if flags & 0x1 else "down"
+
+
+def channel_packets(channel, sys_net=SYS_NET):
+    statistics = Path(sys_net) / channel / "statistics"
+    return tuple(int((statistics / name).read_text().strip()) for name in ("tx_packets", "rx_packets"))
+
+
+def foreign_traffic_lines(motor_ids, interface="socketcan", sys_net=SYS_NET, wait_s=FOREIGN_TRAFFIC_WAIT_S,
+                          sleep=time.sleep):
+    if interface != "socketcan":
+        return []
+    channels = [channel for channel in bus_plan(motor_ids) if (Path(sys_net) / channel).exists()]
+    if not channels:
+        return []
+    before = {}
+    lines = []
+    for channel in channels:
+        try:
+            before[channel] = channel_packets(channel, sys_net)
+        except (OSError, ValueError) as error:
+            lines.append(f"{channel}: cannot read tx/rx packet counters ({error})")
+    sleep(wait_s)
+    for channel, (tx0, rx0) in before.items():
+        try:
+            tx1, rx1 = channel_packets(channel, sys_net)
+        except (OSError, ValueError) as error:
+            lines.append(f"{channel}: cannot read tx/rx packet counters ({error})")
+            continue
+        if tx1 != tx0 or rx1 != rx0:
+            lines.append(
+                f"{channel}: {(tx1 - tx0) / wait_s:.0f} tx/s, {(rx1 - rx0) / wait_s:.0f} rx/s "
+                "while this program has not opened it"
+            )
+    return lines
+
+
+def check_foreign_traffic(motor_ids, interface="socketcan", allow=False, sys_net=SYS_NET,
+                          wait_s=FOREIGN_TRAFFIC_WAIT_S, sleep=time.sleep):
+    lines = foreign_traffic_lines(motor_ids, interface, sys_net, wait_s, sleep)
+    if not lines:
+        return []
+    text = (
+        "CAN traffic before this program opened the bus (another program is using it):\n  "
+        + "\n  ".join(lines)
+        + f"\n  Find it by hand: {FOREIGN_HAND_CHECK}"
+    )
+    if not allow:
+        raise RuntimeError(
+            text + "\n  Stop that program first; --allow-foreign-readers runs anyway (bench use only)."
+        )
+    print("Warning: " + text + "\n  Continuing because of --allow-foreign-readers.")
+    return lines
 
 
 def up_command(channel):
