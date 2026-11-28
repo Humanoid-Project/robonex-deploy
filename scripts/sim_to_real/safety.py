@@ -600,40 +600,41 @@ def _brake_and_stop(motors, buses, enabled_ids, stop_ids, duration, kd, observe=
     stop_sent = []
     observe_errors = []
     enabled = [mid for mid in sorted(set(enabled_ids)) if mid in motors]
-    if enabled and duration > 0.0:
-        deadline = time.monotonic() + duration
-        try:
-            while time.monotonic() < deadline:
-                for mid in enabled:
-                    try:
-                        motor = motors[mid]
-                        motor.control(
-                            pos=0.0, vel=0.0, kp=0.0,
-                            kd=min(gain_for(kd, mid), motor.spec.kd_max), torque=0.0,
-                        )
-                    except (OSError, can.CanError) as error:
-                        damping_errors[mid] = error
+    try:
+        if enabled and duration > 0.0:
+            deadline = time.monotonic() + duration
+            try:
+                while time.monotonic() < deadline:
+                    for mid in enabled:
+                        try:
+                            motor = motors[mid]
+                            motor.control(
+                                pos=0.0, vel=0.0, kp=0.0,
+                                kd=min(gain_for(kd, mid), motor.spec.kd_max), torque=0.0,
+                            )
+                        except Exception as error:
+                            damping_errors[mid] = error
 
-                time.sleep(0.01)
-                _call_observer(observe, observe_errors)
-        except KeyboardInterrupt:
-            pass
-
-    for mid in sorted(set(stop_ids)):
-        motor = motors.get(mid)
-        if motor is None:
-            continue
-        try:
-            motor.stop()
-        except (OSError, can.CanError, KeyboardInterrupt) as error:
-            stop_errors[mid] = error
-        else:
-            stop_sent.append(mid)
-    for bus in buses.values():
-        try:
-            bus.shutdown()
-        except Exception:
-            pass
+                    time.sleep(0.01)
+                    _call_observer(observe, observe_errors)
+            except KeyboardInterrupt:
+                pass
+    finally:
+        for mid in sorted(set(stop_ids)):
+            motor = motors.get(mid)
+            if motor is None:
+                continue
+            try:
+                motor.stop()
+            except (Exception, KeyboardInterrupt) as error:
+                stop_errors[mid] = error
+            else:
+                stop_sent.append(mid)
+        for bus in buses.values():
+            try:
+                bus.shutdown()
+            except Exception:
+                pass
     report = {
         "damped": enabled,
         "damping_errors": damping_errors,
