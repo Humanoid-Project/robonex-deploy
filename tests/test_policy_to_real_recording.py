@@ -59,7 +59,8 @@ class RichImuDriver(FakeImuDriver):
         return sample
 
 
-def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False, start_overrides=None, real_roll_pairs=False):
+def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False, start_overrides=None, real_roll_pairs=False,
+                    recheck_overrides=None):
     import safety
     from robonex_common.joints import JOINT_BY_MODEL_NAME
 
@@ -92,8 +93,9 @@ def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False, start_o
 
     seen_limits = {}
 
-    def enable(motors_, hubs_, kp, kd, limits, enabled_out=None):
+    def enable(motors_, hubs_, kp, kd, limits, enabled_out=None, **kwargs):
         seen_limits["enable"] = dict(limits)
+        seen_limits["enable_kwargs"] = dict(kwargs)
         events.append("enable")
         enabled_out.extend(sorted(motors_))
         return {mid: motors_[mid].last_position for mid in motors_}, enabled_out
@@ -120,9 +122,15 @@ def run_full_deploy(module, monkeypatch, tmp_path, fail_in_policy=False, start_o
 
     monkeypatch.setattr(module, "open_hardware", open_hardware)
     monkeypatch.setattr(module, "stop_idle_motors", lambda buses, ids, host_id: [])
+    inspections = []
+
     def inspect(motors_, tolerance, limits):
         seen_limits["preflight"] = dict(limits)
-        return {mid: starts[mid] for mid in motors_}, []
+        inspections.append(1)
+        measured = {mid: starts[mid] for mid in motors_}
+        if len(inspections) > 1:
+            measured.update({mid: value for mid, value in (recheck_overrides or {}).items() if mid in measured})
+        return measured, []
 
     monkeypatch.setattr(module, "inspect_zero_positions", inspect)
     if not real_roll_pairs:

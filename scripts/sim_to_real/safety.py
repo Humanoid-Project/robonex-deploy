@@ -338,7 +338,8 @@ def gain_for(gains, motor_id):
     return gains
 
 
-def enable_with_runtime_feedback(motors, hubs, kp, kd, limits, enabled_out=None):
+def enable_with_runtime_feedback(motors, hubs, kp, kd, limits, enabled_out=None, reference=None,
+                                 max_deviation=None, hold_targets=None, hold_window=None):
     starts = {}
     enabled_ids = enabled_out if enabled_out is not None else []
 
@@ -382,6 +383,11 @@ def enable_with_runtime_feedback(motors, hubs, kp, kd, limits, enabled_out=None)
             )
             error.enabled_ids = enabled_ids
             raise error
+        blocked = start_gate_reason(mid, start, reference, max_deviation, hold_targets, hold_window)
+        if blocked:
+            error = RuntimeError(blocked)
+            error.enabled_ids = enabled_ids
+            raise error
         starts[mid] = start
         motor.control(
             pos=start, vel=0.0,
@@ -399,6 +405,51 @@ def enable_with_runtime_feedback(motors, hubs, kp, kd, limits, enabled_out=None)
             error.enabled_ids = enabled_ids
             raise error
     return starts, enabled_ids
+
+def hold_window_reason(mid, position, target, window, source):
+    delta = wrap_to_pi(position - target)
+    if abs(delta) <= window:
+        return None
+    return (
+        f"ID {mid} {source} {math.degrees(position):+.2f} deg is {math.degrees(delta):+.2f} deg from its hold pose "
+        f"{math.degrees(target):+.2f} deg (window {math.degrees(window):.0f} deg); move it by hand to its hold pose, "
+        "or run without --zero-head to leave it unpowered"
+    )
+
+
+def hold_start_blocks(measured, hold_targets, window):
+    blocks = []
+    for mid, target in sorted(hold_targets.items()):
+        position = measured.get(mid)
+        if position is None or not math.isfinite(position):
+            continue
+        reason = hold_window_reason(mid, position, target, window, "start")
+        if reason:
+            print(f"  ID {mid} start {math.degrees(position):+6.2f} deg, hold pose {math.degrees(target):+.1f} deg "
+                  f"(window {math.degrees(window):.0f} deg)  BLOCK")
+            blocks.append(reason)
+    return blocks
+
+
+def start_gate_reason(mid, start, reference, max_deviation, hold_targets, hold_window):
+    if hold_targets and mid in hold_targets:
+        reason = hold_window_reason(mid, start, hold_targets[mid], hold_window, "type-0x02 position at enable")
+        if reason:
+            return reason
+    if reference is None or max_deviation is None:
+        return None
+    expected = reference.get(mid)
+    if expected is None or not math.isfinite(expected):
+        return f"ID {mid} has no start reference reading to compare its type-0x02 position with"
+    delta = wrap_to_pi(start - expected)
+    if abs(delta) > max_deviation:
+        return (
+            f"ID {mid} type-0x02 position at enable {math.degrees(start):+.2f} deg differs from the start re-check "
+            f"{math.degrees(expected):+.2f} deg by {math.degrees(delta):+.2f} deg (limit {math.degrees(max_deviation):.0f} "
+            "deg); the joint moved after the check, keep the robot still until the motors are enabled"
+        )
+    return None
+
 
 def inspect_zero_positions(motors, tolerance_rad, limits):
     print("\nPreflight zero-position check using read-only mechPos:")

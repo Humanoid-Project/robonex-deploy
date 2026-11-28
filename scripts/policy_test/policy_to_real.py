@@ -96,6 +96,7 @@ from safety import (
     restore_signals,
     enable_with_runtime_feedback,
     hold_roll_band,
+    hold_start_blocks,
     inspect_zero_positions,
     open_hardware,
     require_robot_model,
@@ -193,6 +194,8 @@ class Settings:
     approach_max_accel: float = 0.60
     approach_tolerance_deg: float = 1.0
     approach_settle_timeout: float = 5.0
+    hold_start_window_deg: float = 10.0
+    enable_max_deviation_deg: float = 5.0
 
     policy_max_speed: float = 6.0
     policy_max_accel: float = 120.0
@@ -2270,6 +2273,28 @@ def policy_loop(runner, commander, joints, imu, motors, limits, contract, args, 
             print(timing.warning())
 
 
+def start_state_check(motors, hard_limits, command_limits, roll_pairs, roll, hold_targets):
+    measured, blocking = inspect_zero_positions(motors, SETTINGS.approach_tolerance_deg * DEG, hard_limits)
+    if roll_pairs:
+        blocking += start_roll_blocks(measured, roll_pairs, roll, math.radians(1.0))
+        blocking += start_box_blocks(measured, roll_pairs, command_limits)
+    blocking += hold_start_blocks(measured, hold_targets, SETTINGS.hold_start_window_deg * DEG)
+    if blocking and any(line.startswith(f"ID {motor_id} ") for line in blocking for motor_id in hold_targets):
+        blocking.append(
+            f"held head motor(s) {sorted(hold_targets)}: move the head by hand into its range, "
+            "or run without --zero-head to leave it unpowered"
+        )
+    return measured, blocking
+
+
+def start_deltas_deg(values, reference):
+    deltas = {}
+    for motor_id, value in sorted(values.items()):
+        value, expected = _finite_or_none(value), _finite_or_none(reference.get(motor_id))
+        deltas[motor_id] = None if value is None or expected is None else math.degrees(wrap_to_pi(value - expected))
+    return deltas
+
+
 def run_deploy(policy_path, contract, args):
     notes = []
     verify_common_source(contract)
@@ -2296,6 +2321,7 @@ def run_deploy(policy_path, contract, args):
             command_limits[spec.motor_id] = hard_limits[spec.motor_id]
             home_targets[spec.motor_id] = 0.0
     control_ids = motor_ids + hold_ids
+    hold_targets = {motor_id: home_targets[motor_id] for motor_id in hold_ids}
 
     buses = {}
     motors = {}
@@ -2322,18 +2348,12 @@ def run_deploy(policy_path, contract, args):
         idle = stop_idle_motors(buses, control_ids, SETTINGS.host_id)
         if idle:
             print(f"Stop sent to the non-policy motors on the open buses: {idle}")
-        measured, blocking = inspect_zero_positions(motors, SETTINGS.approach_tolerance_deg * DEG, hard_limits)
         profile = robot_model(contract.robot_model)
         roll_pairs = roll_pairs_for(profile, motor_ids)
-        if roll_pairs:
-            blocking += start_roll_blocks(measured, roll_pairs, profile.foot_roll, math.radians(1.0))
-            blocking += start_box_blocks(measured, roll_pairs, command_limits)
+        measured, blocking = start_state_check(
+            motors, hard_limits, command_limits, roll_pairs, profile.foot_roll, hold_targets
+        )
         if blocking:
-            if any(line.startswith(f"ID {motor_id} ") for line in blocking for motor_id in hold_ids):
-                blocking.append(
-                    f"held head motor(s) {sorted(hold_ids)}: move the head by hand into its range, "
-                    "or run without --zero-head to leave it unpowered"
-                )
             raise RuntimeError(
                 "Preflight safety check failed; motors will not be enabled:\n  " + "\n  ".join(blocking)
             )
@@ -2394,15 +2414,30 @@ def run_deploy(policy_path, contract, args):
         print("  The robot must hang on the stand or be held; this tool cannot catch a fall.")
         print("  Keep the emergency stop within reach.")
         confirm("Press Enter to enable the motors and start, or Ctrl-C to cancel: ")
+        print("\nStart re-check after the confirmation (fresh mechPos, the robot may have moved):")
+        recheck, blocking = start_state_check(
+            motors, hard_limits, command_limits, roll_pairs, profile.foot_roll, hold_targets
+        )
+        end_meta["start_recheck"] = {
+            "mech_pos_rad": {motor_id: _finite_or_none(value) for motor_id, value in sorted(recheck.items())},
+            "minus_preflight_deg": start_deltas_deg(recheck, measured),
+        }
+        if blocking:
+            raise RuntimeError(
+                "Start re-check after the confirmation failed; motors will not be enabled:\n  " + "\n  ".join(blocking)
+            )
         if keyboard is not None and keyboard.start():
             print(f"  {keyboard.legend()}")
 
         stop_ids = list(control_ids)
         starts, enabled_ids = enable_with_runtime_feedback(
-            motors, hubs, ENABLE_KP, ENABLE_KD, hard_limits, enabled_out=enabled_ids
+            motors, hubs, ENABLE_KP, ENABLE_KD, hard_limits, enabled_out=enabled_ids,
+            reference=recheck, max_deviation=SETTINGS.enable_max_deviation_deg * DEG,
+            hold_targets=hold_targets, hold_window=SETTINGS.hold_start_window_deg * DEG,
         )
 
         end_meta["enable_start_positions_rad"] = {motor_id: _finite_or_none(v) for motor_id, v in starts.items()}
+        end_meta["start_recheck"]["enable_minus_recheck_deg"] = start_deltas_deg(starts, recheck)
         joints = RuntimeJointSource(motors, hubs)
         commander = TargetCommander(motors, starts, SETTINGS)
         if getattr(args, "fresh_feedback", False):
